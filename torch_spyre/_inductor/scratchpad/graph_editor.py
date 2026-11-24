@@ -369,8 +369,9 @@ class GraphEditor:
           it, in the body, as before: the allocator's live-range gate only looked
           from ``lower_before`` on;
         * an output clone with no drain plan copies the buffer's final value and
-          carries the buffer's ``loop_member``, so it goes right after its last
-          writer, in that writer's list (a member stays a member);
+          takes the writer's loop membership (``copy_op_metadata``), so it goes
+          right after its last writer, in that writer's list (a member stays a
+          member);
         * any other clone goes right before its first consumer, in that
           consumer's list: it runs every trip when the consumer is in a loop body.
 

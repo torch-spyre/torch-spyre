@@ -614,17 +614,16 @@ class CustomPreSchedulingPasses:
             reorder_nonstick_dims,
             finalize_layouts,
             # insert_restickify's advance-transfer logic (see its own
-            # docstring) branches on whether old_name already has
-            # `loop_member` stamped, to decide whether the per-trip advance
-            # belongs on the restickify stage or stays on the consumer.
-            # splice_while_loops runs first in this list and stamps every
-            # for_each_tile level's LoopMember in one deferred final
-            # phase, so by the time insert_restickify runs, every tiled
-            # stage's loop_member is already in place. If this pass ever
-            # moved ahead of splice_while_loops' stamping, that check would
-            # silently take the "not yet tiled" branch and emit an empty
-            # loop_member for a stage that is actually tiled -- a
-            # wrong-answer, not a crash.
+            # docstring) branches on whether old_name is already in a loop
+            # (`is_looped`), to decide whether the per-trip advance belongs
+            # on the restickify stage or stays on the consumer.
+            # splice_while_loops runs first in this list and the pass loop
+            # builds its loops' nodes once it returns, so by the time
+            # insert_restickify runs, every tiled stage is in its loop. If
+            # this pass ever moved ahead of splice_while_loops, that check
+            # would silently take the "not yet tiled" branch and leave a
+            # stage that is actually tiled out of its loop -- a wrong
+            # answer, not a crash.
             insert_restickify,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
