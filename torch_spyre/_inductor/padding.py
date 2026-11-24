@@ -50,8 +50,6 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
-import dataclasses
-
 import sympy
 import torch
 from sympy import Expr
@@ -75,8 +73,8 @@ from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .loop_facts import read_advances_anywhere
-from .loop_node import move_before, record_loop_info
+from .loop_facts import enclosing_loops, is_looped, read_advances_anywhere
+from .loop_node import move_before, record_member
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -566,9 +564,10 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         _move_ops_before(operations, y_new_ops, op)
 
         # When coarse-tiling runs pre-stickification, the consuming matmul
-        # already carries loop_info.  The padding ops must inherit it so they
-        # remain contiguous in the loop group for build_loop_scheduler_nodes.
-        if hasattr(op, "loop_info"):
+        # already sits in a loop.  The padding ops must join it so they remain
+        # contiguous in the loop group.
+        if is_looped(op):
+            levels = enclosing_loops(op)
             for new_op in y_new_ops:
                 if isinstance(new_op, ComputedBuffer):
                     # The padding op re-runs identical work every trip and reads y
@@ -577,8 +576,13 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
                     # loop-invariant copy inherits the matmul's loop_tiled_dims, which
                     # are indexed against the matmul's dims, not the copy's; clear them
                     # (or place the copy before the node) when padding is node-aware.
-                    new_op.loop_info = dataclasses.replace(op.loop_info)  # type: ignore[attr-defined]
-                    record_loop_info(new_op)
+                    record_member(
+                        new_op,
+                        [
+                            (level.tiled_dims, level.tiled_reduction_dims)
+                            for level in levels
+                        ],
+                    )
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is

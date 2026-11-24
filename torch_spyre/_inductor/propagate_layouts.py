@@ -90,7 +90,6 @@ from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
     dense_relocation_serves_read,
-    expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     forward_valid_elements,
@@ -1148,6 +1147,57 @@ def _single_arg_op_layout(
     )
 
 
+def _clone_absent_stick_input_target(
+    arg: PropArg,
+    stick_expr: sympy.Expr,
+    out_stl: SpyreTensorLayout,
+    output_dep: MemoryDep,
+) -> SpyreTensorLayout | None:
+    """Return the size-1-stick input STL for a clone that broadcasts into a new
+    stick, or None when the clone does not need split.
+
+    The split is required when the output stick symbol is absent from every
+    device coordinate of the input and the input stick is symbolic: RESTICKIFY_OP
+    cannot move the input stick off and fill the new one in one copy, and
+    padding has no input dim to pad (``_pad_restickify_input``).  The test
+    mirrors ``is_restickify_coords``: both sides are device coordinates, which
+    ``device_coordinates`` sets over the op's iteration.
+
+    Returns None, keeping ``AnyInNode``, when any candidate input
+    layout already has a constant stick (the clone is an identity broadcast
+    fill from it) or no candidate has a size-1 restickify target.
+    """
+    if not stick_expr.free_symbols:
+        return None
+    out_coords = try_device_coordinates(out_stl, output_dep, None)
+    if out_coords is None:
+        return None
+    out_stick_syms = out_coords[-1].free_symbols & output_dep.ranges.keys()
+    if not out_stick_syms:
+        return None
+    in_dep = arg.dep
+    feasible: list[tuple[SpyreTensorLayout, list[sympy.Expr]]] = []
+    for cand in arg.layouts:
+        coords = try_device_coordinates(cand, in_dep, None)
+        if coords is None:
+            continue
+        in_syms = set().union(*(c.free_symbols for c in coords))
+        if not coords[-1].free_symbols or not out_stick_syms.isdisjoint(in_syms):
+            return None
+        if is_stick_expr_offset_free(coords[-1], cand.elems_per_stick()):
+            feasible.append((cand, coords))
+    if not feasible:
+        return None
+    in_host_coords = host_coordinates(arg.layout, in_dep, None)
+    for cand, coords in feasible:
+        target = compute_restickify_target_layout(
+            cand, arg.layout, sympy.S.Zero, in_host_coords, coords, arg=arg
+        )
+        if target is not None:
+            return target
+    return None
+
+
 def _clone_layout(
     op: Operation,
     output: FixedLayout,
@@ -1160,6 +1210,13 @@ def _clone_layout(
     Case 1: Input has supported stick expression
       - No restickify insertion needed
       - Clone op becomes identity if input is already row-major, otherwise becomes restickify
+
+    Case 1b: Output stick is a broadcast dim the input does not index
+      (e.g., ``x.unsqueeze(1).expand(T, K).clone()``)
+      - RESTICKIFY_OP cannot both move the input stick off and fill the new
+        stick in one copy, and padding has no input dim to pad
+      - hence, restickify the input onto a size-1 stick before the clone
+      - clone op then becomes an identity broadcast fill upto interleaved value.
 
     Case 2: Input has unsupported stick expression (due to offset)
       - Insert restickify before clone to swap stick with non-stick dimension
@@ -1192,6 +1249,15 @@ def _clone_layout(
     )
 
     if is_stick_expr_offset_free(stick_expr, stick_size):
+        required_in_stl = _clone_absent_stick_input_target(
+            args[0], stick_expr, out_stl, output_dep
+        )
+        if required_in_stl is not None:
+            # Case 1b: move the input stick onto a size-1 dim (target stick 0).
+            op.restick_cost_fn = FixedInOutNode.from_args(
+                args, out_stl, [required_in_stl], op, output_dep
+            )
+            return [out_stl]
         # Case 1: No restickify insertion needed.
         # Use AnyInNode to produce the fixed output layout.
         op.restick_cost_fn = AnyInNode.from_args()
@@ -1845,13 +1911,29 @@ def _matmul_layouts(
         x_req_stl = generate_stl_with_required_stick(
             x, stick_var, data.reduction_type, "x"
         )
-        y_dim_order = list(range(len(y.layout.size))) + [-1]
-        y_req_stl = SpyreTensorLayout(
-            [concretize_expr(s) for s in y.layout.size],
-            [concretize_expr(s) for s in y.layout.stride],
-            y.layout.dtype,
-            y_dim_order,
+        # If y already carries a QFP8WT EA (e.g. from a KV-cache gather), pass
+        # it through directly.  The hardware's batchmatmulfp8 op understands the
+        # 2D-stick weight layout regardless of N size; building a STANDARD
+        # sparse-stick STL here would produce a dense→sparse scatter
+        # incompatibility in the beam search.
+        _y_qfp8wt = next(
+            (
+                stl
+                for stl in y.layouts
+                if stl.element_arrangement == ElementArrangement.QFP8WT
+            ),
+            None,
         )
+        if _y_qfp8wt is not None:
+            y_req_stl = _y_qfp8wt
+        else:
+            y_dim_order = list(range(len(y.layout.size))) + [-1]
+            y_req_stl = SpyreTensorLayout(
+                [concretize_expr(s) for s in y.layout.size],
+                [concretize_expr(s) for s in y.layout.stride],
+                y.layout.dtype,
+                y_dim_order,
+            )
         # Output stick is on the last host dim (N=1 collapses N to a scalar position).
         out_dims = len(output.size)
         out_stick_dim = out_dims - 1
@@ -2539,28 +2621,6 @@ def _topk_layouts(
     return results
 
 
-def _compact_layout(
-    op: Operation,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    args: list[PropArg],
-) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact: output is the default dense STL."""
-
-    if len(args) != 1:
-        raise Unsupported(f"({op.get_name()}) requires exactly one input")
-
-    in_arg = args[0]
-    out_layouts = []
-
-    for in_stl in in_arg.layouts:
-        _, out_stl = expand_sparse(in_stl, output)
-        out_layouts.append(out_stl)
-
-    op.restick_cost_fn = AnyInNode.from_args()
-    return out_layouts
-
-
 def _keep_by_index_layouts(
     op: Operation,
     output: FixedLayout,
@@ -2958,6 +3018,18 @@ def _align_single_source_producer(
     if not isinstance(producer, ComputedBuffer):
         return
     if not isinstance(producer.data, Pointwise):
+        return
+    # Do not overwrite a producer whose layout already carries a non-STANDARD
+    # element arrangement (e.g. QFP8WT 2D-stick from qfp8wt).  The alt_stl for
+    # the mutation target is always STANDARD; forcing it onto the producer strips
+    # the arrangement and causes the codegen to misread the HBM layout.  The
+    # caller then gives the target the same QFP8WT arrangement (see
+    # source_is_qfp8wt there), so producer and target still agree.
+    if any(
+        getattr(stl, "element_arrangement", ElementArrangement.STANDARD)
+        != ElementArrangement.STANDARD
+        for stl in getattr(producer, "layouts", [])
+    ):
         return
     producer.layouts = [alt_stl]
 
@@ -3782,6 +3854,7 @@ def propagate_spyre_tensor_layouts(
                 rw = op_read_writes(op)
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
+                caller_target_stl = target_stl
 
                 # An unsupported write stick expression (an offset like v+32, or
                 # an offset-free sub-stick write) needs the stick dim relocated
@@ -3827,6 +3900,53 @@ def propagate_spyre_tensor_layouts(
                         )
                     op._restickify_plan = (target_name, target_stl, alt_stl)
                     target_stl = alt_stl
+
+                # When the scatter source carries QFP8WT EA (i.e. the value
+                # being written was produced by quantize_weight_fp8_with_scale),
+                # the destination must be QFP8WT too so that:
+                #   1. reorder_nonstick_dims sees QFP8WT on k_cache and the
+                #      deferred IA-rotate entry records QFP8WT EA.
+                #   2. _ia_rotate_stl (with EA preservation) propagates QFP8WT
+                #      into the required_stl of the _DeferredReorder.
+                #   3. reorder_nonstick_dims_mutation rewrites the target's layout
+                #      in place to that required_stl, so the scatter writes in
+                #      2D-stick addressing with no copy-in / copy-back.
+                # A graph input must already be QFP8WT: the caller's tensor keeps
+                # the layout it was allocated with, so relabelling a STANDARD
+                # input here would leave its device_tensor_layout() wrong for
+                # every later reader.  Internal buffers are promoted.
+                # Only an indirect scatter is a QFP8WT scatter.  A plain copy
+                # (e.g. the clone of a QFP8WT weight) keeps its own layouts.
+                source_is_qfp8wt = output_dep.is_indirect() and any(
+                    any(
+                        stl.element_arrangement == ElementArrangement.QFP8WT
+                        for stl in a.layouts
+                    )
+                    for a in args
+                    if a.dep.name != target_name
+                )
+                if (
+                    source_is_qfp8wt
+                    and graph_input is not None
+                    and caller_target_stl.element_arrangement
+                    != ElementArrangement.QFP8WT
+                ):
+                    raise Unsupported(
+                        f"QFP8WT scatter into graph input {target_name} requires "
+                        f"a QFP8WT destination; allocate it with "
+                        f"torch_spyre.model_utils.zeros_qfp8wt "
+                        f"(got {caller_target_stl.element_arrangement})"
+                    )
+                if source_is_qfp8wt:
+                    qfp8wt_stl = target_stl.with_element_arrangement(
+                        ElementArrangement.QFP8WT
+                    )
+                    if graph_input is not None:
+                        graph_input.layouts = [qfp8wt_stl]
+                    elif target_buf is not None:
+                        target_buf.layouts = [qfp8wt_stl]
+                    target_stl = qfp8wt_stl
+
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op

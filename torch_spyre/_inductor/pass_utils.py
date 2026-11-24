@@ -108,7 +108,7 @@ _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
     "iteration_space_ownership",
-    "loop_info",
+    "loop_member",
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
@@ -171,6 +171,12 @@ def copy_op_metadata(
     for attr in attrs:
         if hasattr(src, attr):
             setattr(dst, attr, getattr(src, attr))
+    if getattr(src, "_loop_chain", ()):
+        # ``src`` is a member of built loop nodes (they, not an attribute, hold
+        # that). ``dst`` is a copy of it: when a loop_node helper places ``dst``
+        # in those nodes it becomes a member that tiles what ``src`` tiles, unless
+        # the pass clears this (a drain or a hoisted clone is not a member).
+        dst._member_like = src  # type: ignore[attr-defined]
 
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -1366,6 +1372,30 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(eff, output_dep, sizes)
 
 
+def restickify_sweep_dim(
+    device_size: Sequence[int],
+    stride_map: Sequence[int] | None,
+    device_coords: Sequence[Expr],
+    elems_per_stick: int,
+) -> int | None:
+    """Index of the gap dim a size-1 restickify sweeps on its intact operand, if any.
+
+    When the host dim on one side of a restickify has size 1, the padding pass
+    (``_pad_elided_dim``) gives the other, intact operand an outermost
+    size-``elems_per_stick`` dim that holds no data (``stride_map`` 0) and that
+    nothing indexes (coordinate 0). Codegen (``_restickify_restore_elided_dim``)
+    later binds a loop variable to it, and the kernel sweeps all its slices on
+    every core.  Work division and codegen both find the dim through this rule, so
+    the span check counts the same dim the kernel sweeps.  Without a stride map
+    there is no gap dim to find.
+    """
+    if stride_map is None:
+        return None
+    if len(device_size) < 2 or device_size[0] != elems_per_stick:
+        return None
+    return 0 if stride_map[0] == 0 and device_coords[0] == 0 else None
+
+
 def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
 
@@ -1948,9 +1978,9 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     set membership on dep.index.free_symbols alone (see issue #3888): both are
     "in y and the output, but not in x".
 
-    op.loop_info.loop_tiled_dims (stamped by coarse-tiling before layout
-    propagation runs, per passes.py's pass ordering) lists, per nesting
-    level, the raw op.data.ranges positions this loop group tiles -- for the
+    Each of the op's loop levels' ``tiled_dims`` (``enclosing_loops``; coarse-tiling
+    records them before layout propagation runs, per passes.py's pass ordering)
+    lists the raw op.data.ranges positions this loop group tiles -- for the
     innermost tile-body op itself, this op's own write is already the
     tile-local slice, so loop_tiled_dims is the only surviving
     signal identifying which raw dims the enclosing loop nest tiles at all.
@@ -2589,7 +2619,8 @@ def unrepresentable_splits_by_index_coeff(
     :func:`finalize_work_division_for_scheduler` (which must never see a
     non-empty result once those checks hold, and raises if it does).
     """
-    reduction_syms = {sym for sym in it_space if write_index.coeff(sym) == 0}
+    write_index_syms = write_index.free_symbols
+    reduction_syms = {sym for sym in it_space if sym not in write_index_syms}
     problems: list[str] = []
     for label, index, symbols in (
         ("output", write_index, [s for s in it_space if s not in reduction_syms]),
@@ -2665,9 +2696,10 @@ def splits_by_index_coeff(
     """
     skip = lambda v: v <= 1  # noqa: E731
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
-    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
+    write_index_syms = write_index.free_symbols
+    # Reduction splits: symbols not in write_index but in read_index
     reduction_only = {
-        sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
+        sym: val for sym, val in splits.items() if sym not in write_index_syms
     }
     reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
     return output_splits, reduction_splits
@@ -3264,15 +3296,12 @@ def is_sparse_stl(stl) -> bool:
 
 
 def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]:
-    """Returns STL to transform the input into the canonical representation the output.
+    """The canonical dense STL of ``output``, and whether ``in_stl`` needs a restickify
+    into it.
 
-    If the input is sparse and the canonical output is not, an extra stick-size dimension
-    is added to the front of the canonical output representation so that restickify can
-    transpose the sparse stick dimension to make it contiguous. The index expression already
-    does the required slicing on the result.
-
-    If the input is not sparse or the output is also sparse no transformation is required
-    the canonical output STL is returned.
+    A sparse input restickifies into the dense canonical layout. That restickify is
+    size-1 on the sparse side, so the padding pass gives the target the size-64 gap
+    dim its sweep needs (``_pad_elided_dim``), as for any other size-1 restickify.
     """
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -3288,18 +3317,7 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
         assert not out_is_sparse
 
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
-
-    if restick:
-        eps = in_stl.elems_per_stick()
-        out_stl = SpyreTensorLayout(
-            [eps] + out_stl.device_size,
-            [c_stride[0] * c_size[0]] + out_stl.stride_map,
-            out_stl.device_dtype,
-            prepend_dim_valid_elements(out_stl, eps),
-        )
-        return True, out_stl
-
-    return False, out_stl
+    return restick, out_stl
 
 
 def sparse_stl_from_host(
@@ -5362,8 +5380,9 @@ def _per_core_view_on_buf(
 
     prep = _prepare_per_core_view(op, dep, buf_name)
     write_index = prep.write_index if prep is not None else sympy.S.Zero
+    write_index_syms = write_index.free_symbols
     reduction_splits = {
-        sym: split for sym, split in splits.items() if write_index.coeff(sym) == 0
+        sym: split for sym, split in splits.items() if sym not in write_index_syms
     }
     result = _per_core_view_from_prep(
         prep,
@@ -5395,11 +5414,11 @@ def completed_reduction_split_on_buf(
     ownership = getattr(op, "iteration_space_ownership", None)
     if prep is None or ownership is None:
         return None
+    write_index_syms = prep.write_index.free_symbols
     reduction_splits = [
         int(ownership.work_slices.get(sym, 1))
         for sym in prep.iter_space
-        if prep.write_index.coeff(sym) == 0
-        and int(ownership.work_slices.get(sym, 1)) > 1
+        if sym not in write_index_syms and int(ownership.work_slices.get(sym, 1)) > 1
     ]
     if len(reduction_splits) != 1 or prep.stick_host_stride is None:
         return None
@@ -5472,8 +5491,13 @@ def format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  op_it_space_splits={readable_splits}")
             if dim_hints := getattr(op, "dim_hints", None):
                 buf.write(f"\n  dim_hints={dim_hints}")
-            if loop_info := getattr(op, "loop_info", None):
-                buf.write(f"\n  loop_info={loop_info}")
+            if levels := enclosing_loops(op):
+                # (group path, trip count, tiled dims, tiled reduction dims) per
+                # level; test_loop_scheduler_readers pins the format.
+                buf.write(
+                    "\n  loop_levels="
+                    f"{[(x.group_path, x.trip_count, x.tiled_dims, x.tiled_reduction_dims) for x in levels]}"
+                )
             buf.write(f"\n  {_strip_stack_traces(str(op.data))}")
         buf.write("\n\n")
     return buf.getvalue()

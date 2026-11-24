@@ -364,13 +364,14 @@ class GraphEditor:
         * a hoisted input clone (``lower_before``) runs once, before the loop its
           consumers run in, so it goes right before that outermost entry, when
           ``lower_before`` is the entry's first op. If ops that are not counted
-          loop members (extern kernels keep their ``loop_info``) come first in the
+          loop members (extern kernels keep their ``loop_member``) come first in the
           loop, ``lower_before`` is not the first op and the clone goes right before
           it, in the body, as before: the allocator's live-range gate only looked
           from ``lower_before`` on;
         * an output clone with no drain plan copies the buffer's final value and
-          carries the buffer's ``loop_info``, so it goes right after its last
-          writer, in that writer's list (a member stays a member);
+          takes the writer's loop membership (``copy_op_metadata``), so it goes
+          right after its last writer, in that writer's list (a member stays a
+          member);
         * any other clone goes right before its first consumer, in that
           consumer's list: it runs every trip when the consumer is in a loop body.
 

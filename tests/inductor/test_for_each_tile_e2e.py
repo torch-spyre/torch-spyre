@@ -64,9 +64,10 @@ from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.constants import RESTICKIFY_OP
+from torch_spyre._inductor.loop_facts import counted_loop_path
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
-from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+from torch_spyre._inductor.wsr.for_each_tile import Gather, for_each_tile
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     PrescribedRegion,
@@ -515,7 +516,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         to scatter elements from one stick to multiple sticks").
 
         Now passes: confirmed via isolated stash/pop bisection that this is
-        fixed by the splice-var/``loop_info`` symbol-consistency work in
+        fixed by the splice-var/``loop_member`` symbol-consistency work in
         ``spyre_kernel.py``/``for_each_tile_lowering.py`` (the same issue
         #4706 OS-5/``_synthesize_dim_hints_for_group`` fixes described in
         ``test_nested_for_each_tile_value_correct``'s docstring, which
@@ -1237,14 +1238,15 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
 
 def _record_loop_membership(result: dict):
     """A pre-scheduling pipeline that records, once it is done, where the ops that
-    claim a loop (by ``loop_info.loop_group_id``) sit in the node tree.
+    claim a loop (``enclosing_loops``) sit in the node tree.
 
     An extern constant is exempt: ``dedup_and_promote_constants`` hoists a body
-    constant to the head of the graph and it keeps its ``loop_info`` (see
+    constant to the head of the graph and it keeps its ``loop_member`` (see
     ``counted_loop_path``), so it claims a loop from the top level by design.
     ``result`` is filled in rather than kept on the class, so tests share no state.
     """
     from torch_spyre._inductor.ir import SpyreConstantFallback
+    from torch_spyre._inductor.loop_facts import enclosing_loops
     from torch_spyre._inductor.loop_node import LoopNode
 
     class _Record(CustomPreSchedulingPasses):
@@ -1252,10 +1254,8 @@ def _record_loop_membership(result: dict):
             super().__call__(graph)
 
             def claims_a_loop(op):
-                return (
-                    not isinstance(op, SpyreConstantFallback)
-                    and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
-                    is not None
+                return not isinstance(op, SpyreConstantFallback) and bool(
+                    enclosing_loops(op)
                 )
 
             result["top_level"] = [
@@ -1321,7 +1321,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
             if name in region.unstamped:
                 continue
             self.assertEqual(
-                op.loop_info.loop_group_id[0],
+                counted_loop_path(op, include_extern=True)[0],
                 region.loop_group_id,
                 f"{name} is stamped by another loop than its region's",
             )
@@ -1329,8 +1329,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         strays = [
             op.get_operation_name()
             for op in outside
-            if getattr(op, "loop_info", None) is not None
-            and op.loop_info.loop_group_id[0] == region.loop_group_id
+            if counted_loop_path(op, include_extern=True)[:1] == (region.loop_group_id,)
         ]
         self.assertFalse(strays, f"{strays} belong to the loop but lie outside it")
 
@@ -1370,7 +1369,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         (region,) = regions
         self._assert_region_is_whole(operations, region)
         depths = {
-            len(op.loop_info.loop_count)
+            len(counted_loop_path(op, include_extern=True))
             for op in operations[region.start : region.stop]
             if op.get_operation_name() not in region.unstamped
         }
@@ -1683,12 +1682,12 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         hardware limit if the work-division planner is free to split its row
         dim across cores. Before the fix, _transfer_loop_info left the
         embedding consumer's own loop_tiled_dims on that copy's deep-copied
-        LoopInfo, which coarse_tile_local_dim_split_domains misread as
+        LoopMember, which coarse_tile_local_dim_split_domains misread as
         "the copy's row dim is loop-tiled" and pinned its core split to 1,
         making every split attempt fail with "per-core tensor span 384.500
         MB ... exceeds hardware limit of 256.00 MB" -- reproduced by
         temporarily reverting the two-line fix in insert_restickify.py's
-        `elif hasattr(op, "loop_info")` branch. The sibling non-looped case
+        `elif hasattr(op, "loop_member")` branch. The sibling non-looped case
         (same bug class, no loop involved) is covered by
         test_embedding_large_vocab_table_no_span_overflow in
         test_indirect_access_gather.py.
@@ -1706,7 +1705,7 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         per-trip relayout handled by ``_transfer_loop_info``'s first
         branch). The copy this test exercises is the *loop-invariant*
         full-table case handled by that function's ``elif hasattr(op,
-        "loop_info")`` branch -- the one the fix touches -- which SDSC
+        "loop_member")`` branch -- the one the fix touches -- which SDSC
         lowers to a plain ``op='identity'`` whose ``debug_handle.ir_chain``
         names the restickify IR node (``'restickify_default'``) instead.
         """
@@ -2519,6 +2518,208 @@ class TestForEachTileFusionScoringE2E(_DynamoResetTestCase):
 
         self.assertEqual(tuple(out.shape), (FS_KV, FS_QG, 4, 1))
         self.assertTrue(torch.isfinite(out).all())
+
+
+class TestForEachTileCallerOwnedOutputE2E(_DynamoResetTestCase):
+    """for_each_tile(out=...) on device: each step writes its tile into the caller's tensor.
+
+    ``TestCallerOwnedOutput`` in test_for_each_tile.py checks the post-grad graph on
+    CPU. These compile through the Spyre backend, where the destination reaches the
+    loop as a MUTATED ADDITIONAL INPUT of the ``while_loop``, written by an
+    ``index_put`` in the body, which ``splice_while_loop`` rebinds to the caller's
+    buffer. Each test checks the caller's tensor after the call.
+    """
+
+    TRIPS, ROWS = 4, 32
+
+    def _run(self, fn, *args):
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        with (
+            torch.inference_mode(),
+            warnings.catch_warnings(),
+            config.patch(backend_loop_unroll=False),
+        ):
+            warnings.simplefilter("error", FallbackWarning)
+            return torch.compile(fn, fullgraph=True, dynamic=False)(*args)
+
+    @staticmethod
+    def _scatter_rows_fn(read_after=False):
+        """Trip ``i`` writes ``values[i] + 1`` into ``pool[index[i]]``."""
+
+        def fn(values, index, pool):
+            def body(_, tiles):
+                (v,) = tiles
+                return None, v[0] + 1
+
+            for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=1,
+                out_dim=Gather(0, index),
+                out=pool,
+            )
+            return pool * 2 if read_after else None
+
+        return fn
+
+    def _scatter_rows_inputs(self, width):
+        """Values, the index table on device, the initial pool and the expected pool.
+
+        The index table is ``[trips, rows]`` int32 with each trip's row starting at a
+        stick boundary (the layout #5157's scatter carry requires). All rows are
+        distinct, and the pool rows nothing writes must keep their initial value.
+        """
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        trips, rows = self.TRIPS, self.ROWS
+        generator = torch.Generator().manual_seed(931)
+        values = (
+            torch.randn(trips, rows, width, generator=generator, dtype=torch.float16)
+            * 0.125
+        )
+        index = torch.randperm(6 * rows, generator=generator)[: trips * rows]
+        index = index.reshape(trips, rows).contiguous()
+        initial = torch.full((6 * rows, width), 3.0, dtype=torch.float16)
+        expected = initial.float()
+        expected[index.reshape(-1)] = values.reshape(-1, width).float() + 1
+        index_layout = SpyreTensorLayout(
+            device_size=[trips, rows // 32, 32],
+            stride_map=[rows, 32, 1],
+            device_dtype=get_device_dtype(torch.int32),
+            valid_elements={(0,): trips, (1, 2): rows},
+        )
+        index = index.to(torch.int32).to(DEVICE_NAME, device_layout=index_layout)
+        return values.to(DEVICE_NAME), index, initial, expected
+
+    @expects_raise
+    def test_eager_out_of_range_index_is_rejected(self):
+        """An eager call checks the index on the host, which a Spyre kernel does not."""
+        values = torch.zeros(2, self.ROWS, 64, dtype=torch.float16).to(DEVICE_NAME)
+        index = torch.arange(2 * self.ROWS, dtype=torch.int32).reshape(2, self.ROWS)
+        index[1, -1] = 2 * self.ROWS
+        dest = torch.zeros(2 * self.ROWS, 64, dtype=torch.float16).to(DEVICE_NAME)
+
+        def body(_, tiles):
+            (v,) = tiles
+            return None, v[0] + 1
+
+        with (
+            torch.inference_mode(),
+            self.assertRaisesRegex(IndexError, "names row 64, outside the 64 rows"),
+        ):
+            for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=1,
+                out_dim=Gather(0, index.to(DEVICE_NAME)),
+                out=dest,
+            )
+
+    def test_gather_rows_into_caller_pool(self):
+        """KV-cache-style write into a pool uploaded with the default layout.
+
+        The scatter wants the indexed dim outermost, so the pool is copied in and
+        out around each trip's write; the next test avoids that.
+        """
+        values, index, initial, expected = self._scatter_rows_inputs(width=64)
+        pool = initial.to(DEVICE_NAME)
+        self._run(self._scatter_rows_fn(), values, index, pool)
+        torch.testing.assert_close(pool.cpu().float(), expected, atol=0.005, rtol=0.02)
+
+    def test_gather_rows_into_indirect_access_pool(self):
+        """A pool in the indirect-access layout (indexed dim outermost) is written in place.
+
+        The loop body holds only the tile's ``+ 1`` and the scatter, with no copy of
+        the pool around it, and a read of the pool later in the same graph sees every
+        trip's rows. Two sticks per row.
+        """
+        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
+
+        values, index, initial, expected = self._scatter_rows_inputs(width=128)
+        pool = _dma_to_spyre_indirect_access(initial)
+        result: dict = {}
+        with (
+            # A cache hit would skip the pipeline the recorder inspects.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                ts_passes, "CustomPreSchedulingPasses", _record_loop_membership(result)
+            ),
+        ):
+            doubled = self._run(
+                self._scatter_rows_fn(read_after=True), values, index, pool
+            )
+        self.assertEqual(result["top_level"], [])
+        self.assertEqual(len(result["in_body"]), 2, result["in_body"])
+        torch.testing.assert_close(pool.cpu().float(), expected, atol=0.005, rtol=0.02)
+        torch.testing.assert_close(
+            doubled.cpu().float(), expected * 2, atol=0.01, rtol=0.02
+        )
+
+    def test_gather_index_shared_with_an_operand_under_a_declared_dim(self):
+        """One row table feeds the body's gather and scatters its result, at every count.
+
+        The trip count is declared with ``dynamic=``. A second loop input on the same
+        table was cloned outside the loop, which a declared dim refuses.
+        """
+        from torch._dynamo.utils import counters
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
+
+        trips_max, rows, width, pool_rows = 16, 32, 64, 1024
+        spec = {"min": 8, "max": trips_max, "granularity": 1}
+
+        def fn(table, src, dest):
+            def body(_, tiles):
+                rows_t, src_whole = tiles
+                return None, src_whole.index_select(0, rows_t[0]) + 1
+
+            for_each_tile(
+                body,
+                (table, src),
+                dims=(0, None),
+                tile_size=1,
+                out_dim=Gather(0, table),
+                out=dest,
+            )
+
+        generator = torch.Generator().manual_seed(7)
+        table_cpu = torch.randperm(pool_rows, generator=generator)[: trips_max * rows]
+        table_cpu = table_cpu.reshape(trips_max, rows).to(torch.int32).contiguous()
+        src_cpu = (
+            torch.randn(pool_rows, width, generator=generator, dtype=torch.float16)
+            * 0.125
+        )
+        layout = SpyreTensorLayout(
+            device_size=[trips_max, rows // 32, 32],
+            stride_map=[rows, 32, 1],
+            device_dtype=get_device_dtype(torch.int32),
+            valid_elements={(0,): trips_max, (1, 2): rows},
+        )
+        table = table_cpu.to(DEVICE_NAME, device_layout=layout, dynamic={0: spec})
+        src = _dma_to_spyre_indirect_access(src_cpu)
+        compiled = torch.compile(fn, fullgraph=True)
+        counters.clear()
+        with torch.inference_mode(), config.patch(backend_loop_unroll=False):
+            for trips in (trips_max, 8, 11):
+                if table.size(0) != trips:
+                    table.resize_((trips, rows))
+                dest_cpu = torch.zeros(pool_rows, width, dtype=torch.float16)
+                dest = _dma_to_spyre_indirect_access(dest_cpu)
+                compiled(table, src, dest)
+                written = table_cpu[:trips].reshape(-1).long()
+                expected = dest_cpu.float()
+                expected[written] = src_cpu[written].float() + 1
+                torch.testing.assert_close(
+                    dest.cpu().float(),
+                    expected,
+                    atol=0.005,
+                    rtol=0.02,
+                    msg=f"at {trips} trips",
+                )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
 
 if __name__ == "__main__":

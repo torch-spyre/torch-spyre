@@ -301,7 +301,7 @@ class TensorArg:
             level's own symbol, reprojected to
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
-            ops without loop_info/coarse tiling.
+            ops in no counted loop.
         work_division: Optional tensor-specific ownership used when it differs
             from the operation's work division.
         kernel_local: True when nothing outside the kernel that produced this
@@ -323,6 +323,17 @@ class TensorArg:
             sharded storage (core c reads or writes only chunk c, through its
             own start address, ``nonUnifiedAllocInHBM_``; see sharded_hbm.py);
             0 for ordinary storage. Checked against the real tensor at launch.
+        non_unified_shard_dim: The iteration-space symbol of the shard dim of
+            this tensor's sharding, when the tensor is sharded storage; None
+            otherwise. The sharded planner pins the work split on the shard
+            dim, and the codegen guard (``verify_non_unified_split``) checks
+            the committed split against this symbol, so a later pass that
+            re-divides the op on any other dim is rejected. Derived from the
+            tensor's placement against the same iteration space the SDSC is
+            emitted from (Inductor mints fresh index symbols per trace, so a
+            symbol captured at planning time can be renamed by scheduling);
+            the SDSC layer maps it to the emitted dim label alongside every
+            other symbol.
     """
 
     is_input: bool
@@ -340,6 +351,7 @@ class TensorArg:
     kernel_local: bool = False
     replicated_scalar: bool = False
     non_unified_shard_bytes: int = 0
+    non_unified_shard_dim: Symbol | None = None
     stride_map: list[int] | None = None
 
     @property
@@ -397,7 +409,7 @@ class OpSpec:
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
         tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
-            to its own nesting level's trip count (LoopInfo.loop_count
+            to its own nesting level's trip count (LoopMember.loop_count
             for that level). Used by SDSC codegen to compute each tiled
             tensor's full pre-tiling extent as
             (per-unit-step device element advance) * trip_count, without

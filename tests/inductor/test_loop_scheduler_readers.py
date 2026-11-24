@@ -17,9 +17,9 @@
 Since ``CustomPreSchedulingPasses`` stopped expanding the ``LoopNode``s, every
 reader after the pass loop sees them: the work-division finalizer, the INFO
 listing (``format_operations``), the cost-model report and dump, and, after
-``Scheduler.__init__``, the pre-fusion passes (``propagate_mutation_layouts``,
-``build_loop_scheduler_nodes``).  Each must read a loop's body exactly as it
-read the flat list.  Everything runs on the CPU with real Inductor objects.
+``Scheduler.__init__``, the pre-fusion pass (``propagate_mutation_layouts``).
+Each must read a loop's body exactly as it read the flat list.  Everything runs
+on the CPU with real Inductor objects.
 """
 
 import unittest
@@ -45,11 +45,11 @@ from torch._inductor.virtualized import V
 
 from torch_spyre._inductor import cost_model_pass as cmp
 from torch_spyre._inductor import dump_cost_model as dcm
-from torch_spyre._inductor import loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import propagate_layouts
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_facts import counted_loop_path
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.loop_node import LoopNode, all_ops, expand
 from torch_spyre._inductor.loop_scheduler import (
     LoopSchedulerNode,
@@ -59,12 +59,6 @@ from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import (
     finalize_work_division_for_scheduler,
     format_operations,
-)
-from torch_spyre._inductor.scheduler import (
-    CountedLoopSchedulerNode,
-    _loop_group_id,
-    _regroup_by_outer_loop_key,
-    build_loop_scheduler_nodes,
 )
 from torch_spyre._inductor.scratchpad.utils import storage_has_single_writer
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
@@ -125,7 +119,7 @@ class _Graph(unittest.TestCase):
         V.graph.name_to_buffer[name] = buf
         V.graph.name_to_op[name] = buf
         if gid is not None:
-            buf.loop_info = LoopInfo(
+            buf.loop_member = LoopMember(
                 loop_group_id=gid,
                 loop_count=[4] * len(gid),
                 loop_tiled_dims=[[] for _ in gid],
@@ -194,6 +188,34 @@ class TestFinalizer(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestPerPassDump(_Graph):
+    """The ``SPYRE_LOG_PASSES`` dump prints the real nested list."""
+
+    def _dump(self, graph, log_passes):
+        from torch_spyre._inductor import passes
+
+        with mock.patch.object(passes, "logger") as log:
+            log.isEnabledFor.return_value = True
+            with config.patch({"log_passes": log_passes}):
+                passes._log_after_pass(graph, "somepass")
+        return log.debug.call_args
+
+    def test_dump_indents_a_loops_body_under_its_node(self):
+        a = self._buf("a")
+        b = self._buf("b", reads="a", gid=(0,))
+        graph = self._graph([a, self._loop("loopnode0", [b])])
+        call = self._dump(graph, "somepass")
+        self.assertEqual(call.args[:2], ("AFTER %s\n%s", "somepass"))
+        text = call.args[2]
+        self.assertIn("loopnode0: LoopNode trip_count=4", text)
+        self.assertIn("\n  b: ComputedBuffer", text)
+        self.assertNotIn("\nb: ComputedBuffer", text)
+
+    def test_dump_is_off_for_a_pass_not_listed(self):
+        graph = self._graph([self._buf("a")])
+        self.assertIsNone(self._dump(graph, "other"))
+
+
 class TestFormatOperations(_Graph):
     def test_flat_list_output_is_unchanged(self):
         # The text a flat list printed before nodes existed: one entry per op,
@@ -203,7 +225,7 @@ class TestFormatOperations(_Graph):
         text = format_operations(ops)
         self.assertEqual(text, "".join(format_operations([op]) for op in ops))
         self.assertTrue(text.startswith("a: ComputedBuffer\n  buffer=a\n  layout="))
-        self.assertIn("\n  loop_info=LoopInfo(loop_group_id=(0,)", text)
+        self.assertIn("\n  loop_levels=[((0,),", text)
         self.assertTrue(text.endswith("\n\n"))
         self.assertNotIn("LoopNode", text)
 
@@ -300,7 +322,7 @@ class TestCostReaders(_Graph):
 
 
 # ---------------------------------------------------------------------------
-# Scheduler side: _loop_group_id, build_loop_scheduler_nodes, mutation layouts
+# Scheduler side: the scheduler nodes of a LoopNode, mutation layouts
 # ---------------------------------------------------------------------------
 
 
@@ -331,27 +353,7 @@ class TestSchedulerPassThrough(_Graph):
         sched.compute_ancestors()
         return sched.nodes
 
-    def test_loop_group_id_of_a_loop_node_is_none(self):
-        b = self._buf("b", gid=(0,))
-        c = self._buf("c", reads="b", gid=(0, 0))
-        self.outputs = ["c"]
-        loop = self._loop("loopnode0", [b, self._loop("loopnode1", [c], trip=2)])
-        (snode,) = self._front_half([loop])
-        self.assertIsInstance(snode, LoopSchedulerNode)
-        self.assertIsNone(_loop_group_id(snode))
-        self.assertIsNone(_loop_group_id(snode.snodes[1]))
-        # Its leaves still report their own loop membership.
-        self.assertEqual(_loop_group_id(snode.snodes[0]), (0,))
-
-    def test_loop_group_id_of_a_flat_counted_loop_is_none(self):
-        b = self._buf("b", gid=(0,))
-        self.outputs = ["b"]
-        (leaf,) = self._front_half([b])
-        self.assertEqual(_loop_group_id(leaf), (0,))
-        group = CountedLoopSchedulerNode.create([leaf], 4)
-        self.assertIsNone(_loop_group_id(group))
-
-    def test_build_loop_scheduler_nodes_passes_a_loop_node_through(self):
+    def test_a_loop_node_becomes_one_scheduler_node_with_a_nested_one(self):
         pre = self._buf("pre")
         b = self._buf("b", reads="pre", gid=(0,))
         c = self._buf("c", reads="b", gid=(0, 0))
@@ -359,72 +361,15 @@ class TestSchedulerPassThrough(_Graph):
         self.outputs = ["post", "c"]
         loop = self._loop("loopnode0", [b, self._loop("loopnode1", [c], trip=2)])
         nodes = self._front_half([pre, loop, post])
-        result = build_loop_scheduler_nodes(list(nodes))
-        self.assertEqual([n.get_name() for n in result], ["pre", "loopnode0", "post"])
-        self.assertIs(result[1], nodes[1])
-        self.assertIsInstance(result[1], LoopSchedulerNode)
-        self.assertIsInstance(result[1].snodes[1], LoopSchedulerNode)
-        # Not wrapped again: one loop at each level.
+        self.assertEqual([n.get_name() for n in nodes], ["pre", "loopnode0", "post"])
+        self.assertIsInstance(nodes[1], LoopSchedulerNode)
+        self.assertIsInstance(nodes[1].snodes[1], LoopSchedulerNode)
+        # One loop at each level, and the leaves keep their own loop membership.
         self.assertEqual(
-            [type(n).__name__ for n in result[1].snodes],
+            [type(n).__name__ for n in nodes[1].snodes],
             ["SchedulerNode", "LoopSchedulerNode"],
         )
-
-    def test_regroup_keeps_a_loop_node_in_place_among_flat_loop_ops(self):
-        # A mixed list: a structured loop and a FLAT loop (its ops carry
-        # loop_info group 1 and still need regrouping, as span-overflow and
-        # allocator tiling produce today).
-        pre = self._buf("pre")
-        b = self._buf("b", reads="pre", gid=(0,))
-        f1 = self._buf("f1", reads="pre", gid=(1,))
-        mid = self._buf("mid", reads="pre")
-        f2 = self._buf("f2", reads="f1", gid=(1,))
-        self.outputs = ["b", "f2", "mid"]
-        loop = self._loop("loopnode0", [b])
-        nodes = self._front_half([pre, loop, f1, mid, f2])
-        names = [n.get_name() for n in nodes]
-        self.assertEqual(names[0], "pre")
-        ordered = _regroup_by_outer_loop_key(list(nodes))
-        # The loop node stays where it was; the flat group-1 ops are made
-        # contiguous around the independent ``mid``.
-        self.assertEqual(
-            [n.get_name() for n in ordered].index("loopnode0"),
-            names.index("loopnode0"),
-        )
-        i1_, i2_ = (
-            [n.get_name() for n in ordered].index("f1"),
-            [n.get_name() for n in ordered].index("f2"),
-        )
-        self.assertEqual(i2_, i1_ + 1)
-        result = build_loop_scheduler_nodes(list(nodes))
-        kinds = [(type(n).__name__, n.get_name()) for n in result]
-        self.assertIn(("LoopSchedulerNode", "loopnode0"), kinds)
-        flat_loops = [n for n in result if type(n) is CountedLoopSchedulerNode]
-        self.assertEqual(len(flat_loops), 1)
-        self.assertEqual([n.get_name() for n in flat_loops[0].snodes], ["f1", "f2"])
-
-    def test_a_flat_member_left_outside_its_loop_node_is_caught(self):
-        # A flat op whose loop_info says it belongs to the loop the node
-        # already is (group 0) would become a second, separate group-0 loop.
-        b = self._buf("b", gid=(0,))
-        mid = self._buf("mid", reads="b")
-        stray = self._buf("stray", reads="mid", gid=(0,))
-        self.outputs = ["stray"]
-        nodes = self._front_half([self._loop("loopnode0", [b]), mid, stray])
-        with self.assertRaisesRegex(RuntimeError, "not contiguous"):
-            build_loop_scheduler_nodes(list(nodes))
-
-    def test_stray_member_is_caught_when_the_first_child_is_a_nested_loop(self):
-        # The check reads the first member's own loop levels: a nested loop
-        # node as first member has no _loop_group_id (it is a loop group).
-        b = self._buf("b", gid=(0, 0))
-        mid = self._buf("mid", reads="b")
-        stray = self._buf("stray", reads="mid", gid=(0,))
-        self.outputs = ["stray"]
-        inner = self._loop("loopnode1", [b], trip=2)
-        nodes = self._front_half([self._loop("loopnode0", [inner]), mid, stray])
-        with self.assertRaisesRegex(RuntimeError, "not contiguous"):
-            build_loop_scheduler_nodes(list(nodes))
+        self.assertEqual(counted_loop_path(nodes[1].snodes[0].node), (0,))
 
     def test_scheduler_time_readers_see_leaf_ops(self):
         # Scheduler._init reads graph.operations once, to make the scheduler
@@ -540,8 +485,8 @@ class TestSchedulerPassThrough(_Graph):
         # external reads, so its body-only buffers showed no read; their
         # range ran to the end of the bundle and the second loop could not
         # reuse the first loop's space (the paged-gather graph: pool 163840
-        # bytes vs 90112 on the flat path).  A buffer a loop writes is live
-        # through that loop's step, and no longer unless read later.
+        # bytes, against 90112 on the since-deleted flat path).  A buffer a loop
+        # writes is live through that loop's step, and no longer unless read later.
         t1 = self._buf("t1", reads="x", gid=(0,))
         o1 = self._buf("o1", reads="t1", gid=(0,))
         t2 = self._buf("t2", reads="x", gid=(1,))
@@ -609,12 +554,6 @@ class TestHandOff(_Graph):
         graph = self._graph_with_loop()
         self._run(graph)
         self.assertIsInstance(graph.operations[1], LoopNode)
-
-    def test_switch_off_expands(self):
-        graph = self._graph_with_loop()
-        with mock.patch.object(loop_scheduler, "SCHEDULE_LOOP_NODES", False):
-            self._run(graph)
-        self.assertEqual([op.get_name() for op in graph.operations], ["a", "b"])
 
     def test_unsupported_release_with_a_loop_raises_naming_the_release(self):
         for text in ("2.12.0", "2.13.0", "2.15.1"):
