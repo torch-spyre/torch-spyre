@@ -1724,8 +1724,10 @@ class TestEAShuffle:
     @_FP16
     def test_ea_shuffle_of_sliced_operand(self, fp16):
         """A staggered operand sliced out of a larger buffer and shuffled."""
+
         def fn(x, y):
             return x[:, 32:96].to(y.dtype) + y[:, 32:96]
+
         x = torch.randn(4, 128, dtype=torch.float32).to(DEVICE_NAME)
         y = torch.randn(4, 128, dtype=fp16).to(DEVICE_NAME)
         _run(fn, x, y, reset_dynamo=True)
