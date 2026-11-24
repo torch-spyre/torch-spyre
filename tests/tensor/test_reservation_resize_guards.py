@@ -314,5 +314,75 @@ class TestReservationWithExplicitLayout(TestCase):
             )
 
 
+# A reserved tensor of rank 3, or of rank 4 and up whose last dim is a whole
+# number of sticks, can request a layout with the reserved dim outermost, so a
+# transfer of fewer than max rows fills one contiguous prefix of the buffer and
+# goes over in one DMA instead of one per outer position (#6026).
+class TestReservedDimOutermost(TestCase):
+    MAX = 16
+    SPEC = {0: {"min": 8, "max": 16, "granularity": 1}}
+
+    def _layout(self, shape: tuple[int, ...]) -> SpyreTensorLayout:
+        # The buffer at max, contiguous, with host dim 0 outermost.
+        size = (self.MAX, *shape[1:])
+        strides: list[int] = []
+        running = 1
+        for extent in reversed(size):
+            strides.insert(0, running)
+            running *= extent
+        dim_order = [1, 0, *range(2, len(size))]
+        return SpyreTensorLayout(size, strides, torch.float16, dim_order)
+
+    def _assert_reserved_dim_outermost(self, x_dev: torch.Tensor) -> None:
+        layout = get_spyre_tensor_layout(x_dev)
+        self.assertEqual(layout.device_size[0], self.MAX)
+        self.assertEqual(layout.stride_map[0], x_dev.stride(0))
+
+    def test_partial_transfer_reads_back_and_keeps_layout_across_resize(
+        self,
+    ) -> None:
+        # Compared with a plain round trip of the same rows, so the device's
+        # own fp16 rounding is on both sides.
+        x = torch.rand(16, 512, 128, dtype=torch.float16)
+        expected = x.to(DEVICE).cpu()
+        layout = self._layout(tuple(x.shape))
+        x_dev = x[:9].to(DEVICE, device_layout=layout, dynamic=self.SPEC)
+        self.assertEqual(
+            list(get_spyre_tensor_layout(x_dev).device_size), [self.MAX, 2, 512, 64]
+        )
+        self._assert_reserved_dim_outermost(x_dev)
+        self.assertTrue(torch.equal(x_dev.cpu(), expected[:9]))
+
+        x_dev.resize_((8, 512, 128))
+        self.assertTrue(torch.equal(x_dev.cpu(), expected[:8]))
+        self._assert_reserved_dim_outermost(x_dev)
+
+        x_dev.resize_((9, 512, 128))
+        self.assertTrue(torch.equal(x_dev.cpu()[:8], expected[:8]))
+        self._assert_reserved_dim_outermost(x_dev)
+
+    def test_rank4_whole_sticks_partial_transfer_reads_back(self) -> None:
+        x = torch.rand(16, 4, 128, 128, dtype=torch.float16)
+        expected = x.to(DEVICE).cpu()
+        layout = self._layout(tuple(x.shape))
+        x_dev = x[:9].to(DEVICE, device_layout=layout, dynamic=self.SPEC)
+        self._assert_reserved_dim_outermost(x_dev)
+        self.assertTrue(torch.equal(x_dev.cpu(), expected[:9]))
+
+    def test_copy_from_strided_source_reads_back(self) -> None:
+        # Contiguous sources can hide a wrong dim map, so copy a column slice
+        # of a wider tensor into the requested layout.
+        wide = torch.rand(9, 512, 256, dtype=torch.float16)
+        src = wide[:, :, :128]
+        expected = src.contiguous().to(DEVICE).cpu()
+        layout = self._layout(tuple(src.shape))
+        x_dev = torch.zeros(9, 512, 128, dtype=torch.float16).to(
+            DEVICE, device_layout=layout, dynamic=self.SPEC
+        )
+        x_dev.copy_(src)
+        self._assert_reserved_dim_outermost(x_dev)
+        self.assertTrue(torch.equal(x_dev.cpu(), expected))
+
+
 if __name__ == "__main__":
     run_tests()

@@ -58,7 +58,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    :caption: Optimization passes
 
    working_set_reduction
-   coarse_tiling_loops
+   loop_nodes
    marker_resolution
    layout_optimization
    cost_model

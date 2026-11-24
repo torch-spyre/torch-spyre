@@ -461,6 +461,16 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph, lx_relayout_plans=plans)
 
 
+def _log_after_pass(graph: GraphLowering, pass_name: str) -> None:
+    """The per-pass IR dump (``SPYRE_LOG_PASSES``), of the real nested list.
+
+    Called once the pass has returned and ``graph.operations`` is the real list
+    again, so a ``LoopNode`` prints its body indented under it.
+    """
+    if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+        logger.debug("AFTER %s\n%s", pass_name, format_operations(graph.operations))
+
+
 @contextlib.contextmanager
 def _flat_operations(graph: GraphLowering, pass_name: str) -> Iterator[None]:
     """For one pre-scheduling pass: if the graph holds LoopNodes, show the pass
@@ -747,6 +757,9 @@ class CustomPreSchedulingPasses:
             # Loops a pass lowered (span-overflow tiling) become nodes here, once
             # the view is back and the pass has stopped iterating the list.
             build_pending_loop_nodes(graph)
+            # The nested list, so a loop's body prints indented under its node.
+            # Before the checker, so a violation still comes with the dump.
+            _log_after_pass(graph, pass_name)
             # After the view is put back: the checker reads the real tree, and a
             # violation then names the pass that left it.
             check_loops(graph, where=pass_name)
@@ -787,12 +800,6 @@ class CustomPreSchedulingPasses:
                 "elapsed %5dms  %s",
                 elapsed_ms,
                 pass_name,
-            )
-        if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
-            logger.debug(
-                "AFTER %s\n%s",
-                pass_name,
-                format_operations(list(all_ops(graph.operations))),
             )
 
     def uuid(self) -> Any | None:
