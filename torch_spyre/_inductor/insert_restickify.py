@@ -252,6 +252,22 @@ def _give_copy_the_loop_term(
     invalidate_op_read_writes(restick_buff)
 
 
+def _shared_loop_depth(source: Operation, consumer: Operation) -> int:
+    """How many outermost counted loops ``source`` and ``consumer`` share.
+
+    The length of the common prefix of their counted-loop paths. An extern kernel
+    runs once, outside its loop, so its path is empty and it shares none.
+    """
+    depth = 0
+    for source_level, consumer_level in zip(
+        counted_loop_path(source), counted_loop_path(consumer), strict=False
+    ):
+        if source_level != consumer_level:
+            break
+        depth += 1
+    return depth
+
+
 def _moved_loop_term(
     op: ComputedBuffer,
     restick_arg_info: RestickifyArgInfo,
@@ -675,15 +691,7 @@ def insert_restickify_on_node_inputs(
         # the consumer is a node.
         move_before(operations, op, restick_buff)
 
-        source_group_id = counted_loop_path(old_name_buf, include_extern=True)
-        consumer_group_id = counted_loop_path(op, include_extern=True)
-        shared_loop_depth = 0
-        for source_level, consumer_level in zip(
-            source_group_id, consumer_group_id, strict=False
-        ):
-            if source_level != consumer_level:
-                break
-            shared_loop_depth += 1
+        shared_loop_depth = _shared_loop_depth(old_name_buf, op)
         _transfer_loop_info(
             restick_buff, old_name_buf, op, restick_arg_info, shared_loop_depth
         )
