@@ -15,11 +15,14 @@
 """``LoopNode``: a counted loop held as one operation in ``graph.operations``.
 
 ``splice_while_loops`` flattens each ``for_each_tile`` loop into ordinary ops
-stamped with ``loop_info``.  Its final step, :func:`collapse`, wraps each loop's
-ops into a ``LoopNode`` (nested for a nested loop), so a loop is a structural
-unit from the first pass after the splice.  ``loop_info`` stays on the leaf
-ops: the node adds structure and the per-loop facts (induction variable, trip
-count, carries) but replaces nothing yet.
+carrying a build-time record, ``loop_member`` (:class:`LoopMember`).  Its final
+step, :func:`collapse`, wraps each loop's ops into a ``LoopNode`` (nested for a
+nested loop), so a loop is a structural unit from the first pass after the splice,
+and records the loop's facts in the node (group id, trip count, induction variable,
+carries, each member's tiled dims, ``strict_loop_vars``) and the chain of nodes
+around each leaf op (``_loop_chain``).  The record is then deleted from every op a
+node holds: after the build the nodes are the only owner of the facts, and a pass
+that adds an op to a loop says what it tiles with :func:`record_member`.
 
 Passes that read the graph flat run against :class:`OpsView`, which iterates
 the leaf ops in program order and refuses edits: a pass that changes the graph
@@ -27,8 +30,8 @@ names the position with the helpers below (``insert_before``, ``move_after``,
 ``remove_op``, ...), each of which finds the list that owns the anchor.
 After the pass loop the nodes stay: each reaches Inductor's scheduler as one
 ``LoopSchedulerNode`` (``loop_scheduler.py``), and the readers in between
-descend into them.  :func:`expand` flattens them only on a pass error and in
-the equivalence tests that compare against the flat path.
+descend into them.  :func:`expand` flattens them only on a pass error and once the
+scheduler has built its own nodes.
 """
 
 from __future__ import annotations
@@ -81,10 +84,49 @@ class LoopCarryRecord:
     storage_view: Any = field(default=None, compare=False, repr=False)
 
 
-# Set to False only by the no-behaviour-change test, to compare the pipeline
-# with and without nodes.  With it off, ``collapse`` builds nothing, so no
-# pass sees a view and ``expand`` has nothing to do.
-BUILD_LOOP_NODES = True
+@dataclass
+class LoopMember:
+    """What a loop lowering says about an op it puts in a loop: ``op.loop_member``.
+
+    The lowerings (``for_each_tile`` and the loop-tiling lowering) write it as they
+    build a loop; ``collapse`` / ``build_pending_loop_nodes`` read it to build the
+    ``LoopNode``s and record the facts in them, then delete it from every op a node
+    holds: from then on the nodes own the facts. (A member is an op whose nodes hold
+    a tiling entry for it; this record is what the lowerings write BEFORE that.) It
+    holds the loop's own facts only. An access's per-trip advance is the loop
+    variable's coefficient in the access's index (``loop_facts.read_advance``).
+
+    Attributes
+    ----------
+    loop_group_id:
+        Tuple encoding the nesting path, e.g. ``(0,)`` for an outermost
+        group, ``(0, 0)`` for a nested group inside group 0.
+    loop_count:
+        List of trip counts, one per nesting level from outermost to
+        innermost.  ``len(loop_count) == len(loop_group_id)`` always holds.
+    loop_tiled_dims:
+        List of lists, one sub-list per nesting level.  Each sub-list
+        contains the ``data.ranges`` positional indices that are tiled at
+        that level.  An empty sub-list means the op is loop-invariant at
+        that level.
+    loop_tiled_reduction_dims:
+        List of lists, one sub-list per nesting level.  Each sub-list
+        contains the ``data.reduction_ranges`` positional indices that are
+        tiled at that level.  An empty sub-list means no reduction dim is
+        tiled at that level.  Parallel to ``loop_tiled_dims``.
+    strict_loop_vars:
+        True on an op the loop-tiling lowering made: its ``dim_hints`` list the
+        loop variable of EVERY level, so an op that lists none is a compiler bug
+        and not a loop-invariant op. False on a ``for_each_tile`` op, where an op
+        that lists no loop variable (the loop's fill, say) simply does not move
+        with the loop. Read by ``loop_facts`` and the kernel's advance lookup.
+    """
+
+    loop_group_id: tuple[int, ...]
+    loop_count: list[sympy.Expr]
+    loop_tiled_dims: list[list[int]]
+    loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
+    strict_loop_vars: bool = False
 
 
 class LoopNode(ir.Operation):
@@ -126,11 +168,15 @@ class LoopNode(ir.Operation):
         # and an access need not move with the loop), so the lowering that divided
         # it records it here.
         # INVARIANT (stage 9.3a): ``tiling`` is written only by ``_fill_tiling`` /
-        # ``record_loop_info`` (from the op's ``loop_info``), and each leaf op's
+        # ``record_member`` / ``_wrap`` (from the op's ``loop_member``), and each leaf op's
         # ``_loop_chain`` only by ``_set_chain``, which the node builder (``_wrap``),
         # the edit helpers below and ``expand`` call. A new edit site calls one of
         # those helpers; it never assigns either directly.
         self.group_id = group_id
+        # True on a loop the loop-tiling lowering made: every member's dim_hints list
+        # the loop variable of every level, so a member that lists none is a compiler
+        # bug and not a loop-invariant op (a for_each_tile loop's fill, say).
+        self.strict_loop_vars = False
         # False on a node built by hand (unit tests), whose facts nothing recorded.
         self.facts_recorded = False
         self.tiling: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
@@ -457,28 +503,64 @@ def _set_chain(entry: ir.Operation, chain: tuple["LoopNode", ...]) -> None:
         entry._loop_chain = chain  # type: ignore[attr-defined]
 
 
-def record_loop_info(op: ir.Operation) -> None:
-    """``op.loop_info`` was (re)written after the op was placed: make the nodes
-    around it hold the new tiled dims. A pass that stamps an op it has already
-    put in a body calls this right after the stamp (the loop checker, rule 6,
-    reports a node that disagrees with the stamp)."""
-    _fill_tiling(op, overwrite=True)
+def record_member(
+    op: ir.Operation,
+    tiling: Iterable[tuple[Iterable[int], Iterable[int]]],
+) -> None:
+    """``op``, already placed in built nodes, is a member of their loops, and tiles
+    ``tiling[level] = (tiled_dims, tiled_reduction_dims)`` at each level, outermost
+    first. This is how a pass that puts a new op into a loop says what the op is
+    to the loop; nothing is stamped on the op. Raises ``ValueError`` if the op is in
+    no node or ``tiling`` does not have one entry per node around it.
+    """
+    chain = getattr(op, "_loop_chain", ())
+    tiling = [(tuple(dims), tuple(reduction)) for dims, reduction in tiling]
+    if not chain or len(chain) != len(tiling):
+        raise ValueError(
+            f"{op.get_name()} is in {len(chain)} loop node(s), not {len(tiling)}"
+        )
+    for node, entry in zip(chain, tiling):
+        node.tiling[op.get_name()] = entry
+
+
+def inherit_loop_membership(source: ir.Operation, target: ir.Operation) -> None:
+    """``target`` stands in for ``source`` (a rebuilt or a probe copy of it, same
+    name): it is a member of the same loops. The nodes' tiling is keyed by name, so
+    only the pointer to the nodes needs copying."""
+    target._loop_chain = tuple(getattr(source, "_loop_chain", ()))  # type: ignore[attr-defined]
+    if hasattr(target, "_member_like"):  # a copy made by copy_op_metadata
+        del target._member_like  # type: ignore[attr-defined]
+
+
+def _drop_spent_records(entry: ir.Operation) -> None:
+    """Remove a lowering's ``loop_member`` from the leaf ops under ``entry`` that sit
+    in built nodes: the nodes hold the facts, so the record would be read by nothing."""
+    for leaf in all_ops([entry]):
+        chain = getattr(leaf, "_loop_chain", ())
+        if (
+            chain
+            and all(node.facts_recorded for node in chain)
+            and hasattr(leaf, "loop_member")
+        ):
+            del leaf.loop_member  # type: ignore[attr-defined]
 
 
 def _fill_tiling(entry: ir.Operation, overwrite: bool = False) -> None:
     """Give each node enclosing a leaf op of ``entry`` the op's tiled dims at that
-    level, read from the op's ``loop_info``, unless the node already has them
+    level, read from the op's ``loop_member``, unless the node already has them
     (``overwrite`` replaces them)."""
     for leaf in all_ops([entry]):
-        info = getattr(leaf, "loop_info", None)
+        info = getattr(leaf, "loop_member", None)
         if info is None:
             continue
         name = leaf.get_name()
         for level, node in enumerate(getattr(leaf, "_loop_chain", ())):
             if overwrite or name not in node.tiling:
                 node.tiling[name] = (
-                    _level_dims(info.loop_tiled_dims, level),
-                    _level_dims(info.loop_tiled_reduction_dims, level),
+                    _level_dims(getattr(info, "loop_tiled_dims", None) or (), level),
+                    _level_dims(
+                        getattr(info, "loop_tiled_reduction_dims", None) or (), level
+                    ),
                 )
 
 
@@ -492,6 +574,21 @@ def _adopt(operations: list[ir.Operation], entry: ir.Operation) -> None:
     assert chain is not None
     _set_chain(entry, tuple(chain))
     _fill_tiling(entry)
+    _drop_spent_records(entry)
+    _take_donor_tiling(entry)
+
+
+def _take_donor_tiling(entry: ir.Operation) -> None:
+    """An op built by ``copy_op_metadata`` from a member (``_member_like``) that is now
+    in the same nodes tiles what the member tiles."""
+    for leaf in all_ops([entry]):
+        donor = getattr(leaf, "_member_like", None)
+        if donor is None:
+            continue
+        del leaf._member_like  # type: ignore[attr-defined]
+        for node in getattr(leaf, "_loop_chain", ()):
+            if donor.get_name() in node.tiling and leaf.get_name() not in node.tiling:
+                node.tiling[leaf.get_name()] = node.tiling[donor.get_name()]
 
 
 def insert_before(
@@ -570,6 +667,8 @@ def replace_op(
     # ``new`` may reuse ``old``'s name (replace_computed_buffer_body does) with a
     # different stamp; its stamp is the authority.
     _fill_tiling(new, overwrite=True)
+    _drop_spent_records(new)
+    _take_donor_tiling(new)
 
 
 def top_level_entry(
@@ -644,6 +743,8 @@ def insert_at_start(node: LoopNode, op: ir.Operation) -> None:
     node.body.insert(0, op)
     _set_chain(op, _chain_of(node))
     _fill_tiling(op)
+    _drop_spent_records(op)
+    _take_donor_tiling(op)
 
 
 def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
@@ -659,6 +760,8 @@ def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
     node.body.append(op)
     _set_chain(op, _chain_of(node))
     _fill_tiling(op)
+    _drop_spent_records(op)
+    _take_donor_tiling(op)
 
 
 def _chain_of(node: LoopNode) -> tuple[LoopNode, ...]:
@@ -672,7 +775,7 @@ def _chain_of(node: LoopNode) -> tuple[LoopNode, ...]:
 
 
 def _group_path(op: ir.Operation) -> tuple[int, ...]:
-    # An ExternKernel keeps its loop_info (e.g. a hoisted loop-body constant)
+    # An ExternKernel keeps its loop_member (e.g. a hoisted loop-body constant)
     # but runs once, outside the loop, so it is not a member of any loop.
     return counted_loop_path(op)
 
@@ -699,7 +802,7 @@ def _wrap(
     ``depth + 1`` (and extending ``prefix``) into ``LoopNode``s, recursively.
 
     A node's body is the span from its first member to its last member.  An
-    op that sits between two members but is not one (no ``loop_info``, an
+    op that sits between two members but is not one (no ``loop_member``, an
     ``ExternKernel``, or an op of another loop) is kept in that span, where it
     is: moving it would change the program order, and :func:`expand` must give
     back exactly the list it was given.  Inside the node it is an ordinary
@@ -728,7 +831,7 @@ def _wrap(
             (),
             group_id=group_idx,
             induction=inductions.get(group_idx),
-            trip_count=ops[i].loop_info.loop_count[depth],  # type: ignore[attr-defined]
+            trip_count=ops[i].loop_member.loop_count[depth],  # type: ignore[attr-defined]
         )
         counter[0] += 1
         node.body = _wrap(run, depth + 1, key, inductions, counter, only)
@@ -767,8 +870,6 @@ def build_pending_loop_nodes(graph: Any) -> None:
     if not pending:
         return
     setattr(graph, _PENDING_ATTR, None)
-    if not BUILD_LOOP_NODES:
-        return
     operations = graph.operations
     assert not isinstance(operations, OpsView), "needs the real list"
     existing = sum(1 for _ in _nodes_in(operations))
@@ -788,12 +889,39 @@ def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
 
 def _record_node_facts(operations: list[ir.Operation]) -> None:
     """Fill every node's per-member tiling and every leaf's node chain, after the
-    nodes were built from the ops' ``loop_info``."""
+    nodes were built from the ops' ``loop_member``, then drop that record from the
+    ops the nodes hold."""
     for entry in operations:
         _set_chain(entry, ())
         _fill_tiling(entry)
-    for node in _nodes_in(operations):
+    # Only the nodes this build made: a node an earlier build recorded has already
+    # lost its leaves' records, so reading them again would find none and turn its
+    # ``strict_loop_vars`` off.
+    new = [n for n in _nodes_in(operations) if not n.facts_recorded]
+    for node in new:
         node.facts_recorded = True
+        flags = {
+            bool(leaf.loop_member.strict_loop_vars)
+            for leaf in all_ops(node.body)
+            if getattr(leaf, "loop_member", None) is not None
+        }
+        if len(flags) > 1:
+            # strict_loop_vars is a property of the loop, not of an op: the
+            # loop-tiling lowering makes whole loops and refuses an op that is
+            # already in one. A node that mixes the two would read a for_each_tile
+            # op's "lists no loop variable" as a compiler bug.
+            raise RuntimeError(
+                f"{node.get_name()} holds ops of the loop-tiling lowering and of "
+                "another lowering"
+            )
+        node.strict_loop_vars = flags == {True}
+    # The nodes own the facts now: the lowering's record is spent. Removing it
+    # means nothing after the build can read it by accident. After every node's
+    # flag is set, so an outer node does not delete what an inner node still reads.
+    for node in new:
+        for leaf in all_ops(node.body):
+            if hasattr(leaf, "loop_member"):
+                del leaf.loop_member  # type: ignore[attr-defined]
 
 
 def collapse(
@@ -805,8 +933,6 @@ def collapse(
     to its loop variable; a level missing from it gets ``induction=None``.
     The list is rewritten in place, so its identity is kept.
     """
-    if not BUILD_LOOP_NODES:
-        return
     operations = graph.operations
     assert not isinstance(operations, OpsView), "collapse needs the real list"
     if not any(_group_path(op) for op in operations):
@@ -825,5 +951,6 @@ def expand(graph: Any) -> None:
         return
     with building_loop():
         operations[:] = list(all_ops(operations))
-        for op in operations:
-            op._loop_chain = ()  # type: ignore[attr-defined]
+        # The ops keep their ``_loop_chain``: the nodes still exist (the scheduler
+        # patch calls this after it built its nodes, and each LoopNode keeps its
+        # body), so the chain and the node's tiling stay true for kernel codegen.

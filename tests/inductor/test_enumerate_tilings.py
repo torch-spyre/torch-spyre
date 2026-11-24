@@ -180,9 +180,9 @@ def _expected_output_specs(dim_sizes, stick_dim, max_dims):
 
 def _one_level_loop_info():
     """A real one-level loop stamp: an op that is a member of a coarse-tiling loop."""
-    from torch_spyre._inductor.loop_info import LoopInfo
+    from torch_spyre._inductor.loop_node import LoopMember
 
-    return LoopInfo(
+    return LoopMember(
         loop_group_id=(0,),
         loop_count=[2],
         loop_tiled_dims=[[]],
@@ -607,9 +607,9 @@ class TestTilingSpace(unittest.TestCase):
 
     def test_a_loop_group_member_without_hints_is_offered_nothing(self):
         # ``coarse_tile`` adds members -- a group's copy-out, a restickify of a
-        # tiled read -- that carry ``loop_info`` but no ``dim_hints``.
+        # tiled read -- that carry ``loop_member`` but no ``dim_hints``.
         op = _pointwise_op((512, 256, 128))
-        op.loop_info = _one_level_loop_info()
+        op.loop_member = _one_level_loop_info()
         space = build_tiling_space(op)
         self.assertTrue(space.is_empty)
         self.assertEqual(space.enumerate(), [TileSpec()])
@@ -654,7 +654,7 @@ class TestRefusalLog(unittest.TestCase):
             op.dim_hints = [object()]
 
         def grouped(op):
-            op.loop_info = _one_level_loop_info()
+            op.loop_member = _one_level_loop_info()
 
         for mark, reason in (
             (hinted, "already tiled by the hint or span-overflow pass"),

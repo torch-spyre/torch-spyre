@@ -120,21 +120,49 @@ def transfer_edges(
     """Ownership intersections for ordinary and completed-result copies.
 
     Both partitions must describe the same coordinate domain.
+
+    A pair of cores intersects when their slices overlap on every dimension,
+    so the work splits by dimension: for each dimension and each source slot,
+    the destination cores it overlaps form one bitmask (computed once per
+    slot), and a source core's destinations are the AND of its masks.
     """
     all_splits = source_splits.keys() | destination_splits.keys()
+    destination_cores = list(destination_map)
+    per_dim: list[tuple[Any, int, int, dict[int, int], dict[int, int]]] = []
+    for dim in all_splits:
+        cores_by_slot: dict[int, int] = {}
+        for bit, d_slice in enumerate(destination_map.values()):
+            slot = d_slice.get(dim, 0)
+            cores_by_slot[slot] = cores_by_slot.get(slot, 0) | (1 << bit)
+        per_dim.append(
+            (
+                dim,
+                source_splits.get(dim, 1),
+                destination_splits.get(dim, 1),
+                cores_by_slot,
+                {},
+            )
+        )
+    everyone = (1 << len(destination_cores)) - 1
     result = set()
     for s_core, s_slice in source_map.items():
-        for d_core, d_slice in destination_map.items():
-            for dim in all_splits:
-                if not _overlap(
-                    s_slice.get(dim, 0),
-                    source_splits.get(dim, 1),
-                    d_slice.get(dim, 0),
-                    destination_splits.get(dim, 1),
-                ):
-                    break
-            else:
-                result.add((s_core, d_core))
+        mask = everyone
+        for dim, source_split, destination_split, cores_by_slot, reach in per_dim:
+            a = s_slice.get(dim, 0)
+            cores = reach.get(a)
+            if cores is None:
+                cores = 0
+                for b, holders in cores_by_slot.items():
+                    if _overlap(a, source_split, b, destination_split):
+                        cores |= holders
+                reach[a] = cores
+            mask &= cores
+            if not mask:
+                break
+        while mask:
+            low = mask & -mask
+            result.add((s_core, destination_cores[low.bit_length() - 1]))
+            mask ^= low
     return result
 
 
@@ -1112,8 +1140,17 @@ def core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]:
             "ownership core count differs from the communication domain: "
             f"{view.num_cores} != {num_cores}"
         )
-    rows = owner_slots(dict(view.core_to_slot), dict(view.work_slice_dims), num_cores)
-    return dict(enumerate(rows))
+    rows = _view_owner_rows(view, num_cores)
+    # Copies: the cached rows are shared between callers.
+    return {core: dict(row) for core, row in enumerate(rows)}
+
+
+# A view's per-core slots, reused across the many pairs one view takes part in
+# (relayout candidates price each producer view against every consumer view).
+# Errors are not cached, so an invalid view raises on every call.
+@lru_cache(maxsize=8192)
+def _view_owner_rows(view: PerCoreView, num_cores: int) -> tuple[dict[Any, int], ...]:
+    return owner_slots(dict(view.core_to_slot), dict(view.work_slice_dims), num_cores)
 
 
 def work_division_from_view(

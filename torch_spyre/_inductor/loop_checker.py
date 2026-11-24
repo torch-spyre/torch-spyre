@@ -25,30 +25,35 @@ What it checks:
 2. Every loop variable in an op's read and write indices is the induction
    variable of a loop that encloses the op.
 3. Every carry's update is an op in its node's body.
-4. An op that runs in a counted loop that a node covers (its ``loop_info``
+4. An op that runs in a counted loop that a node covers (its ``loop_member``
    names that loop) sits inside that node: not outside it, and not in the body
    of another loop's node.
-5. A node's body holds no op that is not a member of the loop BETWEEN two of
-   its members.
+5. A node's body holds no op that is not a member of the loop anywhere in its
+   body.
+6. An op in nodes the pipeline built points at exactly those nodes and carries no
+   ``loop_member``: once the nodes are built they own the loop facts, and a pass
+   that adds an op to a loop says what it tiles with ``record_member``. An op whose
+   index uses an enclosing loop's variable must hold a tiling entry in those nodes
+   (an op without one reads as "not in the loop", which would drop its advance
+   silently).
 
-A loop no node covers is not checked: span-overflow tiling still stamps flat
-loop ops (stage 7a replaces it), and ``build_loop_scheduler_nodes`` groups them
-later. So rule 4 fires only when a node already claims the op's loop, which is
-how a copy-back placed after its loop by a flat index (#6101) is told from a
-flat loop.
+A loop no node covers is not checked: a loop-tiling lowering requests its
+nodes and the pass loop builds them once the pass has returned. So rule 4 fires
+only when a node already claims the op's loop, which is how a copy-back placed
+after its loop by a flat index (#6101) is told from a loop not yet built.
 
-Rules 4 and 5 compare each op's ``loop_info`` with the node it sits in, using
-the same group path that builds the nodes (:func:`counted_loop_path`, which
-gives an ``ExternKernel`` the empty path). They see only the leaf ops, so a node
-built by hand from ops with no ``loop_info`` (the unit tests do) is not checked
-by them.
+Rules 4 and 5 compare each op's loop path with the node it sits in, using the
+path that builds the nodes (:func:`counted_loop_path`, which gives an
+``ExternKernel`` the empty path). They see only the leaf ops, so a node built by
+hand from ops with no ``loop_member`` (the unit tests do) is not checked by them.
+Rule 6 skips nodes the pipeline did not build.
 
 What it cannot check: that a read which SHOULD advance carries the induction
 variable. That was the padding bug (#5573); only a comparison against the
 kernel finds it.
 
 What it does not check, and why. A once-only op (an extern kernel that keeps
-its ``loop_info``, such as a ``SpyreConstantFallback`` created in a body)
+its ``loop_member``, such as a ``SpyreConstantFallback`` created in a body)
 stays in the body until the scheduler hoists it (``loop_scheduler``), so
 "once-ops are outside the node" is not an invariant before that. On the loop
 tests, a check for it fired on every graph that creates a constant in a body.
@@ -73,7 +78,7 @@ from torch._inductor import ir
 from torch._inductor.dependencies import MemoryDep
 
 from .logging_utils import get_inductor_logger
-from .loop_facts import counted_loop_path, node_levels, stamped_levels
+from .loop_facts import counted_loop_path
 from .loop_node import LoopNode, all_ops, in_building_loop
 
 logger = get_inductor_logger("loop_checker")
@@ -267,34 +272,19 @@ def _non_members(entries: list[ir.Operation], depth: int, problems: list[str]) -
         _non_members(entry.body, depth + 1, problems)
 
 
-def _facts(levels) -> list[tuple]:
-    return [
-        (
-            level.group_path,
-            level.trip_count,
-            level.tiled_dims,
-            level.tiled_reduction_dims,
-        )
-        for level in levels
-    ]
-
-
-def _node_fact_problems(
+def _node_chain_problems(
     op: ir.Operation, enclosing: tuple[LoopNode, ...], problems: list[str]
 ) -> None:
-    """Rule 6: the facts the nodes around ``op`` hold (group path, trip count,
-    tiled dims, from ``loop_facts.node_levels``) equal what ``op.loop_info`` says.
+    """Rule 6: an op in nodes the pipeline built points at exactly those nodes
+    (``_loop_chain``) and carries no ``loop_member``.
 
-    Until the lowerings stop writing ``loop_info`` (stage 9.4) both exist; a pass
-    that changes the stamp after the node was built, without telling the node,
-    leaves the node answering differently, which this reports. An op with no
-    ``loop_info`` has nothing to compare with and is skipped.
+    The nodes own the loop facts once they are built (stage 9.4.3). A pass that adds
+    an op to a loop calls a ``loop_node`` helper, which records the chain, and
+    ``record_member``, which records what the op tiles. An op edited into a body
+    by hand has no chain; one stamped after the build would carry a record nothing
+    reads. Nodes built by hand (unit tests) are not checked.
     """
-    if (
-        not enclosing
-        or getattr(op, "loop_info", None) is None
-        or not all(n.facts_recorded for n in enclosing)
-    ):
+    if not enclosing or not all(n.facts_recorded for n in enclosing):
         return
     if tuple(getattr(op, "_loop_chain", ())) != enclosing:
         problems.append(
@@ -302,11 +292,11 @@ def _node_fact_problems(
             f"{[n.get_name() for n in getattr(op, '_loop_chain', ())]} is not the "
             f"nodes around it {[n.get_name() for n in enclosing]}"
         )
-        return
-    stamped, derived = _facts(stamped_levels(op)), _facts(node_levels(op))
-    if stamped != derived:
+    elif hasattr(op, "loop_member"):
         problems.append(
-            f"{op.get_name()}: loop_info says {stamped} but its nodes say {derived}"
+            f"{op.get_name()}: carries a loop_member inside built nodes "
+            f"{[n.get_name() for n in enclosing]}, which nothing reads; a pass that "
+            "puts an op in a loop says what it tiles with record_member"
         )
 
 
@@ -325,11 +315,24 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
             # one: skip tracing every op's dependencies.
             continue
         mine = {n.induction for n in enclosing if n.induction is not None}
-        stray = (_index_symbols(op) & all_inductions) - mine
+        symbols = _index_symbols(op)
+        stray = (symbols & all_inductions) - mine
         if stray:
             problems.append(
                 f"{op.get_name()} indexes with {sorted(map(str, stray))}, not "
                 "the induction variable of any loop enclosing it"
+            )
+        if (
+            symbols & mine
+            and all(n.facts_recorded for n in enclosing)
+            and any(op.get_name() not in n.tiling for n in enclosing)
+        ):
+            problems.append(
+                f"{op.get_name()} advances with the loop variable "
+                f"{sorted(map(str, symbols & mine))} but its nodes hold no tiling for "
+                "it, so it reads as not in the loop: a pass that puts an op that "
+                "advances with a loop into it says what it tiles with record_member "
+                "(or builds it with copy_op_metadata from a member)"
             )
 
     def carries(entries: list[ir.Operation]) -> None:
@@ -347,7 +350,7 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
 
     carries(operations)
     for op, enclosing in _walk(operations):
-        _node_fact_problems(op, enclosing, problems)
+        _node_chain_problems(op, enclosing, problems)
     _membership_problems(operations, 0, (), problems, _covered_keys(operations))
     _non_members(operations, 0, problems)
     return problems

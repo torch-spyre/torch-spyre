@@ -25,15 +25,13 @@ per-compile patches, so a CPU compile in the same process is untouched.
 ``CustomPreSchedulingPasses`` hands the scheduler the real nested list (it no
 longer expands the nodes), so on a compiled graph every ``LoopNode`` reaches
 ``Scheduler.__init__``.  A ``LoopSchedulerNode`` is a
-``CountedLoopSchedulerNode``, so the pre-fusion pass
-``build_loop_scheduler_nodes`` passes it through unchanged (its
-``_loop_group_id`` is None) and everything after it (fusion, kernel
-preparation, HBM-pool planning, codegen) sees the counted loop it always saw.
+``CountedLoopSchedulerNode``, so everything after it (fusion, kernel
+preparation, HBM-pool planning, codegen) sees a counted loop.
 Once the scheduler nodes exist, ``graph.operations`` is the flat leaf list
 again (the structure lives in the scheduler nodes): kernel preparation's LX
 read contracts read it and expect leaf ops.  A kernel op inside a node that
-is not a member of that loop (no matching ``loop_info``) is refused, since it
-would run every trip here and once on the flat path.
+is not a member of that loop (the node holds no tiling entry for it) is refused,
+since it would run every trip.
 
 The patch reaches into private Inductor code.  It is supported only on the
 torch releases in ``SUPPORTED_RELEASES`` and is refused with ``Unsupported``
@@ -71,12 +69,6 @@ from .scheduler import CountedLoopSchedulerNode
 # value parsed from package metadata: a patch whose failure mode is "refuse to compile a
 # loop" should not depend on metadata lookups that can fail at import.
 SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
-
-# Set to False only by the equivalence test, to compare the flow-through path
-# with the path it replaced: ``CustomPreSchedulingPasses`` then expands every
-# ``LoopNode`` after the pass loop, as before, and ``build_loop_scheduler_nodes``
-# rebuilds the loops from the flat ops' ``loop_info``.
-SCHEDULE_LOOP_NODES = True
 
 # The Inductor surface this module depends on.  "patched": replaced for the
 # compile by this module.  Every other entry is read, called or inherited and
@@ -125,7 +117,7 @@ PATCHED_SURFACE: tuple[str, ...] = (
     "topological_sort_schedule, the _pre_fusion_custom_pass, fuse_nodes "
     "(Spyre's can_fuse_* are False), merge_loops, compute_last_usage "
     "(FusedSchedulerNode.set_last_usage) and _codegen -- run on the supported "
-    "release by test_loop_scheduler_equivalence.py",
+    "release by test_loop_scheduler_review.py",
 )
 
 
@@ -314,28 +306,23 @@ def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None
     """Refuse a kernel op directly in ``loop_node``'s body that is not a
     member of that loop.
 
-    A ``LoopSchedulerNode`` runs every kernel child ``trip_count`` times.  The
-    path it replaced decided membership op by op, from ``loop_info``
-    (``build_loop_scheduler_nodes``): an op without this loop's group path ran
-    outside the loop, once.  ``collapse`` keeps an op that sits between two
-    members inside the span, so such an op (an op a pass placed there without
-    ``loop_info``) would silently run every trip on this path -- an
-    accumulator's zero-fill re-run each trip, a wrong answer.  Every direct
-    kernel child must therefore share one group path, and so be in the loop
-    on both paths; a nested loop's members are checked at their own level.
+    A ``LoopSchedulerNode`` runs every kernel child ``trip_count`` times.
+    ``collapse`` keeps an op that sits between two members inside the span, so
+    an op a pass placed there without telling the node it is a member would
+    silently run every trip -- an accumulator's zero-fill re-run each trip, a
+    wrong answer.  Every direct kernel child must therefore share one group
+    path; a nested loop's members are checked at their own level.
 
-    No pass produces such an op today: across the seven graphs of
-    ``test_loop_scheduler_equivalence.py`` this check never fires.  It guards a
-    future pass that places an op between two members without stamping its
-    ``loop_info``.  An op at the head or tail of a body is refused the same way
-    (before stage 8.5 the hand-off moved such an op out of the node).
+    No pass produces such an op today.  It guards a future pass that places an
+    op between two members, or at the head or tail of a body, without recording
+    its tiling.
     """
     paths = {op.get_name(): counted_loop_path(op) for op in kernels}
     # ``collapse`` wraps the ops sharing ``path[: depth + 1]`` and recurses on
-    # longer paths, so the direct kernel children of a node built from
-    # ``loop_info`` all have the SAME full path, and a node always starts at
-    # a member.  (A node built by hand from ops without ``loop_info``, as the
-    # unit tests do, has only empty paths and is not checked.)
+    # longer paths, so the direct kernel children of a node built from the
+    # lowering's records all have the SAME full path, and a node always starts
+    # at a member.  (A node built by hand from ops with no records, as the unit
+    # tests do, has only empty paths and is not checked.)
     if len(set(paths.values())) <= 1:
         return
     outsiders = sorted(name for name, path in paths.items() if not path)
@@ -346,8 +333,7 @@ def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None
     )
     raise Unsupported(
         f"counted loop {loop_node.get_name()} holds kernel ops that are not all "
-        f"members of it ({detail}); they would run every trip here and "
-        "differently on the flat path"
+        f"members of it ({detail}); they would run every trip"
     )
 
 
@@ -357,11 +343,10 @@ def _build_loop_scheduler_node(
     """Create the scheduler nodes of ``loop_node``'s body and wrap them.
 
     A no-op (an allocation that generates no code) or an extern kernel is not
-    a kernel, and Spyre's codegen rejects it inside a counted loop.  The flat
-    pipeline excludes them only by accident (``_loop_group_id`` finds no
-    ``SchedulerNode`` in them).  Here it is explicit: they are created as
-    ordinary nodes and placed immediately before their (outermost) loop.  One
-    that reads a buffer the loop writes cannot go before it, and is refused.
+    a kernel, and Spyre's codegen rejects it inside a counted loop.  They are
+    created as ordinary nodes and placed immediately before their (outermost)
+    loop.  One that reads a buffer the loop writes cannot go before it, and is
+    refused.
     """
     children: list[BaseSchedulerNode] = []
     hoisted: list[BaseSchedulerNode] = []
