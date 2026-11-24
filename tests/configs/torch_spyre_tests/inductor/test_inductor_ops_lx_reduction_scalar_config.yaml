@@ -36,6 +36,12 @@ test_suite_config:
             # (backend follow-up on PR #3284).
             - LxPlanning.*::test_conv2d_direct_.*_s2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv1d_direct_.*_s2_lx_planning_(pointwise|reduction)
+            # float32→float16 on a 1D unaligned tensor (100 elements, not a
+            # multiple of 64).  The LX reduction wrap reduces all fp16 elements
+            # over the stick; the backend's coordinate masking gives a wrong
+            # result for a staggered FP32_TO_DL16 unaligned stick reduction
+            # (#4014).
+            - LxPlanning.*::test_to_dtype_float32_to_float16_100_lx_planning_reduction
           mode: xfail
         - names:
             - LxPlanning.*::test_(all_dim|all_full|any_dim|any_full|count_nonzero|cummax|cummin|cumprod|cumsum|logcumsumexp|max_default|sum_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|conv3d|dwise_conv2d|var_).*_lx_planning_(pointwise|reduction)

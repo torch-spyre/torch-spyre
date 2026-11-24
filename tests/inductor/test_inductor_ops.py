@@ -582,7 +582,7 @@ ALL_DTYPES = [
 ALL_DTYPE_PAIRS = [(src, dst) for src in ALL_DTYPES for dst in ALL_DTYPES if src != dst]
 
 TO_DTYPE_OP_SHAPES_UNALIGNED = [
-    (68,),  # 1D unaligned: 68 > 1 fp16 stick (64 elems), not a multiple of 64
+    (100,),  # 1D unaligned: not a multiple of 64; (68,) was a lucky case that passes
     (4, 16),
     (4, 68),
     (4, 32),  # exactly 1 fp32 stick -- shape[-1] < 32 check should NOT apply here
