@@ -109,8 +109,12 @@ def numpy_eval(expr: sympy.Basic, values: Sequence[Any]) -> Any:
     """expr's value from values, its operands' values in order: a Piecewise's arms'
     values and conditions, value then condition, and any other node's arguments. The
     function is that of expr's class, or of the nearest class along its MRO that has
-    one. Raises NotImplementedError, naming the class, when none has."""
+    one, or else an implemented function's ``_imp_``, which takes scalars, at each
+    entry. Raises NotImplementedError, naming the class, when it has neither."""
     for cls in type(expr).__mro__:
         if cls in NUMPY_FUNC_MAP:
             return NUMPY_FUNC_MAP[cls](*values)
+    imp = getattr(expr, "_imp_", None)
+    if imp is not None:
+        return np.vectorize(imp, otypes=[object])(*values)
     raise NotImplementedError(f"no numpy function for {type(expr).__name__}: {expr}")
