@@ -661,16 +661,13 @@ def _typecast_layouts(
         out_ea = ElementArrangement.QFP8CH
     else:
         out_ea = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
-        # A stick with only size-1 host dims holds one element, so staggering
-        # is a no-op. A constant stick (no host dim) keeps the staggered output.
+        # A stick dim with no host dim, or only a size-1 one (0-dim, (1,), (2, 1)),
+        # holds a single element at position 0, which every arrangement leaves in
+        # place. Staggering is a no-op there and EA in DCI cannot permute.
         # Decide from the read's coordinates, not the input's stride_map: a
         # round-trip conversion rewrites the stride_map entry (#5566).
-        if (
-            out_ea in STAGGERED_EAS
-            and in_stick_expr.free_symbols
-            and all(
-                concretize_expr(dep.ranges[v]) == 1 for v in in_stick_expr.free_symbols
-            )
+        if out_ea in STAGGERED_EAS and all(
+            concretize_expr(dep.ranges[v]) == 1 for v in in_stick_expr.free_symbols
         ):
             out_ea = ElementArrangement.STANDARD
     c_size = [concretize_expr(s) for s in output.size]
