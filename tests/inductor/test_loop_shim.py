@@ -14,7 +14,7 @@
 
 """Index-derived advances, for an op the loop-tiling lowering made.
 
-Device-free tests on stub ops. A ``LoopInfo`` with ``strict_loop_vars`` (what the
+Device-free tests on stub ops. A ``LoopMember`` with ``strict_loop_vars`` (what the
 loop-tiling lowering stamps) lists the variable of every level in the op's
 ``dim_hints``, so ``loop_facts`` reads its advances from the op's own index: the
 coefficient of each loop variable it lists. ("Shim" in the test names is that op.)
@@ -37,7 +37,7 @@ from torch_spyre._inductor.loop_facts import (
     read_advances_anywhere,
     advancing_levels,
 )
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.propagate_hints import DimHint
 
 d0, d1 = sympy_index_symbol("d0"), sympy_index_symbol("d1")
@@ -59,9 +59,9 @@ def _hint(variable, trips):
     )
 
 
-def _op(loop_info, reads, writes, hints=()):
+def _op(loop_member, reads, writes, hints=()):
     op = SimpleNamespace(
-        loop_info=loop_info,
+        loop_member=loop_member,
         dim_hints=list(hints),
         get_read_writes=lambda: SimpleNamespace(reads=reads, writes=writes),
     )
@@ -69,7 +69,7 @@ def _op(loop_info, reads, writes, hints=()):
 
 
 def _shim(levels=1, tiled=None):
-    return LoopInfo(
+    return LoopMember(
         loop_group_id=(3,) + (0,) * (levels - 1),
         loop_count=[sympy.Integer(8)] * levels,
         loop_tiled_dims=tiled if tiled is not None else [[1]] + [[]] * (levels - 1),
@@ -80,7 +80,7 @@ def _shim(levels=1, tiled=None):
 
 def test_shim_levels_are_read_by_enclosing_loops():
     shim = _shim()
-    legacy = LoopInfo(
+    legacy = LoopMember(
         loop_group_id=(3,),
         loop_count=[sympy.Integer(8)],
         loop_tiled_dims=[[1]],
@@ -185,7 +185,7 @@ def test_a_for_each_tile_op_that_lists_no_loop_variable_does_not_advance():
     """It is inside the loop but indexes nothing with its variable (the loop's fill,
     for one): zero at every level, not an error."""
     dep = _dep("arg0_1", d0 + d1)
-    legacy = LoopInfo(
+    legacy = LoopMember(
         loop_group_id=(3, 0),
         loop_count=[sympy.Integer(8)] * 2,
         loop_tiled_dims=[[], []],
@@ -225,7 +225,7 @@ def test_a_non_affine_use_of_the_variable_is_unsupported():
 def test_a_coarsetileinfo_op_is_read_from_its_index_too():
     """A ``for_each_tile`` op carries no more than the loop's own facts; whatever
     stored lists it still has are ignored, so an empty record gives the same advance."""
-    info = LoopInfo(
+    info = LoopMember(
         loop_group_id=(3,),
         loop_count=[sympy.Integer(8)],
         loop_tiled_dims=[[1]],
@@ -259,7 +259,7 @@ from torch_spyre._inductor.scratchpad.allocator import (  # noqa: E402
 
 def _equal_infos():
     shim = _shim()
-    legacy = LoopInfo(
+    legacy = LoopMember(
         loop_group_id=shim.loop_group_id,
         loop_count=list(shim.loop_count),
         loop_tiled_dims=[list(d) for d in shim.loop_tiled_dims],
@@ -274,11 +274,11 @@ def test_the_allocator_treats_a_shim_op_as_coarse_tiled():
     relayout prices."""
     shim, legacy = _equal_infos()
     for info in (shim, legacy):
-        op = SimpleNamespace(loop_info=info)
+        op = SimpleNamespace(loop_member=info)
         assert _is_coarse_tiled(op) is True
         assert _coarse_tile_loop_trip_count(op) == 8
     assert _is_coarse_tiled(SimpleNamespace()) is False
-    assert _coarse_tile_loop_trip_count(SimpleNamespace(loop_info=None)) == 1
+    assert _coarse_tile_loop_trip_count(SimpleNamespace(loop_member=None)) == 1
 
 
 def _kernel_for(op_loop_info, *, reads=()):
@@ -288,7 +288,7 @@ def _kernel_for(op_loop_info, *, reads=()):
     kernel._tile_advance_seen = {}
     kernel._tile_advance_rw = None
     node = SimpleNamespace(
-        loop_info=op_loop_info,
+        loop_member=op_loop_info,
         get_operation_name=lambda: "op7",
         get_read_writes=lambda: SimpleNamespace(reads=list(reads), writes=[]),
     )
@@ -376,7 +376,7 @@ def test_a_write_takes_the_first_write_and_counts_no_read():
 
 def test_read_copy_elision_keeps_a_copy_for_a_shim_consumer():
     """Decided: it does not migrate; only a ``for_each_tile`` consumer (a
-    ``LoopInfo`` without ``strict_loop_vars``) has a saved direct form, so a consumer
+    ``LoopMember`` without ``strict_loop_vars``) has a saved direct form, so a consumer
     the loop-tiling lowering made keeps its copy, and says so, not crashes."""
     consumer_is_shim, copy_is_shim = True, False
     _, legacy = _equal_infos()
@@ -389,14 +389,14 @@ def test_read_copy_elision_keeps_a_copy_for_a_shim_consumer():
         data=mock.MagicMock(spec=Pointwise),
         get_read_writes=lambda: SimpleNamespace(reads=[cp, other], writes=[out]),
         get_layout=lambda: layout,
-        loop_info=_shim() if consumer_is_shim else legacy,
+        loop_member=_shim() if consumer_is_shim else legacy,
     )
     copy_op = SimpleNamespace(
         get_layout=lambda: mock.MagicMock(spec=FixedTiledLayout),
         get_read_writes=lambda: SimpleNamespace(
             reads=[_dep("src", d0 + d1)], writes=[cp]
         ),
-        loop_info=_shim() if copy_is_shim else legacy,
+        loop_member=_shim() if copy_is_shim else legacy,
     )
     direct = SimpleNamespace(
         get_read_writes=lambda: SimpleNamespace(

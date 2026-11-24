@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
@@ -246,8 +247,8 @@ void SpyreStream::copyProgramAsync(
                 /*host2device=*/true);
 }
 
-void SpyreStream::copyAsync(const at::Tensor& src,
-                            const at::Tensor& dst) const {
+void SpyreStream::copyAsync(const at::Tensor& src, const at::Tensor& dst,
+                            bool stage_pageable_h2d) const {
   SPYRE_RUNTIME_DEBUG() << "src (" << src.scalar_type()
                         << ") is on:" << src.device();
   SPYRE_RUNTIME_DEBUG() << "dst (" << dst.scalar_type()
@@ -318,6 +319,37 @@ void SpyreStream::copyAsync(const at::Tensor& src,
                              dev_tensor->element_size()) == dev_total_size)
             ? nullptr
             : &dci;
+
+    // Without a DCI, flex reads a pageable H2D source on the scheduler thread
+    // after this returns. A non-blocking caller may reuse the source right
+    // away, so copy it into a pinned buffer now; the pinned DMA then skips
+    // flex's own shadow-buffer copy. The identity checks above guarantee a
+    // dense source starting at the storage base and spanning dev_total_size.
+    if (host2device && dci_arg == nullptr && stage_pageable_h2d &&
+        dev_total_size > 0) {
+      auto* pinned =
+          static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
+      if (!pinned->isPinnedPtr(cpu_ptr)) {
+        c10::DataPtr staged;
+        try {
+          staged = pinned->allocate(dev_total_size);
+        }
+        catch (const std::exception& error) {
+          TORCH_WARN_ONCE("Spyre non-blocking H2D: no pinned staging buffer (",
+                          error.what(),
+                          "); converting on the calling thread instead.");
+        }
+        if (staged) {
+          std::memcpy(staged.get(), cpu_ptr, dev_total_size);
+          // copyAsyncImpl's pinned branch holds the buffer until completion.
+          copyAsyncImpl(staged.get(), dev_total_size, allocation, nullptr,
+                        host2device);
+          return;
+        }
+        // The conversion path stages the source before returning.
+        dci_arg = &dci;
+      }
+    }
 
     // The narrowed-range path is a conversion-path optimization: it rebases
     // the DCI onto the sticks covering the view. It has nothing to offer a

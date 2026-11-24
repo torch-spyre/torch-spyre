@@ -563,13 +563,13 @@ After all changes:
      ```bash
      python -m pytest tests/inductor/test_loop_scheduler.py \
        tests/inductor/test_loop_scheduler_readers.py \
-       tests/inductor/test_loop_scheduler_review.py \
-       tests/inductor/test_loop_scheduler_equivalence.py -q
+       tests/inductor/test_loop_scheduler_review.py -q
      ```
-     `test_loop_scheduler_equivalence.py` is the gate: it compiles real loops
-     with the flow-through on and off and compares kernels, numerics and the
-     scheduler's structure. A numerics-only test cannot stand in for it: a loop
-     wrapped twice still matches a CPU reference for online softmax.
+     `test_loop_scheduler_review.py` is the gate: it compiles real loops on
+     the device and checks the scheduler's structure (the loop tree, the
+     once-run nodes, the work division) as well as the numerics against a CPU
+     reference. A numerics-only test cannot stand in for it: a loop wrapped
+     twice still matches a CPU reference for online softmax.
 
 7. **Run the full CI.** Local runs cover only a slice, and the local lower
    stack may differ from CI's. The fastest full signal is a draft PR.

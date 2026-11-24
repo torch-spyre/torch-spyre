@@ -45,10 +45,10 @@ from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.pass_utils import PerCoreView
 
-from utils_inductor import expects_raise
+from utils_inductor import expects_raise, loop_member_view
 from torch_spyre._inductor.loop_facts import read_advance
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
@@ -96,11 +96,11 @@ _TILING_SOLVERS = frozenset({"cpsat", "simulated_annealing"})
 _Counts = tuple[int, ...]
 
 
-def _counts(info: LoopInfo) -> _Counts:
+def _counts(info: LoopMember) -> _Counts:
     return tuple(int(count) for count in info.loop_count)
 
 
-def _describe(tiling: dict[str, LoopInfo]) -> str:
+def _describe(tiling: dict[str, LoopMember]) -> str:
     """One line per tiled op: its loop path, trip counts and tiled dims."""
     return "\n".join(
         f"  {name}: loop_group_id={info.loop_group_id} "
@@ -109,19 +109,19 @@ def _describe(tiling: dict[str, LoopInfo]) -> str:
     )
 
 
-def _nests(tiling: dict[str, LoopInfo]) -> dict[int, dict[str, LoopInfo]]:
+def _nests(tiling: dict[str, LoopMember]) -> dict[int, dict[str, LoopMember]]:
     """The tiled ops grouped into loop nests, keyed by outermost loop id.
 
     ``loop_group_id[0]`` names an op's outermost loop, so ops sharing it sit in
     one nest however deep each of them goes.
     """
-    nests: dict[int, dict[str, LoopInfo]] = {}
+    nests: dict[int, dict[str, LoopMember]] = {}
     for name, info in tiling.items():
         nests.setdefault(info.loop_group_id[0], {})[name] = info
     return nests
 
 
-def _nest_mismatch(nest: dict[str, LoopInfo], expected: _Counts) -> Optional[str]:
+def _nest_mismatch(nest: dict[str, LoopMember], expected: _Counts) -> Optional[str]:
     """Why ``nest`` is not a loop nest with trip counts ``expected``, or None.
 
     The longest ``loop_group_id`` in ``nest`` is its path.  Every op must sit
@@ -254,10 +254,10 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
 
     ``torch_spyre._inductor.patches.enable_spyre_context`` installs
     ``CustomPreSchedulingPasses`` itself, so observing its result means
-    substituting this subclass for it.  ``coarse_tile`` stamps ``loop_info``
+    substituting this subclass for it.  ``coarse_tile`` stamps ``loop_member``
     well before the scheduler is built, so reading it here sees the final plan.
 
-    ``tiling`` maps every coarse-tiled op to its ``LoopInfo``: the loops
+    ``tiling`` maps every coarse-tiled op to its ``LoopMember``: the loops
     codegen will emit, whichever pass stamped them. ``core_splits`` maps each
     of them to its committed core division over its output: the split factor
     of each dim, keyed by that dim's stride in the output index.
@@ -266,7 +266,7 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     its ``read_advances`` entries.
     """
 
-    tiling: dict[str, LoopInfo] = {}
+    tiling: dict[str, LoopMember] = {}
     read_advances: dict[str, list[tuple]] = {}
     read_names: dict[str, list[str]] = {}
     core_splits: dict[str, dict[int, int]] = {}
@@ -275,13 +275,9 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
         # Leaf ops: graph.operations keeps its LoopNodes after the pipeline
-        # (they reach the scheduler as nodes); a LoopNode has no loop_info.
-        tiled = [
-            op
-            for op in all_ops(graph.operations)
-            if getattr(op, "loop_info", None) is not None
-        ]
-        type(self).tiling = {op.get_name(): op.loop_info for op in tiled}
+        # (they reach the scheduler as nodes); a LoopNode is not an op in a loop.
+        tiled = [op for op in all_ops(graph.operations) if loop_member_view(op)]
+        type(self).tiling = {op.get_name(): loop_member_view(op) for op in tiled}
         # Per op, the advance of each read per trip at each level, from the record or
         # the index, whichever the op carries.
         type(self).read_advances = {
@@ -337,7 +333,7 @@ class AutomatedCoarseTilingTests(
         *,
         layout_solver: str,
         auto_tiling: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, LoopInfo]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, LoopMember]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
         # Only a joint solver chooses tilings; elsewhere the flag is inert.
         if auto_tiling and layout_solver not in _TILING_SOLVERS:
