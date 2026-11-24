@@ -30,7 +30,7 @@ from torch._inductor.codegen.common import (
     REMOVED,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
-from torch._inductor.ir import ComputedBuffer, Pointwise
+from torch._inductor.ir import ComputedBuffer, Pointwise, Scan
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
@@ -47,9 +47,11 @@ from .constants import (
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
     MATMUL_REDUCTION_OPS,
+    NON_ZERO_POS_TO_IDX_OP,
     POOL_OPS,
     RESTICKIFY_OP,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
+    SCAN_OPS,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
 )
@@ -78,6 +80,9 @@ from .pass_utils import (
     op_read_writes,
     max_trip_count,
     require_declared_count,
+    find_scan_var,
+    scan_ordered_space,
+    scan_space_position,
     symbolic_count_bounds,
     with_shape_env_replacements,
     finite_upper_or_none,
@@ -365,6 +370,14 @@ class SpyreOpFuncs:
         return ReductionOp("quantscalepertokenfp8", [x])
 
     @staticmethod
+    def non_zero_pos_to_idx(x, carry, padval):
+        # Combiner of the ``spyre::non_zero_pos_to_idx`` scan. ``scan`` below
+        # reads the op name and constants from the combiner and emits one op over
+        # the whole scan dim; the combiner is never expanded into a loop.
+        op_info = {"constants": {"padval": padval}}
+        return PointwiseOp(NON_ZERO_POS_TO_IDX_OP, [x, carry], op_info)
+
+    @staticmethod
     def relu(x):
         return PointwiseOp("relufwd", [x])
 
@@ -536,7 +549,21 @@ class SpyreKernelOpsHandler(DefaultHandler):
         ],
         values: tuple[RValue, ...],
     ) -> tuple[RValue, ...]:
-        raise NotImplementedError
+        """Lower ``ir.Scan`` to one op over the whole scan dim (no loop).
+
+        The scan axis is not an argument here: ``ir.Scan`` splices the scan
+        symbol into the load and store indices, so the op's iteration space
+        carries it. The combiner only names the scan (``SCAN_OPS``).
+        """
+        if len(values) != 1:
+            raise Unsupported(f"scan with {len(values)} inputs")
+        self.kernel.num_reduction += 1
+        (combined,) = combine_fn(values, values)
+        # ``ops.<name>(...)`` in the combiner returns an OpsValue wrapper.
+        combined = getattr(combined, "value", combined)
+        if not isinstance(combined, PointwiseOp) or combined.op not in SCAN_OPS:
+            raise Unsupported(f"unsupported scan combiner {combined}")
+        return (PointwiseOp(combined.op, list(values), combined.op_info),)
 
 
 def _tile_advance_expr_from_dep(
@@ -1124,6 +1151,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space_extended = iteration_space_with_splits(
             ir_node, self.current_node.read_writes, it_space
         )
+        if isinstance(ir_node.data, Scan):
+            # Positional SDSC labels follow output dim order, not the write
+            # dep's pointwise-then-scan order.
+            it_space_extended = scan_ordered_space(
+                it_space_extended,
+                find_scan_var(ir_node, self.current_node.read_writes),  # type: ignore[arg-type]
+                scan_space_position(ir_node),  # type: ignore[arg-type]
+            )
         # Build per-level tiled_symbols (innermost first) for this op.
         # loop_tiled_dims / loop_tiled_reduction_dims are lists of per-level
         # dim-index lists, outermost first — so we build outermost-first then
@@ -1422,6 +1457,15 @@ class SpyreKernel(Kernel[CSEVariable]):
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst))
             op_info.update(value.op_info)
+            if value.op in SCAN_OPS:
+                # Name of the scanned iteration symbol (a string, so it survives
+                # op-spec cloning and serializes like other op_info values).
+                op_info["scan_dim"] = str(
+                    find_scan_var(
+                        self.current_node.node,  # type: ignore[arg-type]
+                        self.current_node.read_writes,
+                    )
+                )
             self.op_specs.append(
                 self.create_op_spec(
                     value.op, False, args, op_info, self.indirect_var_names()

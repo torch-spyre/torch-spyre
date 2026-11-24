@@ -102,6 +102,7 @@ host. `torch.fft.*` itself is not supported on the device (it is complex).
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition; int64 falls back to CPU |
 | `torch.min` | | Y | Spyre | `min.dim` via custom decomposition; eager `aten::min.dim_min` is not yet supported; int64 falls back to CPU |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
+| `spyre::non_zero_pos_to_idx` | | Y | Spyre | Compiled only; custom op; scan dim must be static and at most 2048 |
 | `torch.linalg.vector_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |

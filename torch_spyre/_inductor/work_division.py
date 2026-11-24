@@ -35,6 +35,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scan,
     _CollectiveKernel,
 )
 
@@ -1475,7 +1476,7 @@ def build_op_split_space(
     enumerated menu carries no tilings to begin with.
     """
     if not isinstance(op, ComputedBuffer) or not isinstance(
-        op.data, (Pointwise, Reduction)
+        op.data, (Pointwise, Scan, Reduction)
     ):
         return None
     try:
@@ -1892,7 +1893,7 @@ def has_resolved_work_div_hint(op: ComputedBuffer) -> bool:
     decides for them.
     """
     return (
-        isinstance(op.data, (Pointwise, Reduction))
+        isinstance(op.data, (Pointwise, Scan, Reduction))
         and has_work_div_hint(op)
         and _resolve_work_div_hint(op, iteration_space_from_op(op)) is not None
     )
@@ -3005,7 +3006,7 @@ def _work_distribution_op(op: ComputedBuffer, max_cores: int) -> None:
     """Pass 2 for one op: commit its default split."""
     rw = op_read_writes(op)
     args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
-    if isinstance(op.data, Pointwise):
+    if isinstance(op.data, (Pointwise, Scan)):
         divide_pointwise_op(op, args, max_cores, work_distribution_pass)
     elif isinstance(op.data, Reduction):
         divide_reduction_op(op, args, max_cores, work_distribution_pass)
@@ -3156,7 +3157,7 @@ def defer_work_division(graph: GraphLowering) -> None:
         {
             op.get_name()
             for op in _iter_computed_buffers(graph.operations)
-            if isinstance(op.data, (Pointwise, Reduction))
+            if isinstance(op.data, (Pointwise, Scan, Reduction))
         },
     )
 

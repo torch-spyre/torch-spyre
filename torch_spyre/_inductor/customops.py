@@ -176,6 +176,35 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     return x.new_empty(out_size, dtype=x.dtype)
 
 
+@torch.library.custom_op(
+    "spyre::non_zero_pos_to_idx", mutates_args=(), device_types="spyre"
+)
+def non_zero_pos_to_idx(
+    x: torch.Tensor, dim: int, padval: torch.types.Number
+) -> torch.Tensor:
+    pass
+
+
+@non_zero_pos_to_idx.register_fake
+def _(x: torch.Tensor, dim: int, padval: torch.types.Number) -> torch.Tensor:
+    # A scan keeps the shape of its input along every dim, including ``dim``.
+    return x.new_empty(x.size())
+
+
+@torch.library.register_kernel("spyre::non_zero_pos_to_idx", ["cpu"])
+def non_zero_pos_to_idx_cpu(
+    x: torch.Tensor, dim: int, padval: torch.types.Number
+) -> torch.Tensor:
+    # Along ``dim`` a counter starts at 0: each non-zero input gets the counter
+    # value and the counter increments; each zero input gets ``padval``.
+    # Integer counters are exact in fp16 only up to 2048, so tests keep the
+    # scan dim within that.
+    dim = dim % x.ndim
+    nz = x != 0
+    counter = torch.cumsum(nz.to(torch.int64), dim=dim) - 1
+    return torch.where(nz, counter.to(x.dtype), torch.full_like(x, padval))
+
+
 @torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")
 def keep_by_index(
     values: torch.Tensor,

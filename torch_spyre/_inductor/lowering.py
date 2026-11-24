@@ -19,6 +19,7 @@ import logging
 import math
 import threading
 from contextlib import contextmanager
+from unittest import mock
 from typing import Any, Callable, Union
 from warnings import warn
 
@@ -27,7 +28,8 @@ import torch
 import torch._inductor.ir as ir
 import torch._inductor.lowering as lowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
-from torch._inductor.virtualized import V
+from torch._inductor.codegen.common import BackendFeature
+from torch._inductor.virtualized import V, ops
 from torch.utils._ordered_set import OrderedSet
 
 import torch_spyre._inductor.customops  # noqa: F401
@@ -45,6 +47,7 @@ from .constants import (
     DEPTHWISE_CONV2D_OP,
     FP16_MIN,
     MAXPOOL2D_OP,
+    NON_ZERO_POS_TO_IDX_MAX_LEN,
     DEVICE_NAME,
     DLFLOAT16_MAX,
     FP8_E4M3FN_MAX,
@@ -902,6 +905,69 @@ def _topk_reduction_kwargs(x, k, dim):
         ranges=ranges,
         reduction_ranges=reduction_ranges,
     )
+
+
+@contextmanager
+def _scan_feature_enabled():
+    """Let ``ir.Scan.create`` run for this lowering only.
+
+    ``Scan.create`` returns ``None`` unless the backend advertises
+    ``BackendFeature.SCAN``. Advertising it globally would also turn stock
+    ``cumprod``/``logcumsumexp`` lowerings into scans Spyre cannot emit, where
+    they now fall back to aten.
+    """
+    graph = V.graph
+    original = graph.has_feature
+
+    def has_feature(device, feature):
+        return feature == BackendFeature.SCAN or original(device, feature)
+
+    # patch.object restores (or removes) the instance override on exit.
+    with mock.patch.object(graph, "has_feature", has_feature):
+        yield
+
+
+@register_spyre_lowering(torch.ops.spyre.non_zero_pos_to_idx)
+def lower_non_zero_pos_to_idx(x, dim, padval):
+    """Lower to a plain ``ir.Scan`` along ``dim``; the output keeps x's shape.
+
+    The scan axis is carried by the scan symbol in the load/store index; see
+    ``pass_utils.scan_axis`` / ``find_scan_var`` for how the passes recover it.
+    """
+
+    def combine_fn(a_tuple, b_tuple):
+        (a,) = a_tuple
+        (b,) = b_tuple
+        return (ops.non_zero_pos_to_idx(a, b, padval),)
+
+    axis = lowering._validate_dim(x, dim)
+    scan_len = x.get_size()[axis]
+    # The counter is an fp16 integer, exact only up to 2048.
+    if not isinstance(scan_len, (int, sympy.Integer)):
+        raise Unsupported(f"non_zero_pos_to_idx: dynamic scan dim size {scan_len}")
+    if scan_len > NON_ZERO_POS_TO_IDX_MAX_LEN:
+        raise Unsupported(
+            f"non_zero_pos_to_idx: scan dim of size {scan_len} exceeds "
+            f"{NON_ZERO_POS_TO_IDX_MAX_LEN}, the largest exact fp16 counter"
+        )
+    kwargs = lowering._make_scan_inner(x, axis=axis, dtype=None)
+    with _scan_feature_enabled():
+        (result,) = ir.Scan.create(
+            **kwargs, combine_fn=combine_fn, can_fallback_to_aten=False
+        )
+    # Deliberately rejected: Scan.create returns a Pointwise copy for a length-1
+    # scan dim, and this op's per-element semantics are not known to be an
+    # identity there, so it is not lowered as a copy. A SplitScan is also not a
+    # single scan and is rejected.
+    # ``Scan.create`` realizes a scan into a ComputedBuffer holding the ``Scan``,
+    # but returns a bare ``Pointwise`` (no ``.data``) for a length-1 dim.
+    scan = getattr(result.data.data, "data", None) if result is not None else None
+    if type(scan) is not ir.Scan:
+        raise Unsupported(
+            f"non_zero_pos_to_idx: dim {dim} of size {x.get_size()} did not lower "
+            f"to a single scan"
+        )
+    return result
 
 
 @register_spyre_lowering(torch.ops.spyre.topkvalue)
