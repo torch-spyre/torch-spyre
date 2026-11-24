@@ -16,6 +16,12 @@ test_suite_config:
             - TestReductions::test_mode_wrong_device
             - TestReductions::test_quantile_error
           mode: mandatory_success
+        # torch.var runs on Spyre: it is decomposed into mean and sum.
+        - names:
+            - TestReductions::test_var
+            - TestReductions::test_var_stability
+            - TestReductions::test_var_stability2
+          mode: mandatory_success
         - names:
             - TestReductions::test_dim_multi_duplicate
             - TestReductions::test_empty_tensor_nonempty_slice
@@ -116,15 +122,12 @@ test_suite_config:
             - TestReductions::test_std_mean_some_dims
             - TestReductions::test_std_vs_numpy
             - TestReductions::test_tensor_compare_ops_empty
-            - TestReductions::test_var
             - TestReductions::test_var_correction_vs_numpy
             - TestReductions::test_var_large_input
             - TestReductions::test_var_mean
             - TestReductions::test_var_mean_all_dims
             - TestReductions::test_var_mean_correction
             - TestReductions::test_var_mean_some_dims
-            - TestReductions::test_var_stability
-            - TestReductions::test_var_stability2
             - TestReductions::test_var_unbiased
             - TestReductions::test_var_vs_numpy
             - TestReductions::test_dim_multi_unsupported

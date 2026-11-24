@@ -11976,11 +11976,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_logsumexp_keepdim0(self):
         x = cached_randn((67, 256), scale=0.1)
-        self.compare_with_cpu(
-            lambda x: torch.logsumexp(x, dim=0, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        self.compare_with_cpu(lambda x: torch.logsumexp(x, dim=0, keepdim=False), x)
+
+    def test_logsumexp_keepdim0_deterministic(self):
+        x = cached_randn((67, 256), scale=0.1)
+        with self._deterministic_algorithms():
+            self.compare_with_cpu(lambda x: torch.logsumexp(x, dim=0), x)
 
     @expects_raise
     def test_nanmean_all_dims_rejected(self):
@@ -12053,65 +12054,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         self.compare_with_cpu(lambda x: torch.nansum(x), x, run_eager=False)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.std yet (stable "
-            "error signature: InductorError: KeyError: 'No FX node for buf...', "
-            "the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_std_dim0_known_xfail(self):
+    def _check_var_std(self, fn, deterministic=False):
         x = cached_randn((67, 256), dtype=torch.float32)
-        self.compare_with_cpu(
-            lambda x: torch.std(x, dim=0, keepdim=False), x, run_eager=False
-        )
+        if deterministic:
+            with self._deterministic_algorithms():
+                self.compare_with_cpu(fn, x)
+        else:
+            self.compare_with_cpu(fn, x)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.var yet (stable "
-            "error signature: InductorError: KeyError: 'No FX node for buf...', "
-            "the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_var_dim0_known_xfail(self):
-        x = cached_randn((67, 256), dtype=torch.float32)
-        self.compare_with_cpu(
-            lambda x: torch.var(x, dim=0, keepdim=False), x, run_eager=False
-        )
+    def test_std_dim0(self):
+        self._check_var_std(lambda x: torch.std(x, dim=0, keepdim=False))
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.std_mean yet "
-            "(stable error signature: InductorError: KeyError: "
-            "'No FX node for buf...', the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_std_mean_dim0_known_xfail(self):
-        x = cached_randn((67, 256), dtype=torch.float32)
-        self.compare_with_cpu(
-            lambda x: torch.std_mean(x, dim=0, keepdim=False), x, run_eager=False
-        )
+    def test_var_dim0(self):
+        self._check_var_std(lambda x: torch.var(x, dim=0, keepdim=False))
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.var_mean yet "
-            "(stable error signature: InductorError: NotImplementedError: "
-            "Pointwise)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_var_mean_dim0_known_xfail(self):
-        x = cached_randn((67, 256), dtype=torch.float32)
-        self.compare_with_cpu(
-            lambda x: torch.var_mean(x, dim=0, keepdim=False), x, run_eager=False
-        )
+    def test_std_mean_dim0(self):
+        self._check_var_std(lambda x: torch.std_mean(x, dim=0, keepdim=False))
+
+    def test_var_mean_dim0(self):
+        self._check_var_std(lambda x: torch.var_mean(x, dim=0, keepdim=False))
+
+    def test_var_last_dim_correction0_keepdim(self):
+        self._check_var_std(lambda x: torch.var(x, dim=-1, correction=0, keepdim=True))
+
+    def test_std_all_dims(self):
+        self._check_var_std(lambda x: torch.std(x))
+
+    def test_var_dim0_deterministic(self):
+        self._check_var_std(lambda x: torch.var(x, dim=0), deterministic=True)
+
+    def test_std_mean_dim0_deterministic(self):
+        self._check_var_std(lambda x: torch.std_mean(x, dim=0), deterministic=True)
 
     @expects_raise
     def test_cumprod_dim0_rejected(self):
@@ -13149,6 +13122,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         with self._deterministic_algorithms():
             self.compare_with_cpu(fn, dst, index, src, run_eager=run_eager)
             self.assertTrue(torch.are_deterministic_algorithms_enabled())
+
+    def test_interpolate_nearest_1d(self):
+        x = cached_randn((2, 4, 64))
+        self.compare_with_cpu(
+            lambda x: torch.nn.functional.interpolate(
+                x, scale_factor=2, mode="nearest"
+            ),
+            x,
+        )
+
+    def test_interpolate_nearest_1d_deterministic(self):
+        x = cached_randn((2, 4, 64))
+        with self._deterministic_algorithms():
+            self.compare_with_cpu(
+                lambda x: torch.nn.functional.interpolate(x, size=96, mode="nearest"),
+                x,
+            )
 
     def test_index_put_deterministic_duplicates(self):
         # Repeated indices: identical result on every run, last write wins
