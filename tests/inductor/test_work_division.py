@@ -1201,18 +1201,21 @@ class TestMultiDimIterationSpaceSplit(unittest.TestCase):
             )
 
 
-def _with_padded_dim(td, sym, extent):
+def _with_padded_dim(td, sym, extent, valid_elements=None):
     """Return ``td`` with the device dim it reads ``sym`` through grown to ``extent``.
 
     The padding is device-only, as on a padded graph input: host size, strides
-    and ``valid_elements`` are unchanged.
+    and ``valid_elements`` are unchanged, unless ``valid_elements`` is specified.
     """
     k = td.device_coords.index(sym)
     stl = td.layout.device_layout
     device_size = list(stl.device_size)
     device_size[k] = extent
     padded = SpyreTensorLayout(
-        device_size, stl.stride_map, stl.device_dtype, stl.valid_elements
+        device_size,
+        stl.stride_map,
+        stl.device_dtype,
+        stl.valid_elements if valid_elements is None else valid_elements,
     )
     layout = FixedTiledLayout(
         td.layout.device, td.layout.dtype, td.layout.size, td.layout.stride, padded
@@ -1351,6 +1354,45 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
             self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out")
         )
         self.assertEqual(kept, it_space)
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "pad_iteration_space ignores the output's valid_elements, so rows "
+            "grow from 7 into the output's live row 8 (#741)"
+        ),
+    )
+    def test_live_slice_output_keeps_rows(self):
+        # An op outputting into a slice of a bigger, live, buffer should not
+        # grow padding: that would overwrite the rest of the buffer.
+        out_dep = _tensor_dep("out", (8, 64), (self.rows, self.cols))
+        in_dep = self._dep("x", 8)
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, self.it_space, [in_dep], out_dep
+        )
+        self.assertEqual(result[self.rows], 7)
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "pad_iteration_space ignores the output's valid_elements, so rows "
+            "grow from 7 into an output of unknown valid_elements (#741)"
+        ),
+    )
+    def test_unknown_valid_elements_keeps_rows(self):
+        # If valid_elements is empty, we cannot distinguish the case of
+        # test_live_slice_output_keeps_rows from the case of
+        # test_padded_input_and_output_grow_rows, so we should not grow.
+        out_dep = _with_padded_dim(
+            _tensor_dep("out", (7, 64), (self.rows, self.cols)), self.rows, 8, {}
+        )
+        in_dep = self._dep("x", 8)
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, self.it_space, [in_dep], out_dep
+        )
+        self.assertEqual(result[self.rows], 7)
 
 
 class TestPadIterationSpaceIndirect(unittest.TestCase):
