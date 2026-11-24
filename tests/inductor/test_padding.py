@@ -44,6 +44,7 @@ from torch.testing._internal.common_utils import (
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
+from torch_spyre._inductor.codegen import superdsc
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
@@ -1527,6 +1528,186 @@ class TestMatmulPaddingNaN(unittest.TestCase):
         result = compiled(a_spyre, b_spyre)
         expected = fn(a_cpu, b_cpu)
         self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+
+# (activation shape, kernel shape) for each layout batchmatmul is lowered from.
+# N (the kernel's last dim) is never a multiple of the stick (64 elements at
+# fp16, 32 at fp32), so the kernel and the output carry padding columns.
+MATMUL_NAN_PAD_CASES = {
+    "2d": ((64, 128), (128, 100)),
+    "decode_m1": ((1, 256), (256, 438)),  # 7 sticks of N, split over cores
+    "n_below_stick": ((33, 64), (64, 10)),
+    "k_unaligned": ((64, 100), (100, 130)),  # K padded by copies, N masked
+    "3d": ((3, 64, 128), (3, 128, 100)),
+    "3d_shared_weight": ((3, 64, 128), (128, 100)),
+    "4d": ((2, 3, 64, 128), (2, 3, 128, 100)),
+    "4d_shared_weight": ((2, 3, 64, 128), (128, 100)),
+    "broadcast_activation_batch": ((1, 64, 128), (4, 128, 100)),
+    "broadcast_weight_batch": ((4, 64, 128), (1, 128, 100)),
+    "broadcast_heads": ((2, 1, 64, 128), (2, 3, 128, 100)),
+}
+
+MATMUL_NAN_PAD_CORES = [1, 4, 32]
+
+MATMUL_NAN_PAD_DTYPES = [torch.float16]
+
+# Reading back the padding of an M=1 output fails in the copy to the host (out
+# of bounds for its storage), so a padding check cannot see the decode case;
+# test_chained_matmul covers it through the visible values instead.
+# TODO: read back the M=1 padding and drop this exclusion.
+MATMUL_NAN_PAD_READBACK_CASES = [
+    case for case, (a_shape, _) in MATMUL_NAN_PAD_CASES.items() if a_shape[-2] != 1
+]
+
+
+def _stick_padded(n: int, dtype: torch.dtype) -> int:
+    elems = get_elem_in_stick(dtype)
+    return math.ceil(n / elems) * elems
+
+
+def _nan_padded_kernel(
+    shape: tuple[int, ...], dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A spyre kernel of ``shape`` whose padding columns hold NaN.
+
+    The tensor is built on the host at the stick-padded width with NaN past the
+    logical N, copied to the device and reinterpreted at ``shape``, so the NaN
+    sits in the device padding. Returns the device tensor and its CPU values.
+    """
+    *lead, k, n = shape
+    full = torch.randn(*lead, k, _stick_padded(n, dtype), dtype=dtype)
+    full[..., n:] = float("nan")
+    device = try_reinterpret_host_shape(full.to("spyre"), [*lead, k, n])
+    return device, full[..., :n].clone()
+
+
+@instantiate_parametrized_tests
+class TestMatmulCoordinateMaskingNaN(unittest.TestCase):
+    """A matmul masks its kernel's padding columns, so NaN there stays out.
+
+    The kernel's padding columns only reach the output's padding columns, so a
+    lone matmul shows correct values with or without the mask. Without it the
+    output padding is NaN, though, and a consumer that reads it, such as a
+    matmul taking the output as its activation (N becomes its K), returns NaN.
+    Each test fails without the mask in ``_get_matmul_coordinate_mask``.
+    """
+
+    def setUp(self) -> None:
+        # Every parametrization compiles the same code object, and Dynamo's
+        # guards do not cover the Spyre config: without a reset, a run with
+        # other sencores/lx_planning would reuse the first run's kernels.
+        torch._dynamo.reset()
+
+    def _assert_close_to_cpu(self, result: torch.Tensor, expected: torch.Tensor):
+        result_cpu = result.cpu()
+        self.assertFalse(
+            result_cpu.isnan().any().item(), "compiled Spyre output contains NaN"
+        )
+        # fp16 accumulation on the device against an fp32 reference: the
+        # error stays below 0.5% of the output's magnitude on these shapes, so
+        # 1% bounds it without hiding a wrong column.
+        scale = expected.abs().max().item()
+        torch.testing.assert_close(
+            result_cpu.float(), expected, rtol=1e-2, atol=1e-2 * scale
+        )
+
+    def _assert_padding_is_zero(self, result: torch.Tensor):
+        *lead, n = result.shape
+        full = try_reinterpret_host_shape(
+            result, [*lead, _stick_padded(n, result.dtype)]
+        ).cpu()
+        padding = full[..., n:]
+        self.assertTrue(
+            (padding == 0).all().item(),
+            f"output padding is not 0 (masked to 0): {padding.unique()}",
+        )
+
+    @parametrize("dtype", MATMUL_NAN_PAD_DTYPES)
+    @parametrize("cores", MATMUL_NAN_PAD_CORES)
+    @parametrize("kernel", ["graph_input", "computed_hbm", "computed_lx"])
+    @parametrize("case", MATMUL_NAN_PAD_READBACK_CASES)
+    def test_padded_kernel_columns(self, case, kernel, cores, dtype) -> None:
+        a_shape, w_shape = MATMUL_NAN_PAD_CASES[case]
+        torch.manual_seed(0)
+        a_cpu = torch.randn(a_shape, dtype=dtype)
+        w_spyre, w_cpu = _nan_padded_kernel(w_shape, dtype)
+
+        if kernel == "graph_input":
+
+            def fn(x, w):
+                return x @ w
+
+        else:
+            # The kernel and the output are intermediates, which LX planning
+            # places in LX; the pointwise ops carry the padding through as is.
+            def fn(x, w):
+                return (x @ (w * 2)) * 0.5
+
+        placements: list[dict[str, str]] = []
+        real_parse_op_spec = superdsc.parse_op_spec
+
+        def record_placements(*args, **kwargs):
+            spec, mapping = real_parse_op_spec(*args, **kwargs)
+            if spec.opfunc == BATCH_MATMUL_OP:
+                placements.append(
+                    {
+                        role: next(iter(arg.allocation))
+                        for role, arg in zip(("kernel", "output"), spec.args[1:])
+                    }
+                )
+            return spec, mapping
+
+        with (
+            ts_inductor_config.patch(
+                {"sencores": cores, "lx_planning": kernel == "computed_lx"}
+            ),
+            # A compile served from the FX graph cache skips codegen, so the
+            # placements would not be recorded.
+            t_inductor_config.patch(force_disable_caches=True),
+            patch.object(superdsc, "parse_op_spec", side_effect=record_placements),
+        ):
+            result = torch.compile(fn, fullgraph=True, dynamic=False)(
+                a_cpu.to("spyre"), w_spyre
+            )
+
+        self.assertTrue(placements, "no batchmatmul was compiled")
+        if kernel == "computed_lx":
+            self.assertTrue(
+                any("lx" in p.values() for p in placements),
+                f"no matmul kernel or output was placed in LX: {placements}",
+            )
+        else:
+            self.assertTrue(
+                all("lx" not in p.values() for p in placements),
+                f"a matmul kernel or output was placed in LX: {placements}",
+            )
+        self._assert_close_to_cpu(result, fn(a_cpu.float(), w_cpu.float()))
+        self._assert_padding_is_zero(result)
+
+    @parametrize("dtype", MATMUL_NAN_PAD_DTYPES)
+    @parametrize("cores", MATMUL_NAN_PAD_CORES)
+    @parametrize("memory", ["hbm", "lx"])
+    @parametrize("case", list(MATMUL_NAN_PAD_CASES))
+    def test_chained_matmul(self, case, memory, cores, dtype) -> None:
+        """``(x @ w) @ y``: the first output's padding becomes the second K."""
+        a_shape, w_shape = MATMUL_NAN_PAD_CASES[case]
+        torch.manual_seed(0)
+        a_cpu = torch.randn(a_shape, dtype=dtype)
+        w_spyre, w_cpu = _nan_padded_kernel(w_shape, dtype)
+        y_cpu = torch.randn(w_shape[-1], 64, dtype=dtype)
+
+        def fn(x, w, y):
+            return (x @ w) @ y
+
+        with ts_inductor_config.patch(
+            {"sencores": cores, "lx_planning": memory == "lx"}
+        ):
+            result = torch.compile(fn, fullgraph=True, dynamic=False)(
+                a_cpu.to("spyre"), w_spyre, y_cpu.to("spyre")
+            )
+        self._assert_close_to_cpu(
+            result, fn(a_cpu.float(), w_cpu.float(), y_cpu.float())
+        )
 
 
 if __name__ == "__main__":

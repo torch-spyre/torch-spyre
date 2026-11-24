@@ -1,0 +1,30 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/kernel/workload-layer.json",
+ "title": "kernel/layer",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "model": {
+   "type": "string"
+  },
+  "layer": {
+   "type": "string"
+  },
+  "bucket": {
+   "type": "array",
+   "items": {
+    "type": "integer",
+    "minimum": 1
+   }
+  },
+  "flags": {
+   "type": "object",
+   "description": "tool flags verbatim (native names); identity unless listed in non_identity"
+  }
+ },
+ "required": [
+  "model",
+  "layer"
+ ]
+}

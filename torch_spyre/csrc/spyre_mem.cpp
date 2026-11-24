@@ -1136,52 +1136,131 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // FP8 multi-dim stick layout uses specialized DCI generation
   if (stl.element_arrangement == ElementArrangement::QFP8WT) {
     // Reverse PyTorch ordering before reading N/K from cpu_sizes.
+    // For a 2D weight [K, N] this gives [N, K] after reversal, so cpu_sizes[0]
+    // = N and cpu_sizes[1] = K.  For higher-rank tensors (3D paged KV cache
+    // [BATCH, K, N] or 4D [BATCH0, BATCH1, K, N]) the two innermost dims after
+    // reversal are still [N, K]; the remaining leading dims are outer batch
+    // dimensions over which we emit one DataConversionStrideInfo each.
+    //
+    // Host element addresses come from the host tensor's own strides, so
+    // transposed or otherwise non-contiguous host views are read and written
+    // in logical order.
+    const std::vector<int64_t> host_tensor_sizes = cpu_tensor->sizes().vec();
+    const std::vector<int64_t> host_tensor_strides =
+        cpu_tensor->strides().vec();
+    TORCH_CHECK(host_tensor_sizes.size() >= 2,
+                "QFP8WT tensor must have at least 2 dimensions");
+    cpu_sizes = host_tensor_sizes;
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
     std::reverse(device_sizes.begin(), device_sizes.end());
 
     const int64_t eps = stl.elems_per_stick();
     const int64_t si = 2;
     const int64_t so = eps / si;
-    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
-    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
+    // After reversal: cpu_sizes[0] = N (columns), cpu_sizes[1] = K (rows).
+    // Any cpu_sizes[2..] are outer batch dimensions.
     const int64_t N = cpu_sizes[0];
     const int64_t K = cpu_sizes[1];
 
-    // Expanded device shape: [si, so, K/si, N/so]
+    // Expanded device shape per [K, N] matrix: [si, so, K/si, N/so]
     TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
     TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
     const int64_t dim2 = K / si;
     const int64_t dim3 = N / so;
 
-    // Host strides for the expanded layout
-    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
-    const int64_t dst3 =
-        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
-
-    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
-    // dim3]:
+    // Host strides for the expanded 4D index space [si, so, dim2, dim3]:
     //   element [k,n]: k = d2*si + a,  n = d3*so + b
-    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
-    //             = a*N + b*1 + d2*(si*N) + d3*so
-    //   → stride_src = [N, 1, si*N, so]
-    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
+    //   host element = k*sK + n*sN = a*sK + b*sN + d2*(si*sK) + d3*(so*sN)
+    //   where sK, sN are the host strides of K and N (N, 1 when contiguous)
+    //   → stride_src = [sK, sN, si*sK, so*sN]
+    const int64_t sK = host_tensor_strides[host_tensor_strides.size() - 2];
+    const int64_t sN = host_tensor_strides[host_tensor_strides.size() - 1];
+    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
+    const std::vector<int64_t> host_strides = {sK, sN, si * sK, so * sN};
 
-    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
-    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
-    //   (within a stick: si dimension innermost at stride=1, so dimension at
-    //   stride=si) → stride = [1, si, dst2, dst3]
+    // The device interleaves the matrices of a batched tensor with their
+    // N-strips, in this order (outermost first):
+    //   [outer batch dims] [N-strip] [last batch dim] [K/si] [stick]
+    // ignoring batch dims of extent 1, so one [K, N] matrix is not contiguous:
+    // consecutive N-strips of it are dst3 apart.  The allocation's own sizes
+    // (dma_sizes) give the batch geometry, so a view such as ``dev[b]``
+    // addresses the right matrices.
+    const size_t full_rank = dma_sizes.size();
+    TORCH_CHECK(full_rank >= 2 && full_rank <= 4,
+                "QFP8WT host transfers support tensors of rank 2 to 4, got ",
+                full_rank);
+    const int64_t full_K = dma_sizes[full_rank - 2];
+    const int64_t full_N = dma_sizes[full_rank - 1];
+    TORCH_CHECK(full_K == K && full_N == N,
+                "QFP8WT host transfers of a view must cover whole [K, N] "
+                "matrices: view is [",
+                K, ", ", N, "], allocation is [", full_K, ", ", full_N, "]");
+    const int64_t matrix_elems = K * N;
+    const int64_t matrix_stride = dim2 * eps;  // one matrix's share of a strip
+    // Batch dims of extent 1 take no part in the interleave.
+    int64_t last_batch_extent = 1;
+    for (size_t d = 0; d + 2 < full_rank; ++d) {
+      if (dma_sizes[d] > 1) last_batch_extent = dma_sizes[d];
+    }
+    const int64_t dst3 = last_batch_extent * matrix_stride;  // strip stride
     const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
 
-    DataConversionStrideInfo dcsi;
-    dcsi.size_ = {si, so, dim2, dim3};
-    dcsi.stride_src_ = host2device ? host_strides : device_strides;
-    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
-    dcsi.offset_src_ = host2device ? cpu_offset : 0;
-    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
-    dci.dcsi_ = {dcsi};
-    // For H2D, output (device) shape is the expanded 4D form.
-    // For D2H, output (host) shape is the original 2D cpu_sizes.
-    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    // Batch geometry of the view (row-major over its leading dims).
+    const size_t host_batch_rank = host_tensor_sizes.size() - 2;
+    // dev_strides was inflated above for sliced views; use the view's own.
+    const std::vector<int64_t> view_strides = dev_tensor->strides().vec();
+    TORCH_CHECK(view_strides.size() == host_tensor_sizes.size(),
+                "QFP8WT host transfer: device and host ranks differ");
+    const int64_t dev_storage_offset = dev_tensor->storage_offset();
+    TORCH_CHECK(dev_storage_offset % matrix_elems == 0,
+                "QFP8WT host transfers must start on a whole [K, N] matrix, "
+                "got storage offset ",
+                dev_storage_offset);
+    int64_t batch = 1;
+    for (size_t d = 0; d < host_batch_rank; ++d) {
+      batch *= host_tensor_sizes[d];
+      TORCH_CHECK(view_strides[d] % matrix_elems == 0,
+                  "QFP8WT host transfers require whole-matrix batch strides");
+    }
+
+    // Emit one DataConversionStrideInfo per batch element so each independent
+    // [K, N] QFP8WT matrix is transferred with the correct 2D-stick interleave.
+    // For the common 2D case (batch==1) this produces a single entry.
+    dci.dcsi_.reserve(static_cast<size_t>(batch));
+    for (int64_t b = 0; b < batch; ++b) {
+      // Unravel b over the view's batch dims (row-major) to get the host
+      // element offset and the matrix's index in the allocation.
+      int64_t host_batch_offset = 0;
+      int64_t dev_matrix_index = dev_storage_offset / matrix_elems;
+      int64_t rem = b;
+      for (size_t d = host_batch_rank; d-- > 0;) {
+        const int64_t idx = rem % host_tensor_sizes[d];
+        host_batch_offset += idx * host_tensor_strides[d];
+        dev_matrix_index += idx * (view_strides[d] / matrix_elems);
+        rem /= host_tensor_sizes[d];
+      }
+      const int64_t outer = dev_matrix_index / last_batch_extent;
+      const int64_t last = dev_matrix_index % last_batch_extent;
+      const int64_t device_matrix_offset =
+          outer * dim3 * dst3 + last * matrix_stride;
+      DataConversionStrideInfo dcsi;
+      dcsi.size_ = {si, so, dim2, dim3};
+      dcsi.stride_src_ = host2device ? host_strides : device_strides;
+      dcsi.stride_dst_ = host2device ? device_strides : host_strides;
+      dcsi.offset_src_ =
+          host2device ? cpu_offset + host_batch_offset : device_matrix_offset;
+      dcsi.offset_dst_ =
+          host2device ? device_matrix_offset : cpu_offset + host_batch_offset;
+      dci.dcsi_.push_back(dcsi);
+    }
+
+    // For H2D, output (device) shape is the expanded form including batch dims.
+    // For D2H, output (host) shape is the original cpu_sizes (all dims
+    // reversed). The batch dims are appended after the four expanded dims in
+    // reversed (innermost-first) order.
+    std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    for (size_t i = 2; i < cpu_sizes.size(); ++i)
+      expanded_dev_shape.push_back(cpu_sizes[i]);
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
     dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
   } else {
@@ -1769,6 +1848,40 @@ bool spyre_is_sharded(const at::Tensor& tensor) {
   return ctx != nullptr && ctx->sharding.has_value();
 }
 
+std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
+                                                      c10::IntArrayRef sizes,
+                                                      c10::IntArrayRef strides,
+                                                      int64_t storage_offset) {
+  const auto& global = sharding_of(sharded)->sharding->global_shape;
+  const size_t rank = global.size();
+  if (sizes.size() != rank || strides.size() != rank || storage_offset < 0) {
+    return std::nullopt;
+  }
+  // The base of sharded storage is contiguous (spyre_empty_sharded makes it
+  // so; resize_ and set_ are rejected), so its strides follow from its shape.
+  std::vector<int64_t> base_strides(rank);
+  int64_t stride = 1;
+  for (size_t i = rank; i-- > 0;) {
+    base_strides[i] = stride;
+    stride *= std::max<int64_t>(global[i], 1);
+  }
+  // The storage offset of a box is sum(start[i] * base_strides[i]) with
+  // 0 <= start[i] < global[i], so it decomposes uniquely.
+  std::vector<int64_t> start(rank);
+  int64_t rest = storage_offset;
+  for (size_t i = 0; i < rank; ++i) {
+    // A size-1 dimension's stride addresses nothing and PyTorch does not
+    // normalize it, so only the other strides must be the base's.
+    if (sizes[i] < 1 || (sizes[i] > 1 && strides[i] != base_strides[i])) {
+      return std::nullopt;
+    }
+    start[i] = rest / base_strides[i];
+    rest %= base_strides[i];
+    if (start[i] + sizes[i] > global[i]) return std::nullopt;
+  }
+  return start;
+}
+
 uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
                               int64_t expected_num_shards,
                               int64_t expected_shard_bytes) {
@@ -1785,6 +1898,14 @@ uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
   TORCH_CHECK(shard_index >= 0 && shard_index < expected_num_shards,
               "shard index ", shard_index, " is out of range for ",
               expected_num_shards, " shards");
+  // A kernel binds core c to the start of shard c, which is only right for
+  // the whole tensor; a box view (x[8:16]) starts elsewhere in the shards.
+  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous() &&
+                  sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
+              "non-unified kernels need whole sharded tensors, not views of "
+              "them (got ",
+              sharded.sizes(), " at storage offset ", sharded.storage_offset(),
+              " of ", info.global_shape, ")");
   // Shard ordinal indexes the shard table directly: shard i backs core i, in
   // an addressable plain allocation of at least one shard.
   TORCH_CHECK(static_cast<size_t>(shard_index) < owner->shard_addrs.size(),
@@ -1938,7 +2059,8 @@ void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
 namespace {
 
 // A single-chunk, non-owning Spyre tensor over shard `shard_index` of a
-// sharded tensor, with the shard-local shape and layout. It keeps the parent
+// sharded tensor's storage, with the shard-local shape (from the recorded
+// global shape, so `sharded` may be a view) and layout. It keeps the parent
 // storage alive. Used by copy_sharded to copy one shard with the ordinary
 // copy path.
 at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
@@ -1946,8 +2068,6 @@ at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
   const auto& info = *owner->sharding;
   TORCH_CHECK(shard_index >= 0 && shard_index < info.num_shards, "shard index ",
               shard_index, " is out of range for ", info.num_shards, " shards");
-  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous(),
-              "shard views require a contiguous base sharded tensor");
   // The shard table is indexed by shard ordinal by construction: shard i
   // backs core i. Exactly one shard's device bytes from the start of its
   // own allocation.
@@ -1974,13 +2094,13 @@ at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
   auto view = at::detail::make_tensor_base<SpyreTensorImpl>(
       c10::Storage(std::move(storage_impl)), pu1_dks, sharded.dtype());
   auto* impl = static_cast<SpyreTensorImpl*>(view.unsafeGetTensorImpl());
-  std::vector<int64_t> shard_size = sharded.sizes().vec();
+  std::vector<int64_t> shard_size = info.global_shape;
   shard_size[info.shard_dim] /= info.num_shards;
   impl->set_sizes_contiguous(shard_size);
   const auto strides = view.strides().vec();
-  impl->spyre_layout =
-      static_cast<SpyreTensorImpl*>(sharded.unsafeGetTensorImpl())
-          ->spyre_layout;
+  // The layout every shard was allocated with (spyre_empty_sharded), rather
+  // than `sharded`'s own: a view may carry another layout.
+  impl->spyre_layout = SpyreTensorLayout(shard_size, info.dtype);
   impl->dma_sizes = shard_size;
   impl->dma_strides = strides;
   return view;
@@ -1990,14 +2110,24 @@ at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
 // each shard goes through the ordinary layout-aware copy into (or out of) a
 // single-chunk view of its own chunk. Synchronous; the destination is valid
 // only after every shard copy has completed.
+//
+// A box view of a sharded tensor (see sharded_box_start) is copied to the
+// CPU from the shards it overlaps: each of them is copied whole into a CPU
+// staging buffer, and the part inside the box is copied out of it on the
+// CPU. Copies into a box view are not supported yet.
 void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
   const bool host2device = self.is_cpu() && spyre_is_sharded(dst);
   const at::Tensor& sharded = host2device ? dst : self;
   const at::Tensor& host = host2device ? self : dst;
   TORCH_CHECK(host.is_cpu(),
               "sharded Spyre tensors can only be copied to or from the CPU");
-  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous(),
-              "sharded Spyre tensors only support whole-tensor copies");
+  const auto box = sharded_box_start(
+      sharded, sharded.sizes(), sharded.strides(), sharded.storage_offset());
+  TORCH_CHECK(box.has_value(),
+              "sharded Spyre tensors only support copies of the whole tensor "
+              "or of a block of it (view: ",
+              sharded.sizes(), " with strides ", sharded.strides(),
+              " at storage offset ", sharded.storage_offset(), ")");
   TORCH_CHECK(host.sizes() == sharded.sizes(),
               "copy shape mismatch: ", host.sizes(), " vs ", sharded.sizes());
   // Dtype-converting DMA is rejected: converting shard copies are untested
@@ -2008,23 +2138,31 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               "change (got ",
               sharded.dtype(), " -> ", host.dtype(), ")");
   const auto& info = *sharding_of(sharded)->sharding;
-  TORCH_CHECK(sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
-              "sharded Spyre tensors only support whole-tensor copies: tensor "
-              "metadata no longer matches the sharded allocation (",
-              sharded.sizes(), " vs ", info.global_shape, ")");
-  // A same-size view(dtype) passes the identity view check but leaves a
-  // tensor whose dtype disagrees with the recorded shard layout; reject it
-  // before the copy misinterprets the bytes.
+  // A same-size view(dtype) passes the view checks but leaves a tensor whose
+  // dtype disagrees with the recorded shard layout; reject it before the copy
+  // misinterprets the bytes.
   TORCH_CHECK(sharded.scalar_type() == info.dtype,
               "sharded Spyre tensors only support whole-tensor copies: tensor "
               "dtype no longer matches the sharded allocation (",
               sharded.scalar_type(), " vs ", info.dtype, ")");
-  const int64_t extent = sharded.size(info.shard_dim) / info.num_shards;
+  const bool whole =
+      sharded.sizes().equals(c10::IntArrayRef(info.global_shape));
+  TORCH_CHECK(whole || !host2device,
+              "copies into a view of a sharded Spyre tensor are not supported "
+              "yet; only copies to the CPU are (view: ",
+              sharded.sizes(), " of ", info.global_shape, ")");
+  const int64_t dim = info.shard_dim;
+  const int64_t extent = info.global_shape[dim] / info.num_shards;
+  const int64_t box_lo = (*box)[dim];
+  const int64_t box_hi = box_lo + sharded.size(dim);
 
   SpyreStream stream = getCurrentStream(sharded.device());
-  for (int64_t i = 0; i < static_cast<int64_t>(info.num_shards); ++i) {
+  for (int64_t i = box_lo / extent; i * extent < box_hi; ++i) {
+    // The rows of shard i (along the shard dimension) inside the box.
+    const int64_t lo = std::max(box_lo, i * extent);
+    const int64_t hi = std::min(box_hi, (i + 1) * extent);
     at::Tensor shard = spyre_shard_view(sharded, i);
-    at::Tensor host_slice = host.narrow(info.shard_dim, i * extent, extent);
+    at::Tensor host_slice = host.narrow(dim, lo - box_lo, hi - lo);
     if (host2device) {
       at::Tensor staging = host_slice.contiguous();
       stream.copyAsync(staging, shard);
@@ -2034,7 +2172,11 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
       at::Tensor staging = at::empty(shard.sizes(), host.options());
       stream.copyAsync(shard, staging);
       stream.synchronize();
-      host_slice.copy_(staging);
+      at::Tensor part = staging.narrow(dim, lo - i * extent, hi - lo);
+      for (int64_t d = 0; d < sharded.dim(); ++d) {
+        if (d != dim) part = part.narrow(d, (*box)[d], sharded.size(d));
+      }
+      host_slice.copy_(part);
     }
   }
 }
@@ -2043,6 +2185,10 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
 
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
+  // As aten::_copy_from does; the DMA path below has no zero-size transfer.
+  if (self.numel() == 0) {
+    return dst;
+  }
   if (spyre_is_sharded(self) || spyre_is_sharded(dst)) {
     // Sharded copies are blocking by contract; non_blocking is honored by
     // completing before return.
@@ -2170,7 +2316,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     }
   }
 
-  stream.copyAsync(*copy_from, *copy_to);
+  stream.copyAsync(*copy_from, *copy_to, /*stage_pageable_h2d=*/non_blocking);
   if (!non_blocking) {
     stream.synchronize();
   }
@@ -2279,16 +2425,20 @@ const at::Tensor& spyre_resize_(
   std::vector<int64_t> layout_size = size_int.vec();
   if (!self_impl->reserved_dims.empty()) {
     // reserved_dims keys are absolute dim indices. If the shape, strides or
-    // offset were changed in place since allocation (t_, squeeze_,
-    // as_strided_, ...), a key can name a different axis than it did, and
-    // every check below would validate the wrong dimension. Fail rather than
-    // trust it; falling through as "unreserved" would reallocate instead.
+    // offset no longer match the allocation, a key can name a different axis
+    // than it did, and every check below would validate the wrong dimension.
+    // That happens after an in-place change (t_, squeeze_, as_strided_, ...)
+    // and on a view that changed the geometry (a slice, a reshape): views
+    // copy the map, and has_intact_reservation() is what rejects them here.
+    // Fail rather than trust it; falling through as "unreserved" would
+    // reallocate instead.
     TORCH_CHECK(self_impl->has_intact_reservation(),
-                "resize_ on a max-reserved Spyre tensor: its shape, strides "
-                "or storage offset were changed in place after allocation "
-                "(e.g. t_(), transpose_(), squeeze_(), as_strided_()), so the "
-                "reservation no longer refers to the same axis. current "
-                "shape=",
+                "resize_ on a max-reserved Spyre tensor: this tensor's shape, "
+                "strides or storage offset no longer match the allocation, so "
+                "the reservation no longer refers to the same axis. This "
+                "happens after an in-place change (t_(), transpose_(), "
+                "squeeze_(), as_strided_()) and on a view that changed the "
+                "geometry (a slice, a reshape). current shape=",
                 self.sizes(), ", shape at allocation=",
                 c10::IntArrayRef(self_impl->dma_sizes));
     // Scope today: at most one entry, so this loop runs once; the guard is
@@ -2402,18 +2552,79 @@ const at::Tensor& spyre_resize_(
   return self;
 }
 
+namespace {
+
+// Launch a device-side MEMORY_FILL DMA over one composite address: every
+// stick of it, padding included. createFillAsyncParams converts value to the
+// dtype-specific fill pattern; launchFillAsync submits it.
+void launch_device_fill(const flex::CompositeAddress* addr, double value,
+                        c10::ScalarType scalar_type) {
+  // Map torch dtype to DataFormats for the value->pattern conversion, which
+  // flex::createFillAsyncParams performs internally.
+  DataFormats dtype = get_device_dtype(scalar_type);
+
+  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
+  // formats. Zero is the all-zero bit pattern in every format, and the fill
+  // writes raw bytes, so a zero fill of fp8 storage can use any supported
+  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
+  // have, so reject it here instead of failing inside the runtime.
+  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
+    TORCH_CHECK(value == 0.0,
+                "fill_ of a float8 Spyre tensor is only supported with the "
+                "value 0 (the device fill has no fp8 pattern); got ",
+                value);
+    dtype = DataFormats::SEN169_FP16;
+  }
+
+  auto* params =
+      flex::createFillAsyncParams(addr, value, dtype, /*use_dmai=*/true);
+  struct Guard {
+    flex::FillAsyncParams* p;
+    ~Guard() {
+      flex::destroyFillAsyncParams(p);
+    }
+  } guard{params};
+  SpyreStream stream;
+  stream.launchFillAsync(params);
+}
+
+// Fill a sharded tensor one shard at a time: each shard is its own
+// single-chunk allocation, so a fill of each shard view covers the whole
+// tensor. Only whole sharded tensors reach this (views of sharded tensors are
+// rejected when created); the checks mirror copy_sharded's.
+void fill_sharded(const at::Tensor& sharded, double value) {
+  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous(),
+              "sharded Spyre tensors only support whole-tensor fills");
+  const auto& info = *sharding_of(sharded)->sharding;
+  TORCH_CHECK(sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
+              "sharded Spyre tensors only support whole-tensor fills: tensor "
+              "metadata no longer matches the sharded allocation (",
+              sharded.sizes(), " vs ", info.global_shape, ")");
+  TORCH_CHECK(sharded.scalar_type() == info.dtype,
+              "sharded Spyre tensors only support whole-tensor fills: tensor "
+              "dtype no longer matches the sharded allocation (",
+              sharded.scalar_type(), " vs ", info.dtype, ")");
+  for (int64_t i = 0; i < static_cast<int64_t>(info.num_shards); ++i) {
+    at::Tensor shard = spyre_shard_view(sharded, i);
+    launch_device_fill(get_composite_address(shard), value,
+                       shard.scalar_type());
+  }
+}
+
+}  // namespace
+
 at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   TORCH_CHECK(self.is_privateuseone(),
               "spyre_fill_tensor: tensor must be on spyre device");
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
-  // Sharded storage is a table of per-shard allocations whose layout
-  // describes one shard, so the checks below do not apply to it. Reject it
-  // here with the sharding message; get_composite_address would too, but only
-  // after the partial-view check below had misreported it.
-  TORCH_CHECK(!spyre_is_sharded(self),
-              "this operation does not support sharded Spyre tensors yet "
-              "(sharded storage can only be copied to or from the CPU)");
+  // A sharded tensor's layout describes one shard, not the whole tensor, so
+  // the view checks below do not apply to it; fill_sharded fills each shard
+  // and rejects anything but the whole tensor.
+  if (spyre_is_sharded(self)) {
+    fill_sharded(self, value);
+    return self;
+  }
 
   // The device-side MEMORY_FILL below writes every stick of the composite
   // address, i.e. the whole storage, so it is only correct when self covers
@@ -2473,36 +2684,7 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "). Fill the whole tensor, or fill a CPU copy and copy it "
               "back.");
 
-  // Map torch dtype to DataFormats for the value->pattern conversion, which
-  // flex::createFillAsyncParams performs internally.
-  DataFormats dtype = get_device_dtype(self.scalar_type());
-
-  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
-  // formats. Zero is the all-zero bit pattern in every format, and the fill
-  // writes raw bytes, so a zero fill of fp8 storage can use any supported
-  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
-  // have, so reject it here instead of failing inside the runtime.
-  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
-    TORCH_CHECK(value == 0.0,
-                "fill_ of a float8 Spyre tensor is only supported with the "
-                "value 0 (the device fill has no fp8 pattern); got ",
-                value);
-    dtype = DataFormats::SEN169_FP16;
-  }
-
-  // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
-  // to the dtype-specific fill pattern; launchFillAsync submits it.
-  auto* params = flex::createFillAsyncParams(get_composite_address(self), value,
-                                             dtype, /*use_dmai=*/true);
-  struct Guard {
-    flex::FillAsyncParams* p;
-    ~Guard() {
-      flex::destroyFillAsyncParams(p);
-    }
-  } guard{params};
-  SpyreStream stream;
-  stream.launchFillAsync(params);
-
+  launch_device_fill(get_composite_address(self), value, self.scalar_type());
   return self;
 }
 

@@ -117,19 +117,21 @@ on:
     # workflow even when the caller has it. Both the prod and the _DEV set therefore appear,
     # because the clickhouse_env ternary below reads whichever the caller selected.
     secrets:
-      CLICKHOUSE_HOST: {required: true}
-      CLICKHOUSE_PORT: {required: true}
-      CLICKHOUSE_USER: {required: true}
-      CLICKHOUSE_PASS: {required: true}
-      CLICKHOUSE_DB: {required: true}
-      # Empty makes the v2 write a no-op, so a caller without it degrades to v1 only.
+      # Endpoint fallback when the v2 pair is unset; the scoped v2 login is the only credential.
+      CLICKHOUSE_HOST: {required: false}
+      CLICKHOUSE_PORT: {required: false}
       CLICKHOUSE_DB_V2: {required: false}
       CLICKHOUSE_HOST_DEV: {required: false}
       CLICKHOUSE_PORT_DEV: {required: false}
-      CLICKHOUSE_USER_DEV: {required: false}
-      CLICKHOUSE_PASS_DEV: {required: false}
-      CLICKHOUSE_DB_DEV: {required: false}
       CLICKHOUSE_DB_V2_DEV: {required: false}
+      CLICKHOUSE_V2_HOST: {required: false}
+      CLICKHOUSE_V2_PORT: {required: false}
+      CLICKHOUSE_V2_USER: {required: false}
+      CLICKHOUSE_V2_PASSWORD: {required: false}
+      CLICKHOUSE_V2_HOST_DEV: {required: false}
+      CLICKHOUSE_V2_PORT_DEV: {required: false}
+      CLICKHOUSE_V2_USER_DEV: {required: false}
+      CLICKHOUSE_V2_PASSWORD_DEV: {required: false}
 
 concurrency:
   # Allow at most one ingest per triggering run (re-runs queue behind)
@@ -139,6 +141,15 @@ concurrency:
 permissions:
   contents: read
   actions: read   # needed to download artifacts from the triggering run
+
+env:
+  # Read by the ingest library: fail when a v2 database has no v2 host; the v2 database list.
+  CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
+  CH_V2_DATABASES: ${{ vars.CH_V2_DATABASES }}
+  # Kill switch, red-on-park and the per-call retry deadline of the v2 write path.
+  CH_WRITE_RESILIENCE: ${{ vars.CH_WRITE_RESILIENCE }}
+  CH_WRITE_STRICT: ${{ vars.CH_WRITE_STRICT }}
+  CH_WRITE_DEADLINE_S: ${{ vars.CH_WRITE_DEADLINE_S || '120' }}
 
 jobs:
   ingest:
@@ -156,37 +167,18 @@ jobs:
       github.event.workflow_run.conclusion != 'cancelled'
 
     env:
-      # ---------------------------------------------------------------------------
-      # Set these secrets in your repo / org settings:
-      #   CLICKHOUSE_HOST   e.g. clickhouse.internal.example.com
-      #   CLICKHOUSE_PORT   e.g. 8123  (HTTP interface)
-      #   CLICKHOUSE_USER   e.g. spyre_writer
-      #   CLICKHOUSE_PASS   the password
-      #   CLICKHOUSE_DB     e.g. spyre
-      # ---------------------------------------------------------------------------
-
-      # Instance selected by the clickhouse_env input: "dev" -> the *_DEV secret
-      # set, anything else (incl. "prod" and the empty value a workflow_run event
-      # sends) -> the plain PROD set. The `!= 'dev'` test (not `== 'prod'`) is
-      # deliberate: it keeps the AUTOMATIC workflow_run path on prod, since that
-      # event carries no input. A secret context key must be a literal name, so
-      # this is a per-name ternary, not a computed `secrets[...]` lookup. This is
-      # what lets a manual DEV re-ingest happen with no edit+push to main.
-      CLICKHOUSE_HOST: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
-      CLICKHOUSE_PORT: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
-      CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
-      CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
-      CLICKHOUSE_DB: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
-      # The schema-v2 database. Every v2 statement is QUALIFIED with it rather than opening a
-      # second connection, because test_cases and benchmark_runs exist in both generations
-      # with incompatible shapes and an unqualified name would hit the wrong one. Empty/unset
-      # makes the v2 write a no-op, which keeps an un-updated caller behaving as before.
-      CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
-      # Dual-write during the migration window: v1 stays authoritative, v2 accumulates the
-      # same runs so the new schema can be validated against real traffic before anything
-      # depends on it. No data is ported -- v1 rows cannot produce a v2 run_id -- so `both` is
-      # how v2 gets any history at all.
-      INGEST_SCHEMA: both
+      # clickhouse_env "dev" selects the *_DEV secrets; anything else (including the empty value
+      # a workflow_run event sends) selects prod. A secret name must be literal, so this is a
+      # per-name ternary; toJSON keeps an unset prod secret from falling through to the dev one.
+      CLICKHOUSE_V2_HOST: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV
+        || secrets.CLICKHOUSE_HOST_DEV)) }}
+      CLICKHOUSE_V2_PORT: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON((secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST
+        && secrets.CLICKHOUSE_PORT) || '') || toJSON((secrets.CLICKHOUSE_V2_HOST_DEV && secrets.CLICKHOUSE_V2_PORT_DEV) || (!secrets.CLICKHOUSE_V2_HOST_DEV
+        && secrets.CLICKHOUSE_PORT_DEV) || '')) }}
+      CLICKHOUSE_DB_V2: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_DB_V2) || toJSON(secrets.CLICKHOUSE_DB_V2_DEV)) }}
+      CLICKHOUSE_V2_USER: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV)) }}
+      CLICKHOUSE_V2_PASSWORD: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
+        }}
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
@@ -446,13 +438,11 @@ jobs:
           ci-event: ${{ env.TRIGGERING_EVENT }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
           platform: x86_64
-          clickhouse-host: ${{ env.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ env.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ env.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ env.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ env.CLICKHOUSE_DB }}
+          clickhouse-v2-host: ${{ env.CLICKHOUSE_V2_HOST }}
+          clickhouse-v2-port: ${{ env.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-user: ${{ env.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ env.CLICKHOUSE_V2_PASSWORD }}
           clickhouse-db-v2: ${{ env.CLICKHOUSE_DB_V2 }}
-          schema: ${{ env.INGEST_SCHEMA }}
 
       - name: Summary
         if: always()

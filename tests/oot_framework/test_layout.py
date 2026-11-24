@@ -195,6 +195,82 @@ def test_config_runs_alone_until_it_has_min_runs(runs, grouped):
     assert (out["inductor/test_new_config.yaml"] != "") is grouped
 
 
+MC = {
+    **POLICY,
+    "multicard": {
+        "enabled": True,
+        "runners": [
+            {"label": "spyre_pf_x2", "min_minutes": 10.0},
+            {"label": "spyre_pf_x4", "min_minutes": 16.0},
+        ],
+    },
+}
+
+
+def test_multicard_moves_long_configs_to_the_largest_runner_they_reach():
+    configs = [rec(f"inductor/test_{c}_config.yaml") for c in ("short", "mid", "long")]
+    timings = T(
+        {
+            "inductor/test_short_config.yaml": 9.9,
+            "inductor/test_mid_config.yaml": 10.0,
+            "inductor/test_long_config.yaml": 18.0,
+        }
+    )
+    assert L.multicard_runners(configs, MC, timings) == {
+        "inductor/test_mid_config.yaml": "spyre_pf_x2",
+        "inductor/test_long_config.yaml": "spyre_pf_x4",
+    }
+
+
+def test_multicard_never_moves_a_config_pinned_to_the_default_runner():
+    pinned = rec(
+        "inductor/test_pinned_config.yaml"
+    )  # runner_overrides.yaml: spyre_pf_x1
+    pinned["runner_overridden"] = True
+    free = rec("inductor/test_free_config.yaml")
+    timings = T(
+        {
+            "inductor/test_pinned_config.yaml": 30.0,
+            "inductor/test_free_config.yaml": 30.0,
+        }
+    )
+    assert L.multicard_runners([pinned, free], MC, timings) == {
+        "inductor/test_free_config.yaml": "spyre_pf_x4"
+    }
+
+
+def test_multicard_off_without_policy_or_when_disabled():
+    configs = [rec("inductor/test_long_config.yaml")]
+    timings = T({"inductor/test_long_config.yaml": 30.0})
+    assert L.multicard_runners(configs, None, timings) == {}
+    off = {**MC, "multicard": {**MC["multicard"], "enabled": False}}
+    assert L.multicard_runners(configs, off, timings) == {}
+    assert L.multicard_runners(configs, POLICY, timings) == {}
+
+
+def test_multicard_leaves_overridden_excluded_and_new_configs_alone():
+    pinned = rec("inductor/test_pinned_config.yaml", runner="spyre_pf_x0")
+    excluded = rec("distributed_tests/test_d_config.yaml")
+    new = rec("inductor/test_new_config.yaml")
+    shared = rec("inductor/test_shared_config.yaml")
+    shared["shared_file"] = True
+    timings = {
+        **T(
+            {
+                "inductor/test_pinned_config.yaml": 30.0,
+                "distributed_tests/test_d_config.yaml": 30.0,
+                "inductor/test_shared_config.yaml": 30.0,
+            }
+        ),
+        **T({"inductor/test_new_config.yaml": 30.0}, runs=2),
+    }
+    policy = {**MC, "exclude": ["distributed_tests/"]}
+    # A shared test file does not block a move: the moved config runs alone under its own name.
+    assert L.multicard_runners([pinned, excluded, new, shared], policy, timings) == {
+        "inductor/test_shared_config.yaml": "spyre_pf_x4"
+    }
+
+
 def test_plan_is_deterministic_whatever_the_input_order():
     configs = [rec(f"inductor/test_{i}_config.yaml") for i in range(30)]
     timings = {c["key"]: (i % 7) * 0.4 for i, c in enumerate(configs)}
@@ -213,6 +289,13 @@ def test_plan_is_deterministic_whatever_the_input_order():
         '{"threshold_minutes": 4.0}',
         '{"unknown_knob": 3}',
         '{"exclude": "distributed_tests/"}',
+        '{"multicard": {"enabled": "yes", "runners": []}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "x", "cards": 2, "min_minutes": 5}]}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "x"}]}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "", "min_minutes": 5}]}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "spyre_pf_x3", "min_minutes": 5}]}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "spyre_pf_x2", "min_minutes": 10}, {"label": "spyre_pf_x4", "min_minutes": 10}]}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "spyre_pf_x2", "min_minutes": 10}, {"label": "spyre_pf_x2", "min_minutes": 16}]}}',
         "not json",
     ],
 )
@@ -357,6 +440,110 @@ def test_filter_configs_never_buckets_a_test_file_split_across_configs(tmp_path)
     assert [s["configs"].split() for s in suites if s.get("configs")] == [
         ["inductor/test_x_config.yaml", "inductor/test_y_config.yaml"]
     ]
+
+
+def test_filter_configs_moves_a_long_config_to_multicard_and_out_of_buckets(tmp_path):
+    cfgdir = tmp_path / "configs"
+    _write_tree(
+        cfgdir,
+        {
+            f"inductor/test_{n}_config.yaml": _cfg(
+                f"${{TORCH_DEVICE_ROOT}}/tests/inductor/test_{n}.py"
+            )
+            for n in ("a", "b", "long")
+        },
+    )
+    rc, suites, err = _run(
+        tmp_path,
+        cfgdir,
+        {
+            "target_job_minutes": 8,
+            "multicard": {
+                "enabled": True,
+                "runners": [{"label": "spyre_pf_x2", "min_minutes": 10}],
+            },
+        },
+        {
+            "inductor/test_a_config.yaml": {"p50_min": 1, "runs": 9},
+            "inductor/test_b_config.yaml": {"p50_min": 1, "runs": 9},
+            "inductor/test_long_config.yaml": {"p50_min": 15, "runs": 9},
+        },
+    )
+    assert rc == 0, err
+    long = [s for s in suites if s["config"] == "inductor/test_long_config.yaml"]
+    assert len(long) == 1 and long[0]["runner"] == "spyre_pf_x2"
+    assert not long[0].get("configs")
+    assert all(s["runner"] == "spyre_pf_x1" for s in suites if s.get("configs"))
+
+
+def test_filter_configs_keeps_a_long_config_pinned_to_x1_in_runner_overrides(tmp_path):
+    cfgdir = tmp_path / "configs"
+    _write_tree(
+        cfgdir,
+        {
+            f"inductor/test_{n}_config.yaml": _cfg(
+                f"${{TORCH_DEVICE_ROOT}}/tests/inductor/test_{n}.py"
+            )
+            for n in ("pinned", "free")
+        },
+    )
+    overrides = tmp_path / "runner_overrides.yaml"
+    overrides.write_text("inductor/test_pinned_config.yaml: spyre_pf_x1\n")
+    rc, suites, err = _run(
+        tmp_path,
+        cfgdir,
+        {
+            "multicard": {
+                "enabled": True,
+                "runners": [{"label": "spyre_pf_x2", "min_minutes": 10}],
+            }
+        },
+        {
+            "inductor/test_pinned_config.yaml": {"p50_min": 15, "runs": 9},
+            "inductor/test_free_config.yaml": {"p50_min": 15, "runs": 9},
+        },
+        extra=("--runner-map", str(overrides)),
+    )
+    assert rc == 0, err
+    runner = {s["config"]: s["runner"] for s in suites}
+    assert runner == {
+        "inductor/test_pinned_config.yaml": "spyre_pf_x1",
+        "inductor/test_free_config.yaml": "spyre_pf_x2",
+    }
+
+
+def test_filter_configs_never_buckets_moved_configs_even_below_the_job_target(tmp_path):
+    cfgdir = tmp_path / "configs"
+    _write_tree(
+        cfgdir,
+        {
+            f"inductor/test_{n}_config.yaml": _cfg(
+                f"${{TORCH_DEVICE_ROOT}}/tests/inductor/test_{n}.py"
+            )
+            for n in ("a", "b")
+        },
+    )
+    rc, suites, err = _run(
+        tmp_path,
+        cfgdir,
+        {
+            "target_job_minutes": 8,
+            "multicard": {
+                "enabled": True,
+                "runners": [{"label": "spyre_pf_x2", "min_minutes": 2}],
+            },
+        },
+        {
+            "inductor/test_a_config.yaml": {"p50_min": 3, "runs": 9},
+            "inductor/test_b_config.yaml": {"p50_min": 3, "runs": 9},
+        },
+    )
+    assert rc == 0, err
+    assert [(s["config"], s["runner"], bool(s.get("configs"))) for s in suites] == [
+        ("inductor/test_a_config.yaml", "spyre_pf_x2", False),
+        ("inductor/test_b_config.yaml", "spyre_pf_x2", False),
+    ]
+    assert not any(k in s for s in suites for k in ("runner_overridden", "multicard"))
 
 
 def test_filter_configs_without_a_policy_is_unchanged(tmp_path):

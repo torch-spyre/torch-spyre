@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: spyre-inference, owner: spyre-inference}
+spec:
+  component: spyre-inference
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [decoder]
+  default_environment: spyre-1card
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core, extended]}
+    - {name: suite, ordered: false, cardinality: many}
+  series_labels: [env.label.device.count, env.label.cpu_pinning]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: decoder}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke, description: "one cheap latency case"}
+spec:
+  cases: [latency_qwen05b_tp1_in64_out64]
+  run: {repeats_min: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: nightly-small, description: "latency, first-token companion, throughput and one serving point on one small model"}
+spec:
+  cases:
+    - latency_qwen05b_tp1_in64_out64
+    - latency_qwen05b_tp1_in64_out1
+    - throughput_qwen05b_tp1_in64_out64
+    - serving_qwen05b_tp1_c4_n100_len4096_seqs4
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: weekly-full, description: "every declared decoder case: wider models, 1 and 4 cards, the concurrency sweep"}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: extended}}}

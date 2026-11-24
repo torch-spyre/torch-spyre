@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# moe-demo: sample MoE benchmarks with placeholder names and synthetic shapes. Validate with --central examples/central.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: moe-demo, owner: example-team}
+spec:
+  component: moe-demo
+  packs: [{name: kernel, version: "0.2"}, {name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [ops, serve]
+  default_environment: ref-1card
+  visibility: public
+  series_labels: [env.label.device.count, env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: ops}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: serve}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: demo-store}
+spec: {type: core/artifactory, endpoint: {env: STORE_BASE_URL}, auth: {mode: token, refs: [{env: STORE_TOKEN}]}, visibility: internal}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-moe-a-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "2026.11"
+  license: Apache-2.0
+  visibility: internal
+  source: {store: demo-store, path: models/demo-moe-a/2026.11}
+  integrity: {files: [{path: model.safetensors, sha256: "1111111111111111111111111111111111111111111111111111111111111111"}]}
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-moe-a}
+spec:
+  assets: [{role: weights, asset: demo-moe-a-weights}]
+  family: demo
+  architecture: decoder-only
+  native_precision: bf16
+---
+apiVersion: bench/v1alpha1
+kind: Workload
+metadata: {name: trace-replay}
+spec:
+  type: llm/serve
+  endpoint: /v1/completions
+  load: {executor: closed, concurrency: 5, requests: 200, warmup_requests: 8}
+  output_len: -1
+  sampling: {temperature: 0.1, ignore_eos: true}
+  flags: {dataset-name: custom, disable-shuffle: true}

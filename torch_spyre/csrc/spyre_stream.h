@@ -47,7 +47,11 @@ class SpyreStream {
   bool query() const;        // Check if work completed
   void synchronize() const;  // Block until work done
 
-  void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
+  // With stage_pageable_h2d, a pageable H2D source is safe to modify as soon
+  // as this returns, as for a CUDA non-blocking copy. A pinned source is still
+  // read by the DMA after return.
+  void copyAsync(const at::Tensor& src, const at::Tensor& dst,
+                 bool stage_pageable_h2d = false) const;
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
 
