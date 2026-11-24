@@ -435,7 +435,7 @@ def _patch_tensor_for_spyre():
             # spyre_empty_with_layout is a direct pybind11 call that bypasses
             # the ATen dispatcher path (which self-inits the runtime via the
             # stream pool). On a fresh process this can be the very first Spyre
-            # device op, so bring up the runtime explicitly first (issue #5179).
+            # device op, so bring up the runtime explicitly first (issue #6129).
             ensure_runtime_initialized()
 
             from torch_spyre._C import spyre_empty_with_layout
@@ -511,7 +511,7 @@ def _patch_tensor_for_spyre():
             # empty_with_layout is a direct pybind11 call that bypasses the
             # ATen dispatcher path (which self-inits the runtime via the
             # stream pool). On a fresh process this can be the very first Spyre
-            # device op, so bring up the runtime explicitly first (issue #5179).
+            # device op, so bring up the runtime explicitly first (issue #6129).
             ensure_runtime_initialized()
 
             from torch_spyre._C import empty_with_layout

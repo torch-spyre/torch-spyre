@@ -19,11 +19,19 @@
 # VFIO access, so a child subprocess that then tries to open it fails with
 # "Device or resource busy".
 import os
+from unittest import mock
 
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal import common_utils
+from torch.testing._internal.common_utils import TestCase, run_tests
 
 
 class TestSpyre(TestCase):
+    def setUp(self):
+        # TestCase.setUp seeds every device's RNG, and seeding Spyre starts its
+        # runtime in this process, which takes the card from the subprocesses.
+        with mock.patch.object(common_utils, "set_rng_seed"):
+            super().setUp()
+
     def test_device_layout_available_before_runtime_init(self):
         """The tensor monkey-patch (`.to(device_layout=)` etc.) must be applied
         at import time, before the device runtime is started.

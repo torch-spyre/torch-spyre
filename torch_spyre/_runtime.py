@@ -18,7 +18,7 @@ Several Python allocation paths call pybind11 entry points
 (``spyre_empty_with_layout``, ``spyre_empty_reserved``, ...) directly. Those
 calls bypass the ATen dispatcher path whose stream pool self-initializes the
 runtime, so when such a call is the first Spyre operation in a process the
-runtime must be brought up explicitly first (issue #5179).
+runtime must be brought up explicitly first (PR #5179, issue #6129).
 
 This module is internal; it is not the public ``torch_spyre.runtime``
 logging namespace.
