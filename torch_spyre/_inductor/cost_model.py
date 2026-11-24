@@ -201,6 +201,7 @@ from .work_division import (
     max,
     log2,
     isinf,
+    piecewise,
 )
 from . import config
 
@@ -1056,6 +1057,22 @@ def _op_cols(o) -> float:
 def _is_sym(*vals) -> bool:
     """True if any value is a sympy expression rather than a number."""
     return any(isinstance(v, sympy.Basic) and not v.is_number for v in vals)
+
+
+def _eq(a, b):
+    """``a == b``, as a sympy ``Eq`` only when either side is symbolic."""
+    return sympy.Eq(a, b) if _is_sym(a, b) else a == b
+
+
+def _ge(a, b):
+    """``a >= b``, as a sympy ``Ge`` only when either side is symbolic."""
+    return sympy.Ge(a, b) if _is_sym(a, b) else a >= b
+
+
+def _piecewise_fold(expr):
+    """``sympy.piecewise_fold(expr)`` when ``expr`` is symbolic; a number is
+    returned unchanged."""
+    return sympy.piecewise_fold(expr) if _is_sym(expr) else expr
 
 
 def _select(flag, if_true, if_false):
@@ -2314,13 +2331,12 @@ def _dma_request_law_available(
         or p.transport_dma_max_burst_words <= 0
         or dtype_bytes != 2
         or run_bytes is None
+        or run_bytes == 0
         or tile_elems is None
         or tile_elems <= 0
-        or sympy.sympify(run_bytes).is_positive is False
     ):
         return False
-    cores = sympy.sympify(cores)
-    if not cores.free_symbols:
+    if not _is_sym(cores):
         key = _transport_rate_cores(rates, cores, compute_read)
         if key is None or rates[key] <= 0:
             return False
@@ -2379,13 +2395,15 @@ def _dma_request_excess_ns(
     # requests/byte intermediate would round sub-unit densities to zero in
     # CP-SAT, silently erasing the split preference. No decision-dependent
     # denominator remains: each run branch becomes payload*split/extent.
-    raw_requests = sympy.piecewise_fold(payload / sympy.sympify(run_bytes))
+    raw_requests = _piecewise_fold(payload / run_bytes)
     min_requests = math.ceil(
         payload / (p.transport_dma_word_bytes * p.transport_dma_max_burst_words)
     )
     max_requests = math.ceil(payload / p.transport_dma_word_bytes)
 
     def at_most(requests, limit):
+        if not _is_sym(requests):
+            return requests <= limit
         # Each affine run branch is a static coefficient times one split.
         # Tighten the comparison to an integer split bound before CP-SAT.
         coefficient, split = requests.as_coeff_Mul()
@@ -2412,16 +2430,14 @@ def _dma_request_excess_ns(
                 value = floor
             else:
                 threshold = math.floor((floor + byte_time) / ns)
-                value = sympy.Piecewise(
+                value = piecewise(
                     (floor, at_most(requests, threshold)),
                     (requests * ns - byte_time, at_most(requests, max_requests)),
                     (cap, True),
                 )
-            at_count = (
-                sympy.Ge(cores, count) if compute_read else sympy.Eq(cores, count)
-            )
+            at_count = _ge(cores, count) if compute_read else _eq(cores, count)
             branches.append((value, at_count))
-        return sympy.Piecewise(*branches, (0, True))
+        return piecewise(*branches, (0, True))
 
     # Price each physical run branch separately. This avoids a reciprocal
     # of a decision, conditional comparisons of conditional expressions, and
@@ -2618,7 +2634,7 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
                 payload = sympy.sympify(payload).xreplace({arg.is_lx: 0})
             if payload <= 0:
                 continue
-            requests = sympy.piecewise_fold(payload / sympy.sympify(run))
+            requests = _piecewise_fold(payload / run)
             min_requests = math.ceil(
                 payload / (p.transport_dma_word_bytes * p.transport_dma_max_burst_words)
             )
@@ -2650,8 +2666,8 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
                             (value * ns - byte_time, at_most(value, max_requests)),
                             (cap, True),
                         )
-                    branches.append((priced, sympy.Eq(op.cores, cores)))
-                return sympy.Piecewise(*branches, (0, True))
+                    branches.append((priced, _eq(op.cores, cores)))
+                return piecewise(*branches, (0, True))
 
             if isinstance(requests, sympy.Piecewise):
                 excess = sympy.Piecewise(
@@ -2663,7 +2679,7 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
                 # The solver can choose an unreplicated read. Charge its bursts
                 # just as the concrete model does; only replicated per-core
                 # loads are already covered by _replicated_operand_reads.
-                excess = sympy.Piecewise((excess, sympy.Eq(replication, 1)), (0, True))
+                excess = piecewise((excess, _eq(replication, 1)), (0, True))
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             lf = getattr(arg, "loop_factor", 1) or 1
             total += (1 - is_lx) * lf * excess

@@ -50,7 +50,7 @@ pytest.importorskip("ortools")
 
 import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor import config
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import ilp_solver_ortools, sa_cooptimizer, utils
 from torch_spyre._inductor.scratchpad.allocator import (
@@ -195,8 +195,8 @@ def test_sibling_pins_are_kept_only_for_a_coarse_tiled_parent(tiled):
     """A sibling parent's free division keeps its group past the cap only when
     this parent is coarse-tiled, the same-tile-group case #5057 needs. Group 1
     is the costlier one, so the cap keeps it only if it is pinned."""
-    loop_info = (
-        LoopInfo(
+    loop_member = (
+        LoopMember(
             loop_group_id=(0,),
             loop_count=[4],
             loop_tiled_dims=[[]],
@@ -205,7 +205,7 @@ def test_sibling_pins_are_kept_only_for_a_coarse_tiled_parent(tiled):
         if tiled
         else None
     )
-    parent_op = SimpleNamespace(loop_info=loop_info)
+    parent_op = SimpleNamespace(loop_member=loop_member)
     pinned = _sibling_pinned_divisions("P", parent_op, {"Q": [(0, 1)]})
     candidates = [
         _candidate("C", 0, 100, group=0, j=0),
