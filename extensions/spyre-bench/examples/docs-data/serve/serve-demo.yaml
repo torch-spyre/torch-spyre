@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Workload
+metadata: {name: trace-replay}
+spec:
+  type: llm/serve
+  endpoint: /v1/completions
+  load: {executor: closed, concurrency: 1, requests: 200, warmup_requests: 8}
+  output_len: -1
+  sampling: {temperature: 0.1, ignore_eos: true}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-fp16}
+spec: {type: llm/vllm, backend: spyre, token: demo, model: demo-llm, precision: fp16, tp: 1, flags: {max-model-len: 1000}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: serve-demo, owner: example-team}
+spec:
+  type: perf
+  level: service
+  tier: sanity
+  system: demo-llm-fp16
+  workload:
+    base: trace-replay
+    patch: {inputs: [{name: prompts, dataset: sample-trace, subset: head-200, expect: {records: 200}}]}
+  environment: one-card
+  metrics: {required: [llm.ttft.p99, llm.itl.median]}
+  run:
+    repeats: 3
+    timeout: 20m
+    command: ["{python}", "tools/emit_serve.py", "--repeat", "{repeat}", "--raw", "{raw_dir}", "--out", "{repeat_dir}"]
+  variants:
+    - name: serve_demo_c1_sample

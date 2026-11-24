@@ -430,7 +430,7 @@ def main() -> None:
         )
         sys.exit(1 if steps or extra else 0)
 
-    client = ClickHouse.connect(database="default")
+    client = ClickHouse.connect(database="default", role="schema")
     if args.cmd == "bootstrap":
         pw = ClickHouseEnv.get("SANDBOX_SOURCE_PASS")
         if not pw:
@@ -498,7 +498,7 @@ def main() -> None:
         try:
             steps = Sandbox.build(
                 client,
-                lambda d: ClickHouse.connect(database=d),
+                lambda d: ClickHouse.connect(database=d, role="schema"),
                 args.name,
                 args.schema_dir,
             )

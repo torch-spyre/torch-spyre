@@ -30,7 +30,7 @@ dev = [
     "jsonschema>=4",
 ]
 
-# Core schemas and packs are data read from the package directory at run time.
+# Core schemas, packs and shared catalogs are data read from the package directory at run time.
 [tool.setuptools]
 packages = ["spyre_bench"]
 
@@ -43,6 +43,9 @@ spyre_bench = [
     "packs/index.yaml",
     "packs/*/pack.yaml",
     "packs/*/schemas/*.json",
+    # Shared resource declarations a product catalog resolves against; see `spyre-bench catalogs`.
+    "catalogs/*/*.yaml",
+    "ondemand_policy.json",
 ]
 
 [tool.ruff]

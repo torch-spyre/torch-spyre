@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""spyre-bench command line: validate, explain, ids, plan, run, upload, verdict, accept, reference, invalidate, analyze, dataset, gen-schemas."""
+"""spyre-bench command line: validate, explain, ids, plan, run, upload, ondemand, verdict, accept, reference, invalidate, analyze, dataset, catalogs, query, gen-schemas."""
 
 import sys
 
@@ -22,6 +22,10 @@ VERBS = {
     "upload": (
         "spyre_bench.upload",
         "seal a results directory and send it to the results inbox (dry run unless --apply)",
+    ),
+    "ondemand": (
+        "spyre_bench.ondemand",
+        "parse a PR comment, authorize it, render the plan preview (on-demand PR runs)",
     ),
     "verdict": ("spyre_bench.verdict", "print the stored verdict of a run or artifact (advisory)"),
     "accept": ("spyre_bench.accept", "propose a stored run as the new accepted baseline (anchor) of its series"),
@@ -41,6 +45,8 @@ VERBS = {
         "spyre_bench.dataset_add",
         "add, list and check datasets: store staging plus Dataset/Asset definitions",
     ),
+    "catalogs": ("spyre_bench.catalog_path", "the shared catalogs this package ships, and where to find them"),
+    "query": ("spyre_bench.query", "read stored results: overview, suites, one benchmark's series, compare"),
     "gen-schemas": ("spyre_bench.gen_schemas", "regenerate (or --check) the core JSON Schemas"),
 }
 

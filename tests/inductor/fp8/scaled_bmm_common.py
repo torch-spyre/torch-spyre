@@ -552,7 +552,7 @@ class _KnownFailure(NamedTuple):
     strict: bool = True
 
 
-_DT_EXCEPTION = "newPds.stickDimOrder_.size() == newPds.stickSize_.size()"
+_SCHEDULER_FAILURE = "sbf-run-scheduler-on-sdsc: failed on program"
 _NO_STICK_MECHANISM = "no mechanism to resolve stick incompatibility"
 _OUTSIDE_BOUND = "elements outside"
 
@@ -597,21 +597,12 @@ _KNOWN_FAILURES = [
     ),
     _KnownFailure(
         "test_shapes",
-        r"3d_moe_bmm_as_captured_8x1408x2816x1-cores1"
-        r"|3d_moe_bmm_as_captured_96x1408x2816x1-cores11",
-        AssertionError,
-        _OUTSIDE_BOUND,
-        "#6438: [fp8] scaled_bmm: N=1 MoE expert matmul returns wrong values (inf) "
-        "at some core counts",
-    ),
-    _KnownFailure(
-        "test_shapes",
         r"(3d_moe_bmm_weight_as_mat2_8x1x704x2816"
         r"|4d_decode_pv_(1|4)x32x1x64x128)-cores\d+",
         InductorError,
-        _DT_EXCEPTION,
-        "#6079: [fp8] scaled_bmm: dbo-opt DtException when the contraction K is "
-        "not a multiple of 128",
+        _SCHEDULER_FAILURE,
+        "#6079: [fp8] scaled_bmm: compilation fails when the contraction K is "
+        "not a multiple of 128 (now in the scheduler, after layout planning)",
     ),
     _KnownFailure(
         "test_shapes",
@@ -641,9 +632,9 @@ _KNOWN_FAILURES = [
         "test_padded_inputs",
         r"pad_n_3d_moe_bmm_as_captured_8x2816x704x1-cores\d+",
         InductorError,
-        _DT_EXCEPTION,
-        "#6079: [fp8] scaled_bmm: dbo-opt DtException when the contraction K is "
-        "not a multiple of 128",
+        _SCHEDULER_FAILURE,
+        "#6079: [fp8] scaled_bmm: compilation fails when the contraction K is "
+        "not a multiple of 128 (now in the scheduler, after layout planning)",
     ),
 ]
 

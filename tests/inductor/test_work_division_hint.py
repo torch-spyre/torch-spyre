@@ -1598,7 +1598,7 @@ def test_lx_relayout_activation_policy_is_source_wide():
             layout=SimpleNamespace(
                 get_buffer=lambda: SimpleNamespace(get_name=lambda: "input")
             ),
-            loop_info=None,
+            loop_member=None,
         )
         with (
             config.patch(lx_extended_ownership=True),

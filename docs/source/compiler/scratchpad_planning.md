@@ -355,12 +355,15 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
 1. **Input-boundary cloning.** When `clone_at_graph_boundaries()` is set,
    `_eligible_clone_inputs` walks graph inputs and inserts a `clone` for any
    HBM input that is read more than once *and* fits on LX. The clone output
-   becomes a fresh LX-eligible buffer. `GraphEditor._place_clone` places each
-   clone beside the outermost loop that holds its anchor: a hoisted input clone
-   goes right before that loop when its `lower_before` op is the loop's first
-   op, so it runs once, and a drain goes right after the loop. An output clone with no drain plan goes right after its last writer, and
-   any other clone goes right before its first consumer, in that consumer's
-   list, so it runs every trip when the consumer is in a loop body.
+   becomes a fresh LX-eligible buffer. An input the graph writes in place is
+   never cloned: the write lands in HBM, so the clone would go stale for every
+   later read. `GraphEditor._place_clone` places each clone beside the
+   outermost loop that holds its anchor: a hoisted input clone goes right before
+   that loop when its `lower_before` op is the loop's first op, so it runs once,
+   and a drain goes right after the loop. An output clone with no drain plan
+   goes right after its last writer, and any other clone goes right before its
+   first consumer, in that consumer's list, so it runs every trip when the
+   consumer is in a loop body.
 2. **Buffer analysis.** `_generate_buffers` produces one
    `LifetimeBoundBuffer` per buffer, *including* the ones that may not
    reside. Nothing is filtered out; `ScratchpadAllocator._residency_reasons`
@@ -476,7 +479,8 @@ detail, such as the restickify proof failure or the mismatched core division.
 The adapter tests check the returned strings; the table does not replace them.
 
 Graph inputs use `_input_residency_reason`. They also require boundary cloning,
-rewritable uses, complete reads and useful LX reuse.
+rewritable uses, complete reads and useful LX reuse, and must not be written in
+place.
 
 A narrow exception permits an untiled matmul to read a zero-offset prefix made
 of complete storage sticks. It requires one private, full-width producer and a

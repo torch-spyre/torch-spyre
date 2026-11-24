@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-llm}
+spec:
+  assets: [{role: weights, asset: demo-llm-weights}]
+  family: demo
+  architecture: decoder-only
+  params: {total: 1000000, active: 1000000}
+  native_precision: bf16

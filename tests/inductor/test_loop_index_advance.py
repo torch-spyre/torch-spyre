@@ -76,6 +76,7 @@ from torch_spyre._inductor.padding import restride_loop_step
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
 from test_loop_advance import CORPUS
+from utils_inductor import loop_member_view
 
 
 d1, d2 = (sympy_index_symbol(f"d{i}") for i in (1, 2))
@@ -126,7 +127,7 @@ class _Probe:
 
     def _record(self, kernel, tensor, is_input, name, result):
         node = kernel.current_node.node
-        info = getattr(node, "loop_info", None)
+        info = loop_member_view(node)
         if info is None:
             return
         dep = self._dep(kernel, node, is_input, name)
@@ -188,7 +189,7 @@ def _compile_and_probe(fn, args, ctx=None):
 def test_the_index_gives_the_kernels_advance(case):
     fn, args, ctx = CORPUS[case]()
     probe = _compile_and_probe(fn, args, ctx)
-    assert probe.rows, f"{case}: the kernel built no TensorArg with a loop_info"
+    assert probe.rows, f"{case}: the kernel built no TensorArg with a loop_member"
 
     differing = [r for r in probe.rows if not r[6]]
     assert not differing, [
@@ -396,11 +397,21 @@ def test_loop_induction_symbols_is_the_unbacked_non_iteration_non_indirect_set()
     assert loop_induction_symbols(0, set()) == []
 
 
+def _one_level_loop_info():
+    """A one-level loop stamp: a stand-in that lists no group is not in a loop."""
+    return SimpleNamespace(
+        loop_group_id=(0,),
+        loop_count=[2],
+        loop_tiled_dims=[[]],
+        loop_tiled_reduction_dims=[[]],
+    )
+
+
 class _ReadOp:
     """A consumer with one memory read, enough for ``_moved_loop_term``."""
 
     def __init__(self, index):
-        self.loop_info = SimpleNamespace()
+        self.loop_member = _one_level_loop_info()
         self._dep = MemoryDep("buf", index, (), ())
 
     def get_read_writes(self):
@@ -410,7 +421,7 @@ class _ReadOp:
 def _moved_term(index):
     from torch_spyre._inductor import insert_restickify as ir
 
-    copy = SimpleNamespace(loop_info=SimpleNamespace())
+    copy = SimpleNamespace(loop_member=_one_level_loop_info())
     info = SimpleNamespace(arg_name="buf", dep_index=index, occurrence=0)
     return ir._moved_loop_term(_ReadOp(index), info, copy, 1, 1)
 

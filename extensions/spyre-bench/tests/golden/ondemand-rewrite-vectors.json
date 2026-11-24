@@ -1,0 +1,138 @@
+[
+ {
+  "in": {
+   "text": "/spyre-bench sanity"
+  },
+  "out": "/spyre-test preset=perf-only bench=sanity TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/bench sanity"
+  },
+  "out": "/spyre-test preset=perf-only bench=sanity TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "please\n/spyre-bench decoder+startup@sanity reuse=only force=a_1\nthanks"
+  },
+  "out": "/spyre-test preset=perf-only bench=decoder+startup@sanity bench-reuse=only bench-force=a_1 TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench torch-spyre:a,b budget=3 sha=abcdef123456"
+  },
+  "out": "/spyre-test preset=perf-only bench=torch-spyre:a,b bench-budget=3 bench-sha=abcdef123456 TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity type=quality"
+  },
+  "out": "/spyre-test bench=sanity TEST_TYPE=quality"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity TEST_TYPE=quality"
+  },
+  "out": "/spyre-test bench=sanity TEST_TYPE=quality"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity test_type=perf"
+  },
+  "out": "/spyre-test preset=perf-only bench=sanity TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity arch=ppc64le"
+  },
+  "out": "/spyre-test arch=ppc64le preset=perf-only bench=sanity TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity reuse"
+  },
+  "out": {
+   "error": "'reuse': expected key=value"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity reuse=only reuse=never"
+  },
+  "out": {
+   "error": "flag 'reuse' given twice"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-benchmark sanity"
+  },
+  "out": null
+ },
+ {
+  "in": {
+   "text": "  /spyre-bench sanity"
+  },
+  "out": null
+ },
+ {
+  "in": {
+   "text": "> /spyre-bench sanity"
+  },
+  "out": null
+ },
+ {
+  "in": {
+   "text": "```\n/spyre-bench sanity\n```"
+  },
+  "out": null
+ },
+ {
+  "in": {
+   "text": "<!-- /spyre-bench sanity -->"
+  },
+  "out": null
+ },
+ {
+  "in": {
+   "text": "no command here"
+  },
+  "out": null
+ },
+ {
+  "in": {
+   "text": "/spyre-bench"
+  },
+  "out": "/spyre-test preset=perf-only TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity preset=nightly"
+  },
+  "out": "/spyre-test bench=sanity preset=nightly TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity arch=amd64,s390x type=quality"
+  },
+  "out": "/spyre-test arch=amd64,s390x bench=sanity TEST_TYPE=quality"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity vs=ref:ref-a"
+  },
+  "out": "/spyre-test preset=perf-only bench=sanity bench-vs=ref:ref-a TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity vs=artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10"
+  },
+  "out": "/spyre-test preset=perf-only bench=sanity bench-vs=artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10 TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity max-wait=45m clean=true budget=3 sha=abcdef1 env=e1 profile=light vs=main purpose=pr"
+  },
+  "out": "/spyre-test preset=perf-only bench=sanity bench-max-wait=45m bench-clean=true bench-budget=3 bench-sha=abcdef1 bench-env=e1 bench-profile=light bench-vs=main bench-purpose=pr TEST_TYPE=perf"
+ }
+]
