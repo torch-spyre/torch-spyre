@@ -229,6 +229,23 @@ def test_a_piecewise_arm_is_not_printed():
     assert list(printed[expr].values) == [1.0, 4.0, 4.0]
 
 
+def test_a_condition_is_a_bool_table():
+    """A condition's table is bool, true and false included, and a parent takes it as
+    it is; any other node's table is float."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    a = case.symbol("a")
+    condition = sympy.And(a > 1, sympy.Not(a > 3))
+    expr = sympy.Piecewise((a, condition), (-a, True))
+    printed = _printed(case, expr)
+    for node in (*condition.args, condition, sympy.true):
+        assert printed[node].values.dtype == bool, node
+    assert list(printed[condition].values) == [False, True, False]
+    assert printed[a].values.dtype == float
+    assert printed[expr].values.dtype == float
+    assert list(printed[expr].values) == [-1.0, 2.0, -4.0]
+
+
 def test_a_symbol_a_constant_and_an_operation_are_each_one_table():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
