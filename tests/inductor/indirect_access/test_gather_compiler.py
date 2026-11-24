@@ -343,7 +343,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         seqlen = 32
         compare_mode(
             "compiled",
-            lambda x: x[torch.arange(seqlen, dtype=torch.int64)],
+            lambda x: x[torch.arange(seqlen, dtype=torch.int64, device=x.device)],
             x,
             atol=0,
             rtol=0,
