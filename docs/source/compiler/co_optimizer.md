@@ -354,7 +354,7 @@ full size can fit one tile at a time. The analogy to work division is direct: wo
 splits in *space* (across cores, at the same time); coarse tiling splits in *time* (across
 loop iterations, on the same core). The underlying loop-IR mechanism — how a tiled run is
 represented and survives scheduling and codegen — is implemented and documented in
-[Coarse-Tiling Loop IR for the Spyre Backend](coarse_tiling_loops.md); that document also
+[Counted Loops in the Spyre Compiler](loop_nodes.md); that document also
 points to the design RFC. What's described here is specifically the *solver's* ability to
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
@@ -669,5 +669,5 @@ Open items from drafting this page that are worth resolving before calling it do
   objective, and test fixtures in full detail
 - [Simulated Annealing Layout Planner](simulated_annealing_layout.md) — the placement-only
   annealer, a different class from the joint SA co-optimizer
-- [Coarse-Tiling Loop IR for the Spyre Backend](coarse_tiling_loops.md) — how a tiled run is
+- [Counted Loops in the Spyre Compiler](loop_nodes.md) — how a tiled run is
   represented and survives scheduling and codegen, independent of who chooses the tiling
