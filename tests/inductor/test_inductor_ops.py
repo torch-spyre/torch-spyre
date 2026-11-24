@@ -6875,9 +6875,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randint((67, 256), dtype=torch.int64),
                 ),
             },
-            "expect_fail": {
-                "bool_2d_dim_0": "the host bool upcast to fp32 is staggered; the dim 0 sum output is STANDARD, and the staggered result is read back without restoring its order (#4393)",
-            },
         },
         ("test_sum_keepdim0", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
@@ -7027,9 +7024,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     False,
                     cached_randint((67, 256), dtype=torch.int64),
                 ),
-            },
-            "expect_fail": {
-                "bool_2d_dim_0": "the host bool upcast to fp32 is staggered; the dim 0 sum output is STANDARD, and the staggered result is read back without restoring its order (#4393)",
             },
         },
         # Integer and bool sums are deterministic counts — compare exactly.
