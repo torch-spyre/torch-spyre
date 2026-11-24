@@ -869,19 +869,46 @@ def test_shards_larger_than_one_dma_slice_round_trip(shape_per_shard, dim, dtype
 
 
 @requires_emulation
-@expects_raise
-def test_dtype_casting_copy_fails_closed():
-    """Dtype-converting copies of sharded tensors are rejected, not truncated.
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dim", [0, 1])
+@pytest.mark.parametrize("box", [False, True], ids=["whole", "box_view"])
+def test_dtype_converting_copy_to_cpu(dtype, dim, box):
+    """Gathering a sharded fp16/bf16 tensor (or a box view of it) as fp32
+    matches the same copy of an unsharded tensor bit for bit (#5824).
 
-    Converting shard copies are untested against the D2H conversion path,
-    which bounds its host output by the host_capacity the DMA factories set.
+    Compared with the unsharded device copy, not the host original: the device
+    fp16 format (DL16) rounds some fp16 values.
     """
     n = num_shards()
+    shape = (4 * n, 64) if dim == 0 else (8, 64 * n)
     torch.manual_seed(0)
-    a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
+    cpu = torch.randn(shape, dtype=dtype)
 
-    with pytest.raises(RuntimeError, match="without a dtype change"):
-        a.to("cpu", torch.float32)
+    def view(t):
+        if not box:
+            return t
+        return t[1:5] if dim == 0 else t[:, 30:100]
+
+    expected = view(cpu.to("spyre")).to("cpu", torch.float32)
+    got = view(_sharded(cpu, dim, n)).to("cpu", torch.float32)
+
+    assert got.dtype == torch.float32
+    assert torch.equal(got, expected)
+
+
+@requires_emulation
+@expects_raise
+def test_dtype_converting_copy_to_device_fails_closed():
+    """A converting copy into a sharded tensor is rejected and leaves it as it
+    was: only copies to the CPU may change the dtype so far (#5824)."""
+    n = num_shards()
+    torch.manual_seed(0)
+    cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    a = _sharded(cpu, 0, n)
+
+    with pytest.raises(RuntimeError, match="to the device without a dtype change"):
+        a.copy_(torch.zeros(4 * n, 64, dtype=torch.float32))
+    assert torch.equal(a.cpu(), cpu.to("spyre").cpu())
 
 
 @requires_emulation

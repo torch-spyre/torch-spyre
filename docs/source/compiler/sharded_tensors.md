@@ -31,9 +31,10 @@ allocation. Sharded tensors are the smallest faithful implementation of that mod
   intermediate is rejected. Everything else that would touch sharded
   storage is rejected at compile time with a message saying why.
 * **Host copies and fills.** Sharded tensors copy to and from the CPU
-  (whole-tensor, no dtype change), and eager `fill_`/`zero_` fill each
-  shard's own allocation. Device-to-device copies are rejected because they
-  take a single device address.
+  (whole-tensor; copies to the CPU may change the dtype, copies to the
+  device may not), and eager `fill_`/`zero_` fill each shard's own
+  allocation. Device-to-device copies are rejected because they take a
+  single device address.
 
 Beyond the op set, the compiled path admits only a narrow shape regime;
 everything outside it fails at compile time with a specific message:
