@@ -716,6 +716,47 @@ class _ScatterScenarios:
 
                 self._assert_compiled_matches_cpu(kernel, cache, idx, src)
 
+    @staticmethod
+    def _lx_planner(co_opt):
+        """LX planning on; both planners decide input clones, in separate code."""
+        from torch_spyre._inductor import config
+
+        torch._dynamo.reset()
+        return config.patch(lx_planning=True, co_optimizing_lx_planning=co_opt)
+
+    def _default_layout_pool_operands(self, P=192, D=64, rows=32):
+        """A default-layout pool, which a scatter relayouts, two row sets, a source."""
+        pool = torch.full((P, D), 3.0, dtype=torch.float16)
+        src = torch.rand(rows, D, dtype=torch.float16)
+        perm = torch.randperm(P)
+        idx_a, idx_b = perm[:rows], perm[rows : 2 * rows]
+        return pool.to("spyre"), src.to("spyre"), idx_a.to("spyre"), idx_b.to("spyre")
+
+    def test_index_copy_then_read_default_layout_input_e2e(self):
+        """A later read of a scattered graph input sees the write, not a stale LX clone."""
+
+        def kernel(pool, src, idx):
+            pool.index_copy_(0, idx, src)
+            return pool * 2
+
+        for co_opt in (True, False):
+            with self.subTest(co_opt=co_opt), self._lx_planner(co_opt):
+                pool, src, idx, _ = self._default_layout_pool_operands()
+                self._assert_compiled_matches_cpu(kernel, pool, src, idx)
+
+    def test_index_copy_twice_into_default_layout_input_e2e(self):
+        """Two scatters into one graph input keep both writes."""
+
+        def kernel(pool, src, idx_a, idx_b):
+            pool.index_copy_(0, idx_a, src)
+            pool.index_copy_(0, idx_b, src + 1)
+            return pool
+
+        for co_opt in (True, False):
+            with self.subTest(co_opt=co_opt), self._lx_planner(co_opt):
+                pool, src, idx_a, idx_b = self._default_layout_pool_operands()
+                self._assert_compiled_matches_cpu(kernel, pool, src, idx_a, idx_b)
+
     def test_index_put_3d_scatter_dim1_e2e(self):
         """3-D tensor [B, H, D] scatter on dim 1 (H): y[:, idx, :] = src.
         Tests indirect access on a non-leading dimension, validating stride

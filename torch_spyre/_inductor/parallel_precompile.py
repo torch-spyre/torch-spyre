@@ -59,10 +59,11 @@ another thread of the parent could hold at fork time: such a lock stays held in
 the child, so a compile that needed it would hang and be killed by the timeout.
 Its LX planning solver gets the rank's share of the CPUs: the autodetected CPU count
 divided by the ranks on this host (``LOCAL_WORLD_SIZE``, else the process group's
-size), at least two; an explicit ``SPYRE_NUM_CPUS`` is this process's budget already
-and is used as it is. Sized to the whole host on every rank, as each parent's is, the
-concurrent solvers starve each other, and a starved solve returns a worse plan for the
-same graph (slower kernels, not just a slower compile). A solve that stops at
+size), at least two, and at most 16 unless the share split across the workers is
+more; an explicit ``SPYRE_NUM_CPUS`` is this process's budget already and is used as
+it is. Sized to the whole host, as each parent's is, the concurrent solvers starve
+each other, and a starved solve returns a worse plan for the same graph (slower
+kernels, not just a slower compile). A solve that stops at
 ``cpsat_time_limit_seconds`` returns the best plan found so far, and the FX graph
 cache keeps that plan: the child counts such solves and exits with code 3, the pool
 reports them in ``time_limited`` and in its summary line, so a slow kernel can be
@@ -399,24 +400,28 @@ def _local_ranks() -> int:
     return 1
 
 
+_SOLVER_CPUS_PER_CHILD = 16  # a child's solver share, unless the rank's split is more
+
+
 def _solver_cpu_share(workers: int) -> int:
-    """CPUs for one child's LX planning solver: the host's share per rank.
+    """CPUs for one child's LX planning solver.
 
     Every rank on the host forks ``workers`` children at once, and each child's
-    CP-SAT solve would otherwise take every CPU of the host, as the parent's
-    does. Starved solves return worse plans, not only later ones. The share is
-    per rank, not per child: on one rank the children keep the whole host, which
-    measured faster than a per-child share, while at four ranks on 64 CPUs the
-    per-rank share took the block warm-up from 338 s to 213 s. An explicit
-    ``SPYRE_NUM_CPUS`` (``config.num_cpus``) is already this process's budget, so
-    it is used as it is; only the autodetected host count is divided.
+    CP-SAT solve would otherwise take every CPU of the host, as the parent's does.
+    Starved solves return worse plans, not only later ones. A child gets its rank's
+    share of the host, capped at ``_SOLVER_CPUS_PER_CHILD`` unless that share split
+    across the workers is larger. With one rank on 64 CPUs and 7 workers, 16 or 8
+    CPUs per child took a cold Gemma-4 start from 589 s to 397 s and 388 s; at four
+    ranks the per-rank share (16) took the block warm-up from 338 s to 213 s. An
+    explicit ``SPYRE_NUM_CPUS`` (``config.num_cpus``) is already this process's
+    budget, so it is used as it is; only the autodetected host count is divided.
     """
     from torch_spyre._inductor import config as spyre_config
 
-    del workers  # the share is per rank; the workers stay in the signature for callers
     if spyre_config.num_cpus is not None and spyre_config.num_cpus > 0:
         return spyre_config.num_cpus
-    return max(2, _host_cpus() // _local_ranks())
+    rank_share = max(2, _host_cpus() // _local_ranks())
+    return min(rank_share, max(_SOLVER_CPUS_PER_CHILD, rank_share // max(1, workers)))
 
 
 _TIME_LIMITED_EXIT = 3  # a child's exit code: compiled, but a solve hit its time limit

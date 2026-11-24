@@ -251,6 +251,14 @@ def _handoff_parent_end(
     return max(last, lifetime_end_overrides.get(name, last + 1) - 1)
 
 
+def _mutation_target_names(graph: GraphLowering) -> set[str]:
+    return {
+        op.layout.target.get_name()
+        for op in graph.operations
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+    }
+
+
 def _extern_kernel_in_live_range(
     graph: GraphLowering, uses: list[int], *, excluded_op: Operation | None = None
 ) -> bool:
@@ -1469,6 +1477,7 @@ class ScratchpadAllocator:
         name: str,
         uses: list[int],
         *,
+        mutated_buffers: Collection[str],
         ncores: Optional[dict[str, int]] = None,
         ncores_reasons: Optional[dict[str, str]] = None,
         division_is_fixed: bool,
@@ -1483,12 +1492,17 @@ class ScratchpadAllocator:
         it saves nothing -- which ``_read_count`` (first use excluded) states
         directly.
 
+        An input the graph writes in place is refused: the write lands in HBM, so
+        the clone would be stale for every later read.
+
         ``ncores``/``ncores_reasons`` are consulted only on the placement path
         (``division_is_fixed``); the joint path defers the core division to the
         solver and passes neither.
         """
         if not clone_at_graph_boundaries():
             return "graph input (no clone)"
+        if name in mutated_buffers:
+            return "mutation target"
         if is_empty_tiled_layout(getattr(graph.try_get_buffer(name), "layout", None)):
             return "empty tensor"
         if self._read_count(uses) == 0:
@@ -1550,11 +1564,7 @@ class ScratchpadAllocator:
         if lifetimes is None:
             lifetimes = calculate_liveness(graph)
         op_by_name = {op.name: op for op in graph.operations}
-        mutated_buffers = {
-            op.layout.target.get_name()
-            for op in graph.operations
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-        }
+        mutated_buffers = _mutation_target_names(graph)
         graph_output_names = set(graph.get_output_names())
         reinterpret_output_names = {
             go.get_name()
@@ -1766,6 +1776,7 @@ class ScratchpadAllocator:
         # parent of its own. The value is letting the consumer that performs that
         # last read reuse the clone's slot for its own output.
         built_by_name = {b.name: b for b in buffers}
+        mutated_buffers = _mutation_target_names(graph)
         for input_name in graph.graph_input_names:
             uses = lifetimes.get(input_name, [])
             if not uses:
@@ -1774,6 +1785,7 @@ class ScratchpadAllocator:
                 graph,
                 input_name,
                 uses,
+                mutated_buffers=mutated_buffers,
                 ncores=ncores,
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=True,
@@ -5047,11 +5059,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         satisfies all its children. That constraint is enforced by requiring
         each child to match the parent, not by pre-rejecting here.
         """
+        mutated_buffers = _mutation_target_names(graph)
         return [
             name
             for name in graph.graph_input_names
             if self._input_residency_reason(
-                graph, name, lifetimes.get(name, []), division_is_fixed=False
+                graph,
+                name,
+                lifetimes.get(name, []),
+                mutated_buffers=mutated_buffers,
+                division_is_fixed=False,
             )
             is None
         ]
