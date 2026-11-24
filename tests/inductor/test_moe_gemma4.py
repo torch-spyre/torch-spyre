@@ -211,8 +211,8 @@ GROUPED_MOE_EAGER = _xfail(
 )
 GROUPED_MOE_COMPILED = _xfail(
     InductorError,
-    "#4648: restickify padding finds no input host dim for the new stick symbol",
-    "restickify padding: no input host dim carries new-stick symbol",
+    "#4531: routing flatten of the [T, 8] topk ids raises Unexpected stick expression",
+    r"Unexpected stick expression Mod\(d0, 8\)",
 )
 STABLE_SORT = _xfail(
     NotImplementedError,
