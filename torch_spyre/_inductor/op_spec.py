@@ -323,6 +323,17 @@ class TensorArg:
             sharded storage (core c reads or writes only chunk c, through its
             own start address, ``nonUnifiedAllocInHBM_``; see sharded_hbm.py);
             0 for ordinary storage. Checked against the real tensor at launch.
+        non_unified_shard_dim: The iteration-space symbol of the shard dim of
+            this tensor's sharding, when the tensor is sharded storage; None
+            otherwise. The sharded planner pins the work split on the shard
+            dim, and the codegen guard (``verify_non_unified_split``) checks
+            the committed split against this symbol, so a later pass that
+            re-divides the op on any other dim is rejected. Derived from the
+            tensor's placement against the same iteration space the SDSC is
+            emitted from (Inductor mints fresh index symbols per trace, so a
+            symbol captured at planning time can be renamed by scheduling);
+            the SDSC layer maps it to the emitted dim label alongside every
+            other symbol.
     """
 
     is_input: bool
@@ -340,6 +351,7 @@ class TensorArg:
     kernel_local: bool = False
     replicated_scalar: bool = False
     non_unified_shard_bytes: int = 0
+    non_unified_shard_dim: Symbol | None = None
     stride_map: list[int] | None = None
 
     @property

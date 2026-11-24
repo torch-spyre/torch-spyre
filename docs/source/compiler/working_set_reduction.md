@@ -297,7 +297,7 @@ tracks actual graph storage, rather than relying on a variable's name.
 ## Example: tiling `y = a + b; z = y * c`
 
 The example below tiles the same computation used throughout this document's
-companion, [`coarse_tiling_loops.md`](coarse_tiling_loops.md), with
+companion, [`loop_nodes.md`](loop_nodes.md), with
 `for_each_tile`. `a`, `b`, `c` are `[1024, 4096]` tensors; the loop tiles
 dimension 0 into 8 steps of 128 rows each:
 
@@ -327,13 +327,12 @@ is ignored), and returns each step's `[128, 4096]` result tile, which
 `out_dim=0` lays into the corresponding `narrow(0, i*128, 128)` slice of the
 returned `[1024, 4096]` output.
 
-This is the same tiling shape as the
-[Small Example](coarse_tiling_loops.md#small-example) in the companion
-document (a single loop, `y = a + b` then `z = y * c`) and it lowers to the
-same downstream mechanism (`loop_info: CoarseTileInfo`, a `CountedLoopSchedulerNode`,
-a `LoopSpec`). `docs/tools/capture_for_each_tile_ir.py` regenerates the real,
-captured IR/OpSpec/`bundle.mlir` for this exact example, which the
-[implementation reference](coarse_tiling_loops.md) quotes at length.
+This is the same example as the
+[worked example](loop_nodes.md#worked-example) in the companion document. It
+lowers to one `LoopNode`, which becomes a `LoopSchedulerNode` and a `LoopSpec`.
+`docs/tools/capture_for_each_tile_ir.py` regenerates the real, captured
+IR/OpSpec/`bundle.mlir` for this exact example, which the
+[implementation reference](loop_nodes.md) quotes at length.
 
 ## Composing and nesting
 
@@ -360,14 +359,11 @@ def fn(a, b, c):
     return z
 ```
 
-The compiler's lowering pipeline (see [Layer 1's Prove → Splice → Identify →
-Stamp
-sequence](coarse_tiling_loops.md#prove-splice-identify-stamp-how-a-for_each_tile-call-becomes-loop_info))
+The compiler's lowering (see [Where loops come from](loop_nodes.md#where-loops-come-from))
 runs to a fixed point over nested `for_each_tile`/`while_loop` structures, so
-this composition is handled uniformly rather than as a special case. See
-that section for how a two-level nest like this ends up with a two-entry
-`loop_group_id` on the innermost ops, analogous to the Small Example's
-`(0, 0)`.
+this composition is handled uniformly rather than as a special case. A
+two-level nest like this becomes two nested `LoopNode`s: the inner node is in the
+outer node's body, and the innermost ops have two levels in `enclosing_loops`.
 
 ## Implementation
 
@@ -382,22 +378,20 @@ Inductor as an `ir.WhileLoop` (`scan`'s own lowering), not as a distinct
 The Spyre backend's job is then to recognize which `ir.WhileLoop`s are
 provably bounded, tile-shaped loops (as opposed to genuinely
 data-dependent `while_loop`s, which stay as `ir.WhileLoop`) and rewrite them
-into a `loop_info`-carrying representation. The mechanics of that
+into a `LoopNode`. The mechanics of that
 recognition and rewrite (`try_prove_for_each_tile`, `splice_while_loops`,
 `_stamp_direct_loop_info`, and the surrounding carry machinery in
 `while_loop_bridge.py`) are described in detail in
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1-pre-scheduling-ir-pass),
-which covers everything past "a run of ops carries a `loop_info:
-CoarseTileInfo`": the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
-and the `LoopSpec` codegen tree (Layer 3).
+[`loop_nodes.md`](loop_nodes.md#where-loops-come-from), which also covers
+everything past the build of the node: how passes read and edit it, the
+scheduler's `LoopSchedulerNode`, and the `LoopSpec` codegen tree.
 
 `splice_while_loops` runs in `CustomPreSchedulingPasses`, before dead-code
 elimination, since it must resolve every `for_each_tile`-shaped
-`ir.WhileLoop` down to a `loop_info`-carrying group before later passes see
-a flat op list. Work-division and scratchpad planning run after, consuming
+`ir.WhileLoop` down to a `LoopNode` before later passes see the graph. Work-division and scratchpad planning run after, consuming
 the resulting tiled iteration spaces. See
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#groups-derivation-and-placement-in-custompreschedulingpasses)
-for the full pass ordering.
+[`loop_nodes.md`](loop_nodes.md#invariants-and-failure-modes)
+for the pass ordering.
 
 ### Transformation
 
@@ -422,10 +416,9 @@ and spills to HBM. With WSR, each tile of `y` lives in LX scratchpad for the
 duration of one iteration and is consumed immediately by the next op.
 :::
 
-The full mechanics (how loop identity is carried through Inductor's
-flat-list pipeline, how the loop perimeter prevents cross-group fusion, how
-buffers crossing the loop boundary are classified) are documented in
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md).
+The full mechanics (how a loop is one node that passes read and edit through
+helpers, how the scheduler keeps the loop whole, how buffers crossing the loop
+boundary are classified) are documented in [`loop_nodes.md`](loop_nodes.md).
 
 A buffer that crosses the loop boundary and whose access has a nonzero
 coefficient on the loop variable of a given level (`loop_facts.read_advance` /
@@ -438,18 +431,18 @@ spans every tile the buffer occupies across the loop; sizing it for a single
 tile would let the loop overrun into whatever buffer the allocator packed
 next to it. A buffer whose accesses have no loop-variable term at any level, by contrast, never advances and is a candidate for
 a fixed-address LX scratchpad slot instead. See
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the `accum_full` /
-`accum_tile` buffers this distinction matters most for.
+[`loop_nodes.md`](loop_nodes.md#carries) for the carried accumulators this
+distinction matters most for.
 
 ## Related documents
 
-- [`coarse_tiling_loops.md`](coarse_tiling_loops.md): implementation
-  reference for the transformation stage (Layer 1 IR pass, Layer 2
-  scheduler wrapper, Layer 3 codegen tree) that turns `for_each_tile`'s
-  `loop_info` into an executable tiled loop nest.
+- [`loop_nodes.md`](loop_nodes.md): implementation reference for the
+  transformation stage (the `LoopNode`, the scheduler's `LoopSchedulerNode`
+  and the `LoopSpec` codegen tree) that turns a `for_each_tile` call into an
+  executable tiled loop nest.
 - [RFC 1358: Coarse-Tiling Loop IR Design
   Rationale](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md),
-  which explains the reasoning behind the three-layer design.
+  which explains the reasoning behind the design.
 - [`scratchpad_planning.md`](scratchpad_planning.md): how LX scratchpad
   allocation consumes the per-tile iteration spaces produced by WSR.
 - [`work_division_planning.md`](work_division_planning.md): how work
