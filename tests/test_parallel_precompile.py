@@ -450,28 +450,6 @@ def test_the_solver_hook_counts_feasible_plans_under_a_time_limit(monkeypatch):
     assert len(warnings) == 1 and warnings[0][1] == "graph 7 (9 nodes)"
 
 
-def test_a_collective_under_lx_context_switching_warns_once(monkeypatch):
-    from torch_spyre._inductor import config as spyre_config
-
-    g = torch.fx.Graph()
-    x = g.placeholder("x")
-    y = g.call_function(torch.ops._c10d_functional.all_reduce.default, (x, "sum", "tp"))
-    g.output((y,))
-    with_collective = torch.fx.GraphModule(torch.nn.Module(), g)
-    warnings = []
-    monkeypatch.setattr(pp.logger, "warning", lambda *a: warnings.append(a))
-    monkeypatch.setattr(pp, "_warned_collectives", False)
-    with spyre_config.patch(enable_lx_context_switching=False):
-        pp._warn_collectives_in_lx(with_collective)
-    assert not warnings  # the workaround is in place
-    with spyre_config.patch(enable_lx_context_switching=True):
-        pp._warn_collectives_in_lx(_graph_with_outputs(((2,), torch.float32)))
-        assert not warnings  # no collective, nothing to warn about
-        pp._warn_collectives_in_lx(with_collective)
-        pp._warn_collectives_in_lx(with_collective)
-    assert len(warnings) == 1 and "6563" in warnings[0][0]
-
-
 def test_the_probe_computes_the_key_a_real_compile_writes(monkeypatch):
     """Pins ``_fx_cache_key`` to the key ``compile_fx_inner`` writes: a torch upgrade
     that changed the key would otherwise turn every probe into a silent miss."""

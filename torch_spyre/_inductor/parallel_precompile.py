@@ -67,12 +67,7 @@ kernels, not just a slower compile). A solve that stops at
 ``cpsat_time_limit_seconds`` returns the best plan found so far, and the FX graph
 cache keeps that plan: the child counts such solves and exits with code 3, the pool
 reports them in ``time_limited`` and in its summary line, so a slow kernel can be
-traced back to a starved warm-up. With ``enable_lx_context_switching`` on (the
-default) the LX planner may keep an all-reduce input in LX, and the wrapper a child
-caches then calls the collective on a buffer it never allocated, a ``NameError`` in
-the second run (torch-spyre#6563): the first graph with a collective logs a warning
-once, naming ``ENABLE_LX_CONTEXT_SWITCHING=0`` as the workaround until the planner is
-fixed.
+traced back to a starved warm-up.
 
 Limits: Linux only (``os.fork``). Each child is a copy-on-write copy of the caller.
 For a vLLM engine with Granite 3.3 8B and 8 workers, the peak resident memory of the
@@ -427,7 +422,6 @@ def _solver_cpu_share(workers: int) -> int:
 _TIME_LIMITED_EXIT = 3  # a child's exit code: compiled, but a solve hit its time limit
 _time_limited = 0  # in a child: LX planning solves that stopped at their time limit
 _label = ""  # in a child: the graph it compiles, for its log lines
-_warned_collectives = False  # the torch-spyre#6563 warning goes out once per process
 
 
 def _count_time_limited_solves() -> None:
@@ -486,32 +480,6 @@ def _hook_time_limited_solves(cls: type) -> None:
 def _graph_label(gm: Any, kwargs: dict) -> str:
     nodes = len(gm.graph.nodes) if hasattr(gm, "graph") else 0
     return f"graph {kwargs.get('graph_id', '?')} ({nodes} nodes)"
-
-
-def _warn_collectives_in_lx(gm: Any) -> None:
-    """Warn once when a graph with a collective compiles in a child while LX context
-    switching is on: the planner may keep the collective's input in LX, and the
-    cached wrapper then names a buffer it never allocated (torch-spyre#6563)."""
-    global _warned_collectives
-    if _warned_collectives or not hasattr(gm, "graph"):
-        return
-    from torch_spyre._inductor import config as spyre_config
-
-    if not spyre_config.enable_lx_context_switching:
-        return
-    if not any(
-        node.op == "call_function" and "_c10d_functional" in str(node.target)
-        for node in gm.graph.nodes
-    ):
-        return
-    _warned_collectives = True
-    logger.warning(
-        "parallel precompile: a graph with a collective compiles in a child while LX "
-        "context switching is on; the LX planner may keep an all-reduce input in LX, "
-        "and the second run then fails with a NameError in the generated wrapper "
-        "(torch-spyre#6563). Set ENABLE_LX_CONTEXT_SWITCHING=0 for this process until "
-        "the planner is fixed."
-    )
 
 
 def _child_setup(workers: int = 1) -> None:
@@ -756,7 +724,6 @@ def fork_inner_compiles(
             # the FX graph cache answers it in place faster than a fork.
             return original(*args, **kwargs)
         gm = kwargs.get("gm", args[0] if args else None)
-        _warn_collectives_in_lx(gm)
         label = _graph_label(gm, kwargs)
         if not pool.placeholders:
             pool.submit(lambda: original(*args, **kwargs), label=label)
