@@ -162,6 +162,25 @@ Pinning applies to host buffers only. A device tensor cannot be pinned: a
 `device="spyre"` allocation with `pin_memory=True` is rejected in
 `spyre_mem.cpp`.
 
+### Non-blocking host-to-device copies
+
+`copy_(src, non_blocking=True)` and `.to("spyre", non_blocking=True)`, also with
+`device_layout=` or `dynamic=`, return before the DMA completes. Work queued
+later on the same stream sees the copied data. As on CUDA, a pageable source
+may be modified or freed as soon as the call returns: a converting copy converts
+it on the calling thread, and a same-format copy first copies it into a pinned
+staging buffer. A pinned source is read by the DMA itself, so leave it unchanged
+until the stream is synchronized.
+
+Staging buffers come from the pinned pool, which keeps idle buffers for reuse.
+`torch.accelerator.empty_host_cache()` releases them, and
+`torch.accelerator.host_memory_stats()` does not report the pool yet
+([#5753](https://github.com/torch-spyre/torch-spyre/issues/5753)). If the pool
+cannot supply a staging buffer, the copy converts the source on the calling
+thread instead, as a converting copy does, and only the first such fallback in
+a process warns. The source is still safe to modify once the call returns, and
+the call still returns before the DMA completes, but it costs more host time.
+
 ## Eager Operations
 
 Eager kernels reach the Spyre dispatch key from two Python sources.
