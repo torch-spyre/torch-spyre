@@ -117,7 +117,7 @@ PATCHED_SURFACE: tuple[str, ...] = (
     "topological_sort_schedule, the _pre_fusion_custom_pass, fuse_nodes "
     "(Spyre's can_fuse_* are False), merge_loops, compute_last_usage "
     "(FusedSchedulerNode.set_last_usage) and _codegen -- run on the supported "
-    "release by test_loop_scheduler_equivalence.py",
+    "release by test_loop_scheduler_review.py",
 )
 
 
@@ -345,8 +345,8 @@ def _build_loop_scheduler_node(
     A no-op (an allocation that generates no code) or an extern kernel is not
     a kernel, and Spyre's codegen rejects it inside a counted loop.  They are
     created as ordinary nodes and placed immediately before their (outermost)
-    loop.  One
-    that reads a buffer the loop writes cannot go before it, and is refused.
+    loop.  One that reads a buffer the loop writes cannot go before it, and is
+    refused.
     """
     children: list[BaseSchedulerNode] = []
     hoisted: list[BaseSchedulerNode] = []

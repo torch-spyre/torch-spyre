@@ -498,8 +498,8 @@ def _hand_off_loop_nodes(graph: GraphLowering) -> None:
     On any other release a graph that holds a ``LoopNode`` is refused here,
     with ``Unsupported`` naming the release: flattening it would compile the
     loop without saying that the release is unsupported (decided policy: fail
-    loudly outside the supported set). A
-    graph with no loop is unaffected on every release.
+    loudly outside the supported set). A graph with no loop is unaffected on
+    every release.
     """
     if not has_loop_nodes(graph.operations):
         return

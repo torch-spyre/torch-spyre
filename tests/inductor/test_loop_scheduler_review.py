@@ -774,8 +774,9 @@ def test_constant_written_in_a_body_runs_once_before_the_loop():
 def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
     """With a constant inside the LoopNode at the hand-off,
     ``create_scheduler_node`` makes it an extern scheduler node and places it
-    immediately before its loop, so it runs once.  The hoisting rule assumes a hoisted op gives the same result
-    every trip; that holds here (a constant) and is not checked."""
+    immediately before its loop, so it runs once.  The hoisting rule assumes a
+    hoisted op gives the same result every trip; that holds here (a constant) and
+    is not checked."""
     X, Y = _matmul_inputs()
     seen: dict = {}
     real = ts_passes._hand_off_loop_nodes

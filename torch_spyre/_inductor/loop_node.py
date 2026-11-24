@@ -30,8 +30,8 @@ names the position with the helpers below (``insert_before``, ``move_after``,
 ``remove_op``, ...), each of which finds the list that owns the anchor.
 After the pass loop the nodes stay: each reaches Inductor's scheduler as one
 ``LoopSchedulerNode`` (``loop_scheduler.py``), and the readers in between
-descend into them.  :func:`expand` flattens them only on a pass error and in
-the equivalence tests that compare against the flat path.
+descend into them.  :func:`expand` flattens them only on a pass error and once the
+scheduler has built its own nodes.
 """
 
 from __future__ import annotations

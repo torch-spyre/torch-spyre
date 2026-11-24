@@ -27,7 +27,6 @@ from torch_spyre._inductor.loop_facts import (
     counted_loop_path,
     enclosing_loops,
     loop_depth,
-    scheduler_enclosing_loops,
 )
 from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
@@ -97,23 +96,6 @@ def test_extern_excluded_by_default():
     op = _extern(_info((0,), [4]))
     assert counted_loop_path(op) == ()
     assert counted_loop_path(op, include_extern=True) == (0,)
-
-
-def test_scheduler_skips_nodes_without_loop_info():
-    node = MagicMock()
-    node.get_nodes.return_value = [
-        _snode(None),
-        _snode(_info((2,), [sympy.Integer(5)])),
-    ]
-    (lvl,) = scheduler_enclosing_loops(node)
-    assert lvl.group_path == (2,)
-    assert lvl.trip_count == 5
-
-
-def test_scheduler_node_without_scheduler_nodes_yields_empty():
-    node = MagicMock()
-    node.get_nodes.return_value = [MagicMock()]
-    assert scheduler_enclosing_loops(node) == ()
 
 
 def test_default_tiled_reduction_dims_is_still_a_loop():

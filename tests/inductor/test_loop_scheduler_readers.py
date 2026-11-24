@@ -18,7 +18,8 @@ Since ``CustomPreSchedulingPasses`` stopped expanding the ``LoopNode``s, every
 reader after the pass loop sees them: the work-division finalizer, the INFO
 listing (``format_operations``), the cost-model report and dump, and, after
 ``Scheduler.__init__``, the pre-fusion pass (``propagate_mutation_layouts``).
-Each must read a loop's body exactly as it read the flat list.  Everything runs on the CPU with real Inductor objects.
+Each must read a loop's body exactly as it read the flat list.  Everything runs
+on the CPU with real Inductor objects.
 """
 
 import unittest
