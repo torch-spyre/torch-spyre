@@ -290,6 +290,24 @@ def test_an_inner_carry_reset_every_outer_trip_does_not_cover_the_outer_loop():
     assert LoopProgram([outer]).live_interval("acc") == (1, 4)
 
 
+def test_a_carry_first_written_in_its_own_loop_still_covers_the_loop():
+    # No initializer before the loop: the in-place update is the first write, so
+    # the storage's birth is in the carry's own loop. Its back edge still holds it.
+    rec = LoopCarryRecord(storage_name="acc", update_name="upd")
+    upd = _Op("upd", reads=["acc"], writes=["acc"])
+    n = _node("n0", [_Op("k"), upd, _Op("k2")], trip=4, carries=[rec])
+    assert LoopProgram([_Op("a"), n, _Op("z")]).live_interval("acc") == (1, 3)
+    # An initializer placed in the carry loop's own body (a non-member clone, say).
+    upd2 = _Op("upd", reads=["acc"], writes=["acc"])
+    n2 = _node(
+        "n0",
+        [_Op("k"), _Op("init", writes=["acc"]), upd2, _Op("k2")],
+        trip=4,
+        carries=[rec],
+    )
+    assert LoopProgram([_Op("a"), n2, _Op("z")]).live_interval("acc") == (1, 4)
+
+
 def test_a_graph_input_mutated_in_a_loop_is_born_outside_it():
     w = _Op("w", reads=["in0"], writes=["in0"])
     r = _Op("r", reads=["in0"])

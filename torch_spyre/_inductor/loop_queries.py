@@ -237,11 +237,22 @@ class LoopProgram:
         for name in self._input_names:
             times.setdefault(name, set())
         index.uses = {name: sorted(ts) for name, ts in times.items()}
+        # A carry crosses the back edge of its own loop: the node whose body holds
+        # its update directly. A node also lists a carry when only the storage's
+        # initial value is made directly in its body (an outer node around an inner
+        # loop's accumulator, reset every outer trip); that value does not survive
+        # the outer back edge, so such a node does not widen. With no update op to
+        # find, every node that lists the carry widens (the safe direction).
+        by_name = {leaf.op.get_name(): leaf for leaf in self._leaves}
         carried: dict[str, list[Loop]] = {}
         for loop in self._node_loops.values():
             assert loop.node is not None
             for carry in loop.node.carries:
-                carried.setdefault(carry.storage_name, []).append(loop)
+                update = by_name.get(carry.update_name)
+                if update is not None and update.placement:
+                    loop = update.placement[-1]
+                if not any(loop is c for c in carried.get(carry.storage_name, ())):
+                    carried.setdefault(carry.storage_name, []).append(loop)
         for name, ts in index.uses.items():
             if not ts:
                 index.intervals[name] = None
@@ -251,15 +262,7 @@ class LoopProgram:
             # A graph input is born outside every loop, whoever writes it later.
             born_in = wrote and name not in self._input_names
             birth = self._leaf(writer).loops if born_in else ()
-            # A carry crosses the back edge of a loop that holds its update but not
-            # its storage's birth. A node also lists a carry whose initial value it
-            # makes directly in its body (an inner loop's accumulator, reset every
-            # outer trip); that value does not survive the outer back edge.
-            widen = [
-                loop
-                for loop in carried.get(name, ())
-                if not any(loop is b for b in birth)
-            ]
+            widen = list(carried.get(name, ()))
             for op in index.readers.get(name, ()):
                 for loop in self._leaf(op).loops:
                     if not any(loop is b for b in birth):
@@ -289,6 +292,6 @@ class LoopProgram:
 
         The uses' range, widened for a read to the span of the outermost loop that
         holds the read but not the buffer's birth (a value read again every trip
-        must survive the back edge), and for a carry to the span of each node that
-        carries it but does not hold its storage's birth."""
+        must survive the back edge), and for a carry to the span of its own loop, the
+        node whose body holds its update directly (the back edge it crosses)."""
         return self._buffers().intervals.get(buffer)
