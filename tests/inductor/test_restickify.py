@@ -3235,3 +3235,37 @@ def test_compute_restickify_target_layout_factorized_new_sd():
         for index in itertools.product(*(range(n) for n in sizes))
     )
     assert addresses == list(range(4 * 8 * 128))
+
+
+@pytest.mark.parametrize("part", ["high", "low"])
+def test_compute_restickify_target_layout_new_sd_sub_stick_part_refused(part):
+    """A new stick variable whose lowest dim is less than a stick is refused.
+
+    Scenario from Qwen3.5-2B: host ``[1, 64, 16, 128]`` read as ``128*d0 + d1``,
+    where ``d0 = 16*b + c`` merges the two adjacent host dims B and C.  ``d0``
+    sits in two outer device dims; its lowest one (C) holds only 16 values, so
+    putting C on the stick, even padded, would give the stick coordinate
+    ``Mod(d0, 16)`` rather than the ``Mod(d0, 64)`` the stick needs.  Either part
+    of ``d0`` as the target gives the same refusal.
+    """
+    import sympy
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import FixedLayout
+    from torch_spyre._C import SpyreTensorLayout as _CSTL
+    from torch_spyre._inductor import pass_utils
+    from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+    from torch_spyre._inductor.propagate_layouts import PropArg
+
+    d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+    size, stride = [1, 64, 16, 128], [131072, 2048, 128, 1]
+    host = FixedLayout(DEVICE, torch.float16, size, stride)
+    dep = MemoryDep("x", 128 * d0 + d1, (d0, d1), (1024, 128))
+    stl = _CSTL(size, stride, torch.float16, [0, 1, 2, 3])
+    assert list(stl.device_size) == [64, 16, 2, 1, 64]
+    ic = pass_utils.host_coordinates(host, dep, None)
+    idc = pass_utils.device_coordinates(stl, dep, None)
+    target = sympy.floor(d0 / 16) if part == "high" else sympy.Mod(d0, 16)
+    result = compute_restickify_target_layout(
+        stl, host, target, ic, idc, arg=PropArg(dep, host, [stl]), label="x"
+    )
+    assert result is None
