@@ -148,7 +148,6 @@ class TestReservationResizeGuard(TestCase):
         # changes. data_ptr/nbytes staying stable is necessary but isn't
         # by itself proof of this.
         stl = copy(get_spyre_tensor_layout(self.x_dev))
-        stl.padding_value = None
         before = str(stl)
         self.x_dev.resize_((140, 1024))
         self.assertEqual(str(get_spyre_tensor_layout(self.x_dev)), before)
@@ -228,7 +227,6 @@ class TestReservationBoundaries(TestCase):
         x_dev = x.to(DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
         ptr = x_dev.untyped_storage().data_ptr()
         stl = copy(get_spyre_tensor_layout(x_dev))
-        stl.padding_value = None
         layout = str(stl)
 
         x_dev.resize_((140, 4, 1024))
