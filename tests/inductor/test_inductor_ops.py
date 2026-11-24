@@ -29,6 +29,7 @@ from torch._inductor.ir import FixedLayout, InputBuffer, Pointwise
 from torch._inductor.virtualized import V
 
 
+from torch._dynamo.exc import BackendCompilerFailed, TorchRuntimeError
 from torch._inductor.exc import InductorError
 from torch_spyre.ops import fft as spyre_fft
 from torch_spyre.ops import fft2 as spyre_fft2
@@ -11963,20 +11964,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # torch's own argument checks. Compiled, torch's meta function raises
         # them; eager dispatch skips it, so spyre_histc repeats them.
         x = torch.rand((64,))
+        # Message fragment: (the error compiled, the arguments). Eager, each is a
+        # plain RuntimeError. torch's meta function has no finite-range check, so
+        # compiled that one is raised by spyre_histc, inside the backend compile.
         cases = {
-            "bins must be > 0": {"bins": 0, "min": 0, "max": 1},
-            "max must be larger than min": {"bins": 8, "min": 1, "max": 0},
-            "is not finite": {"bins": 8, "min": 0, "max": float("inf")},
+            "bins must be > 0": (TorchRuntimeError, {"bins": 0, "min": 0, "max": 1}),
+            "max must be larger than min": (
+                TorchRuntimeError,
+                {"bins": 8, "min": 1, "max": 0},
+            ),
+            "is not finite": (
+                BackendCompilerFailed,
+                {"bins": 8, "min": 0, "max": float("inf")},
+            ),
         }
-        for fragment, kwargs in cases.items():
+        for fragment, (compiled_error, kwargs) in cases.items():
             for compile_mode in (True, False):
-                with pytest.raises(Exception, match=fragment):
+                expected = compiled_error if compile_mode else RuntimeError
+                with pytest.raises(expected, match=fragment) as excinfo:
                     _compile_and_run(
                         lambda x, _kw=kwargs: torch.histc(x, **_kw),
                         [x],
                         "spyre",
                         compile=compile_mode,
                     )
+                self.assertIs(excinfo.type, expected)
         # An eager call that raised must leave the next eager call working. Called
         # directly: _compile_and_run resets the compile caches between calls.
         x_dev = x.to("spyre")
