@@ -1087,6 +1087,51 @@ def _lower_pool2d(
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.histc_count)
+def lower_histc_count(idx, bin_ids, bins, out_dtype):
+    """Broadcast idx to (bins_pad, n), restickify so the bins are on the stick,
+    compare with 0..bins_pad-1 and sum down the rows in idx's dtype. Each
+    intermediate is its own realized op: split_multi_ops cannot split buffers
+    built here."""
+    aten = torch.ops.aten
+    sum_dtype = idx.get_dtype()
+    # bin_ids is one tensor shared between calls (histc_bin_ids), and the count
+    # below has its shape and dtype. A fallback op's output is eligible for both
+    # of Inductor's reuse paths; neither runs on Spyre today (allow_buffer_reuse
+    # is False in patches.py, and the backend does not declare INPLACE_BUFFERS).
+    # Both skip a buffer listed here, so the ids stay safe if that changes.
+    # TODO(#4647): use the shared device arange and drop this.
+    V.graph.never_reuse_buffers.add(bin_ids.get_name())
+    n = int(idx.get_size()[0])
+    bins_pad = int(bin_ids.get_size()[0])
+
+    def realized(fn, *args):
+        out = fn(*args)
+        out.realize()
+        return out
+
+    def cast(t, dtype, skip_trunc=False):
+        # Synthetic origin, so the layout pass applies its dtype-conversion rule.
+        out = realized(lambda a, d: to_dtype(a, d, skip_trunc=skip_trunc), t, dtype)
+        args = (n_, dtype) if (n_ := t.get_origin_node()) is not None else ()
+        _ensure_synthetic_origin(
+            out, torch.ops.prims.convert_element_type.default, args
+        )
+        return out
+
+    rows = realized(
+        lowering.clone, lowering.expand(lowering.unsqueeze(idx, 0), [bins_pad, n])
+    )
+    xb = lowering.permute(lower_restickify(rows), [1, 0])  # (n, bins_pad)
+    eq = lowering.lowerings[aten.eq.Tensor]
+    match = realized(eq, xb, lowering.unsqueeze(bin_ids, 0))
+    counts = realized(lowering.sum_, cast(match, sum_dtype), [0])  # (bins_pad,)
+    if out_dtype != sum_dtype:
+        # Whole numbers: no trunc needed.
+        counts = cast(counts, out_dtype, skip_trunc=True)
+    return lowering.slice_(counts, 0, 0, bins)
+
+
 @register_spyre_lowering(torch.ops.aten.avg_pool2d.default)
 def lower_avg_pool2d(
     x,

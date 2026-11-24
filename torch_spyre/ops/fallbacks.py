@@ -263,6 +263,14 @@ def spyre__triu_cpu(input, diagonal=0, **kwargs):
     return torch.triu(input, diagonal)
 
 
+@register_fallback(["spyre::histc_cpu"])
+def spyre__histc_cpu(input, bins, min, max, **kwargs):
+    """
+    CPU fallback for torch.histc on inputs spyre_histc keeps off the device.
+    """
+    return torch.ops.spyre.histc_cpu(input, bins, min, max)
+
+
 @register_fallback(["spyre::max_dim_int64_fallback"])
 def spyre__max_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
     """

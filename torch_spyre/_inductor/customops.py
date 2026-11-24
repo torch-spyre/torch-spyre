@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from typing import Optional, Sequence
 
 import torch
@@ -174,6 +175,79 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     # Index materializes in the input dtype, not int64: a float that lies it
     # is an index. Matches lower_topkindex (dst_dtype = x.get_dtype()).
     return x.new_empty(out_size, dtype=x.dtype)
+
+
+@torch.library.custom_op("spyre::histc_count", mutates_args=(), device_types="spyre")
+@compile_once("spyre.histc_count", dynamic=False)
+def histc_count(
+    idx: torch.Tensor,
+    bin_ids: torch.Tensor,
+    bins: int,
+    out_dtype: torch.dtype,
+    compiled,
+) -> torch.Tensor:
+    """Counts of each value 0..bins-1 in the 1-D fp32 or fp16 ``idx``, as a
+    (bins,) tensor of ``out_dtype``. Other values are ignored. The count is
+    summed in ``idx``'s dtype. ``bin_ids`` is
+    ``histc_bin_ids(bins_pad, idx.dtype, idx.device)``.
+
+    Normally lowered inside the compiled decomposition. This eager body is for
+    the calls where Dynamo runs ``spyre_histc`` as plain Python: once an eager
+    call has raised an argument error, it skips that function from then on.
+    """
+    # One trace per bins value: it sets the output's length.
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(idx, bin_ids, bins, out_dtype)
+
+
+@histc_count.register_fake
+def _(
+    idx: torch.Tensor, bin_ids: torch.Tensor, bins: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    return idx.new_empty((bins,), dtype=out_dtype)
+
+
+# The 64 most recently used (bins_pad, dtype, device); lru_cache is thread-safe.
+# TODO(#4647): use the shared device arange cache instead.
+@functools.lru_cache(maxsize=64)
+def _histc_bin_ids_on_device(
+    bins_pad: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    return torch.arange(bins_pad, dtype=dtype).to(device)
+
+
+@torch.library.custom_op("spyre::histc_bin_ids", mutates_args=())
+def histc_bin_ids(
+    bins_pad: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """0..bins_pad-1 as an fp32 or fp16 tensor on ``device``, built on the host
+    and copied over. The tensor is cached and shared between calls, so nothing
+    may write to it; lower_histc_count keeps its buffer from reuse."""
+    return _histc_bin_ids_on_device(bins_pad, dtype, device)
+
+
+@histc_bin_ids.register_fake
+def _(bins_pad: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    return torch.empty((bins_pad,), dtype=dtype, device=device)
+
+
+@torch.library.custom_op("spyre::histc_cpu", mutates_args=())
+def histc_cpu(input: torch.Tensor, bins: int, min: float, max: float) -> torch.Tensor:
+    """CPU fallback for torch.histc when ``spyre_histc`` keeps the input off the
+    device: a compare table over its size limit, or a symbolic length. Counts
+    have the input's dtype. Integer and fp16 input is counted as fp32, as on the
+    device: CPU histc has no kernel for them.
+
+    Mirrors max_dim_int64_fallback: the Spyre kernel is registered in
+    fallbacks.py, and this body computes the real result for non-Spyre inputs.
+    """
+    x = input if input.dtype == torch.float32 else input.to(torch.float32)
+    return torch.histc(x, bins=bins, min=min, max=max).to(input.dtype)
+
+
+@histc_cpu.register_fake
+def _(input: torch.Tensor, bins: int, min: float, max: float) -> torch.Tensor:
+    return input.new_empty((bins,))
 
 
 @torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")

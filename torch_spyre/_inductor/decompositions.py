@@ -30,6 +30,7 @@ import math
 import threading
 from typing import Any, Callable, Optional, Sequence, Union
 
+import numpy as np
 import torch
 import torch._decomp as decomp
 from torch._prims_common import (
@@ -1875,6 +1876,122 @@ def spyre_topk(
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )
+
+
+def _histc_bin_index(x, lo, hi, width_den, bins, repair_division=False):
+    """torch's histc bin index for fp32 ``x``: 0..bins-1 in range. Below ``lo``,
+    above ``hi`` or for NaN it is negative or NaN, which matches no bin."""
+    valid = (x <= hi).to(torch.float32)
+    scaled = (x - lo) * float(bins)
+    pos = torch.floor(scaled / width_den)
+    if repair_division:
+        # Dividing by a device tensor can land a float step under a whole
+        # quotient, which floors to the bin below. Multiply back to restore it.
+        rem = scaled - pos * width_den
+        pos = pos + (rem >= width_den).to(torch.float32)
+        pos = pos - (rem < 0).to(torch.float32)
+    pos = pos - torch.relu(pos - (bins - 1.0))  # x == hi -> bins - 1
+    return pos * valid + (valid - 1.0)
+
+
+# The count compares every element with every bin, and its time grows with that
+# table: N x bins (rounded up to a full stick) x the element size. Above 16 MB
+# the CPU round trip is faster (measured at 32 cores), so histc counts there.
+# TODO: count in chunks, so large inputs stay on the device.
+_HISTC_DEVICE_TABLE_MAX_BYTES = 16 * 2**20
+
+
+@register_spyre_decompositions([torch.ops.aten.histc.default])
+def spyre_histc(
+    input: torch.Tensor,
+    bins: int = 100,
+    min: float = 0,
+    max: float = 0,
+) -> torch.Tensor:
+    """1-D int32/int64/float32/float16 histc: bin index per element, then
+    spyre::histc_count. The index maths is fp32, so integers are exact below
+    2**24, and a value within a float step of a bin edge can land in the
+    neighbouring bin: device fp32 arithmetic rounds differently from the CPU's.
+
+    A compare table over _HISTC_DEVICE_TABLE_MAX_BYTES, or an input whose length
+    is symbolic, is counted on the CPU instead (spyre::histc_cpu), with torch's
+    own bin rule."""
+    if input.dtype not in (torch.int32, torch.int64, torch.float32, torch.float16):
+        raise Unsupported(
+            f"histc: {input.dtype} input is not supported "
+            "(int32, int64, float32 and float16 are)"
+        )
+    if input.dim() != 1:
+        raise Unsupported(f"histc: only 1-D input is supported, got {input.dim()}-D")
+    # torch's checks; eager dispatch skips its meta checks.
+    if bins <= 0:
+        raise RuntimeError(f"torch.histc(): bins must be > 0, but got {bins}")
+    lo, hi = float(min), float(max)
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise RuntimeError(f"torch.histc: range of [{lo}, {hi}] is not finite")
+    if lo > hi:
+        raise RuntimeError("torch.histc: max must be larger than min")
+    # An fp16 input is compared and counted as fp16 (the index maths stays in
+    # fp32). Device fp16 holds whole numbers exactly only up to 1024, hence the
+    # two limits.
+    # TODO: count in fp32, with no element limit, once a reduction keeps its
+    # input's element arrangement (#5553).
+    idx_dtype = torch.float16 if input.dtype == torch.float16 else torch.float32
+    if idx_dtype == torch.float16:
+        if bins > 1024:
+            raise Unsupported("histc: float16 input supports at most 1024 bins")
+        if input.numel() > 1024:
+            raise Unsupported("histc: float16 input supports at most 1024 elements")
+    if input.numel() == 0:
+        return input.new_zeros((bins,))
+
+    stick = get_elem_in_stick(idx_dtype)
+    bins_pad = (bins + stick - 1) // stick * stick
+    n = input.numel()
+    if not isinstance(n, int):
+        # The count's lowering needs the length at compile time.
+        logger.debug("histc: the input length %s is symbolic; counting on the CPU", n)
+        return torch.ops.spyre.histc_cpu(input, bins, lo, hi)
+    table_bytes = n * bins_pad * idx_dtype.itemsize
+    if table_bytes > _HISTC_DEVICE_TABLE_MAX_BYTES:
+        logger.debug(
+            "histc: %d elements x %d bins needs a %.1f MB compare table, over "
+            "the %d MB device limit; counting on the CPU",
+            n,
+            bins,
+            table_bytes / 2**20,
+            _HISTC_DEVICE_TABLE_MAX_BYTES // 2**20,
+        )
+        return torch.ops.spyre.histc_cpu(input, bins, lo, hi)
+    # First, so this extern call does not split the kernels that follow.
+    bin_ids = torch.ops.spyre.histc_bin_ids(bins_pad, idx_dtype, input.device)
+    x = input.to(torch.float32)
+    if lo == hi:
+        # min == max: the data's range, widened by 1 if constant, as torch does.
+        # Unlike torch, NaN or inf in the data does not raise.
+        # An fp16 input's fp32 copy is padded, and a reduction over it would read
+        # the padding, so its range is taken from the input itself.
+        src = input if input.dtype == torch.float16 else x
+        lo_t = torch.amin(src).to(torch.float32)
+        hi_t = torch.amax(src).to(torch.float32)
+        same = lo_t == hi_t
+        lo_t = torch.where(same, lo_t - 1, lo_t)
+        hi_t = torch.where(same, hi_t + 1, hi_t)
+        idx = _histc_bin_index(x, lo_t, hi_t, hi_t - lo_t, bins, repair_division=True)
+    else:
+        # Edges in fp32, as torch computes them.
+        idx = _histc_bin_index(
+            x,
+            float(np.float32(lo)),
+            float(np.float32(hi)),
+            float(np.float32(hi) - np.float32(lo)),
+            bins,
+        )
+    if idx_dtype == torch.float16:
+        # The fp32 index of an fp16 input is in staggered order; the cast back to
+        # fp16 restores standard order for histc_count.
+        idx = idx.to(torch.float16)
+    return torch.ops.spyre.histc_count(idx, bin_ids, bins, input.dtype)
 
 
 @register_spyre_decompositions([torch.ops.aten.gelu.default])
