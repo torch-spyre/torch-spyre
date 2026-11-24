@@ -358,7 +358,6 @@ the lowering's `loop_member`.
 | `counted_loop_path(op, include_extern=False)` | the group path `op` runs in; `()` for an `ExternKernel` unless `include_extern` is set (it runs once, outside the loop) |
 | `is_looped(op)` | whether `op` is a member of a counted loop |
 | `strict_loop_vars(op)` | whether the loop-tiling lowering made the op's loops |
-| `scheduler_enclosing_loops(node)` | the levels of a scheduler node's first `SchedulerNode` |
 | `read_advance(op, dep)`, `output_advance(op)` | the per-trip advance of a read or of the write, one entry per level, in host elements |
 | `read_advances_anywhere`, `output_advances_anywhere`, `advancing_levels` | whether and where an access moves with the loop |
 
@@ -698,7 +697,7 @@ redirected by `_patch_consumers`: `NameSwapHandler` swaps the name,
 | File (under `torch_spyre/_inductor/`) | What it holds |
 |---|---|
 | `loop_node.py` | `LoopMember`, `LoopCarryRecord`, `LoopNode`, `OpsView`, the edit helpers, `request_loop_nodes` / `build_pending_loop_nodes` / `collapse` (build nodes), `expand` (flatten) |
-| `loop_facts.py` | the read API: `LoopLevel`, `enclosing_loops`, `counted_loop_path`, `is_looped`, `loop_depth`, `strict_loop_vars`, `scheduler_enclosing_loops`, `read_advance`, `output_advance`, `advancing_levels` |
+| `loop_facts.py` | the read API: `LoopLevel`, `enclosing_loops`, `counted_loop_path`, `is_looped`, `loop_depth`, `strict_loop_vars`, `read_advance`, `output_advance`, `advancing_levels` |
 | `loop_checker.py` | `check_loops`, `find_violations`, `LoopStructureError` |
 | `loop_carries.py` | `apply_loop_carries` |
 | `loop_scheduler.py` | `LoopSchedulerNode`, `_check_members`, the per-compile `Scheduler` patches, `SUPPORTED_RELEASES`, `loop_scheduler_supported`, `refuse_release` |
