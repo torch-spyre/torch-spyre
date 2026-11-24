@@ -172,7 +172,8 @@ correct pattern: `NameSwapHandler` in `insert_restickify.py`,
 The flat order (`graph.operations` in a pass, `all_ops`) is program order, not
 execution count or time, so do not read how often an op runs or when a buffer
 lives off its index. Ask `LoopProgram` in `torch_spyre/_inductor/loop_queries.py`
-(`executions`, `shared_loops`, `span`, `uses`, `live_interval`). Ask
+(`executions`, `shared_loops`, `span`, `uses`, `live_interval`); build it from the
+graph, or pass `input_names=` when building from `graph.operations`. Ask
 `loop_facts` for what a loop tiles and how an access advances.
 
 ## Skills

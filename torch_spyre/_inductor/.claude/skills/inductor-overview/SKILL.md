@@ -88,7 +88,9 @@ is only safe when the swap is addressing-equivalent.
 The flat order (`graph.operations` in a pass, `all_ops`) is program order, not
 execution count or time. Do not derive how often an op runs, which loops two ops
 share, or a buffer's lifetime from positions in it. Ask
-`loop_queries.LoopProgram(graph)` (`executions`, `shared_loops`,
+`loop_queries.LoopProgram(graph)` (or `LoopProgram(graph.operations,
+input_names=graph.graph_input_names)`; build a new one after an edit)
+(`executions`, `shared_loops`,
 `same_iteration`, `span`, `uses`, `runtime_reads`, `live_interval`). Ask
 `loop_facts` for what a loop tiles and how an access advances
 (`enclosing_loops`, `read_advance`).

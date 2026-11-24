@@ -306,7 +306,8 @@ class OpsView(MutableSequence):
 
     The order is program order, not execution count or time: an op's position
     says nothing about how often it runs. Ask ``loop_queries.LoopProgram`` for
-    that, for shared loops, a loop's span and a buffer's uses and lifetime; ask
+    that, for shared loops, a loop's span and a buffer's uses and lifetime (build it
+    from the graph, or pass ``input_names=`` when building from this view); ask
     ``loop_facts`` for what a loop tiles and how an access advances.
     """
 

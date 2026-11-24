@@ -316,3 +316,57 @@ def test_a_graph_input_mutated_in_a_loop_is_born_outside_it():
         SimpleNamespace(operations=[_Op("a"), n], graph_input_names=["in0"])
     )
     assert p.live_interval("in0") == (1, 4)
+
+
+def test_an_unresolved_carry_widens_to_its_listing_node_in_either_order():
+    # n0 carries two storages: r1's update sits in the inner node n1, r2's update
+    # op does not exist. The unresolved one must widen to n0's own span whatever
+    # the order the carries are listed in.
+    upd1 = _Op("upd1", reads=["b1"], writes=["b1"])
+    for order in ((0, 1), (1, 0)):
+        recs = [
+            LoopCarryRecord(storage_name="b1", update_name="upd1"),
+            LoopCarryRecord(storage_name="b2", update_name="missing"),
+        ]
+        inner = _node("n1", [_Op("k1"), upd1], trip=2)
+        outer = _node(
+            "n0",
+            [_Op("k0"), inner, _Op("k2")],
+            trip=4,
+            carries=[recs[i] for i in order],
+        )
+        p = LoopProgram([_Op("a"), _Op("b2", writes=["b2"]), outer])
+        assert p.span(p.loop_for(outer)) == (2, 5)
+        assert p.live_interval("b2") == (1, 5), order
+
+
+def test_span_of_a_node_is_its_loops_span_and_a_foreign_loop_raises():
+    n = _node("n0", [_Op("k"), _Op("k2")])
+    p = LoopProgram([_Op("a"), n])
+    assert p.span(n) == p.span(p.loop_for(n)) == (1, 2)
+    n9 = _node("n9", [_Op("z")])
+    foreign = LoopProgram([n9]).loop_for(n9)
+    with pytest.raises(KeyError, match="not from this program"):
+        p.span(foreign)
+    with pytest.raises(KeyError):
+        p.span(_node("stranger", [_Op("q")]))
+
+
+def test_input_names_keyword_gives_the_graph_answer_from_operations():
+    w = _Op("w", reads=["in0"], writes=["in0"])
+    r = _Op("r", reads=["in0"])
+    n = _node("n0", [_Op("k"), w, r, _Op("k2")], trip=4)
+    ops = [_Op("a"), n]
+    assert LoopProgram(ops, input_names=["in0"]).live_interval("in0") == (1, 4)
+    assert LoopProgram(OpsView(ops), input_names=["in0"]).input_names() == ("in0",)
+    with pytest.raises(ValueError, match="input_names"):
+        LoopProgram(
+            SimpleNamespace(operations=ops, graph_input_names=["in0"]),
+            input_names=["in0"],
+        )
+
+
+def test_executions_is_a_sympy_integer_with_no_loops():
+    p = LoopProgram([_Op("a")])
+    assert isinstance(p.executions(_Op_in(p, "a")), sympy.Integer)
+    assert p.executions(_Op_in(p, "a")) == 1

@@ -41,7 +41,19 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 
 from test_loop_queries import _Alloc, _Extern, _Op
-from test_loop_scheduler_review import _CASES, _compile
+from test_loop_scheduler_review import (
+    _CASES as _REVIEW_CASES,
+    _compile,
+    _cumsum_split_k_fn,
+    _matmul_inputs,
+)
+
+# The review file's cases, plus the one real graph with an extern kernel (the
+# FallbackKernel behind cumsum's triu mask) in a loop body at the hand-off.
+_CASES = {
+    **_REVIEW_CASES,
+    "cumsum_split_k": (_cumsum_split_k_fn, _matmul_inputs, None),
+}
 
 
 def legacy_interval(

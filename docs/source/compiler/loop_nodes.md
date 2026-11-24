@@ -365,7 +365,10 @@ the lowering's `loop_member`.
 does not say how often an op runs or when a buffer is live. The flat order a pass
 sees (`graph.operations`, `all_ops`) is program order, not execution count or time,
 so do not derive those from positions. `loop_queries.LoopProgram` answers them from
-one walk of the program, built as `LoopProgram(graph)` (or from `graph.operations`):
+one walk of the program, built as `LoopProgram(graph)`, or as
+`LoopProgram(graph.operations, input_names=graph.graph_input_names)` (without the
+input names, a graph input written inside a loop is taken to be born in it). It
+describes the graph as it was when built: after an edit, build a new one:
 
 | Method | Answer |
 |---|---|
@@ -376,8 +379,8 @@ one walk of the program, built as `LoopProgram(graph)` (or from `graph.operation
 | `slot(op)`, `time(op)` | the op's position in program order, and the slot it takes effect at |
 | `uses(buffer)`, `runtime_reads(buffer)`, `live_interval(buffer)` | the times of the ops that touch a buffer, how many times it is read when run, and the slots it is live over |
 
-An extern kernel placed in a body is answered as running once, before its
-outermost loop, because that is where the loop scheduler runs it.
+Until stage A0.5, an extern kernel placed in a body is answered as running once,
+before its outermost loop, because that is where the loop scheduler runs it.
 
 ### The advance comes from the index
 

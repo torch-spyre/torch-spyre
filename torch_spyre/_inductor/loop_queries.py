@@ -30,12 +30,17 @@ Three relations are kept apart:
 
 Every query here is about execution. The program is the leaf ops in program order,
 numbered from 0: an op's *slot*. Everything is computed once, in ``__init__``, from
-one walk; nothing is cached across edits and nothing is stored on the IR ops.
+one walk; nothing is stored on the IR ops. The program describes the graph as it
+was when built (the buffer index is filled lazily, on the first buffer query, from
+the ops' accesses at that moment): after any edit, a list edit or an ``inner_fn``
+rewrite, build a new one. Built from ``graph.operations`` or a list, a program
+does not know the graph's inputs; pass ``input_names`` (or build from the graph).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterable
 from typing import Any
 
 import sympy
@@ -51,7 +56,8 @@ class Loop:
     """One loop of a program. A handle: compare by identity.
 
     ``node`` is ``None`` for a pending loop (lowered, not built into a node yet),
-    which is identified by ``path``, its group path.
+    which is identified by ``path``, its group path. ``path`` identifies pending
+    loops only; a built loop is identified by ``node`` and its ``path`` is ``()``.
     """
 
     node: LoopNode | None
@@ -94,9 +100,21 @@ class _BufferIndex:
 class LoopProgram:
     """The loop structure of a graph's operations, answered per op."""
 
-    def __init__(self, source) -> None:
-        self._input_names: tuple[str, ...] = tuple(
-            getattr(source, "graph_input_names", ())
+    def __init__(self, source, *, input_names: Iterable[str] = ()) -> None:
+        """``source`` is a graph, ``graph.operations`` or a list of ops/nodes.
+
+        A graph supplies its own input names. For any other source, pass
+        ``input_names`` if the ops touch graph inputs: an input written inside a
+        loop is born outside it, which the program cannot know otherwise. Giving
+        both a graph and ``input_names`` raises ``ValueError``."""
+        graph_inputs = getattr(source, "graph_input_names", None)
+        input_names = tuple(input_names)
+        if graph_inputs is not None and input_names:
+            raise ValueError(
+                "input_names: the graph already has graph_input_names; pass one"
+            )
+        self._input_names: tuple[str, ...] = (
+            tuple(graph_inputs) if graph_inputs is not None else input_names
         )
         self._index: _BufferIndex | None = None
         if hasattr(source, "operations"):
@@ -167,14 +185,24 @@ class LoopProgram:
         loops = self._leaf(op).loops
         return loops[0] if loops else None
 
-    def span(self, loop: Loop) -> tuple[int, int] | None:
+    def span(self, loop: Loop | LoopNode) -> tuple[int, int] | None:
+        """Inclusive slots the loop covers; ``None`` for an empty node. A
+        ``LoopNode`` is looked up with ``loop_for``; a ``Loop`` from another
+        program raises ``KeyError``."""
+        if isinstance(loop, LoopNode):
+            loop = self.loop_for(loop)
+        elif not (
+            self._node_loops.get(id(loop.node)) is loop
+            or self._pending.get(loop.path) is loop
+        ):
+            raise KeyError(f"loop {loop.path or loop.node} is not from this program")
         s = self._span.get(id(loop))
         return (s[0], s[1]) if s else None
 
-    def executions(self, op: Operation) -> sympy.Expr | int:
+    def executions(self, op: Operation) -> sympy.Expr:
         loops = self._leaf(op).loops
         if not loops:
-            return 1
+            return sympy.Integer(1)
         return sympy.Mul(*(loop.trip_count for loop in loops))
 
     def executions_estimate(self, op: Operation) -> int:
@@ -228,7 +256,8 @@ class LoopProgram:
             read = {d.name for d in rw.reads}
             for name in written | read:
                 times.setdefault(name, set()).add(t)
-                # A write wins a tie: an op that updates a buffer in place makes it.
+                # The earliest leaf makes the buffer (the first one on a tie); one
+                # op that reads and writes it counts as a write.
                 cur = first.get(name)
                 if cur is None or t < cur[0]:
                     first[name] = (t, op, name in written)
@@ -249,10 +278,13 @@ class LoopProgram:
             assert loop.node is not None
             for carry in loop.node.carries:
                 update = by_name.get(carry.update_name)
-                if update is not None and update.placement:
-                    loop = update.placement[-1]
-                if not any(loop is c for c in carried.get(carry.storage_name, ())):
-                    carried.setdefault(carry.storage_name, []).append(loop)
+                target = (
+                    update.placement[-1]
+                    if update is not None and update.placement
+                    else loop
+                )
+                if not any(target is c for c in carried.get(carry.storage_name, ())):
+                    carried.setdefault(carry.storage_name, []).append(target)
         for name, ts in index.uses.items():
             if not ts:
                 index.intervals[name] = None
