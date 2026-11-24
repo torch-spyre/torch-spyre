@@ -227,14 +227,19 @@ SPYRE_FP8_OPS = {
 }
 
 # Ops whose QFP8WT-arranged weight/output tensor requires a 2D stick [2, 64].
-# Used consistently in both compute_ops._layout_info_for_tensor and
-# superdsc._create_sdsc_tensors to gate device-size flattening and
-# 2D-stick metadata restoration.
+# Used in compute_ops._layout_info_for_tensor to restore 2D-stick metadata
+# that was erased by device-size flattening when an op is compiled individually.
+# Other ops (e.g. identity copies and index_copy_ scatters) are not gated here:
+# superdsc selects the 2D stick from the tensor's element arrangement alone, so
+# their metadata is never flattened away.
 FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 
 TOPK_OPS = {"topkvalue", "topkindex"}
 _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
+# topkindex counts in the input dtype, and fp16 holds integers exactly only up to
+# this many elements along the search dim (#5847).
+FP16_TOPK_MAX_DIM = 1024
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]

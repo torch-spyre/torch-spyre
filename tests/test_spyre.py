@@ -64,14 +64,6 @@ _SCALAR_ADD_XFAIL_UINT8_TO_DTYPE = pytest.mark.xfail(
 )
 
 
-# A float16-format bool's float32 or integer result is staggered on device.
-_EAGER_BOOL_READBACK_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="a staggered result is read back without restoring its order (#4393)",
-)
-
-
 def _expect_raise(match):
     """Decorator: the test passes only if it raises with a message matching ``match``."""
 
@@ -84,6 +76,16 @@ def _expect_raise(match):
         return wrapper
 
     return decorator
+
+
+def _queue_matmuls():
+    """Queue enough device work that the next DMA runs well after its call returns."""
+    a = torch.randn(2048, 2048, dtype=torch.float16).to("spyre")
+    matmul = torch.compile(lambda x: x @ x, dynamic=False)
+    matmul(a)
+    torch.accelerator.synchronize()
+    for _ in range(40):
+        matmul(a)
 
 
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1474 (DataFormats.SEN143_FP8)
@@ -148,6 +150,11 @@ class TestSpyre(TestCase):
             # element count is what catches it.
             subtest(lambda t: t[8:16].detach(), name="detached_rows_middle"),
             subtest(lambda t: t[:8].detach(), name="detached_rows_leading"),
+            # A tracked view of an untracked partial tensor: its base is the
+            # detached slice, so the base itself must be checked too.
+            subtest(lambda t: t[8:16].detach().view(-1), name="detached_rows_flat"),
+            subtest(lambda t: t[8:16].detach()[:], name="detached_rows_full_slice"),
+            subtest(lambda t: t[8:16].detach().t(), name="detached_rows_transposed"),
             # Broadcast: the base's offset and element count, but only row 0.
             subtest(lambda t: t[:1].expand(64, 64), name="broadcast_row"),
         ],
@@ -169,6 +176,31 @@ class TestSpyre(TestCase):
         self.assertTrue(torch.equal(d.cpu(), expected))
 
     @parametrize(
+        "mode",
+        [
+            subtest(torch.no_grad, name="no_grad"),
+            subtest(torch.inference_mode, name="inference_mode"),
+        ],
+    )
+    def test_fill_views_without_autograd(self, mode):
+        # Under no_grad, views are still tracked (the base check applies); under
+        # inference_mode they are not (the layout check applies). Either way a
+        # partial view must be rejected and a whole-tensor view must fill.
+        expected = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64)
+        with mode():
+            d = expected.to("spyre")
+            for view in (lambda t: t[8:16], lambda t: t[8:16].detach().view(-1)):
+                with self.assertRaisesRegex(
+                    RuntimeError, "partial view of a Spyre tensor"
+                ):
+                    view(d).fill_(3.0)
+            self.assertTrue(torch.equal(d.cpu(), expected))
+            d.view(-1).fill_(3.0)
+            self.assertTrue(torch.equal(d.cpu(), torch.full((64, 64), 3.0)))
+            d.t().zero_()
+            self.assertTrue(torch.equal(d.cpu(), torch.zeros(64, 64)))
+
+    @parametrize(
         "view",
         [
             subtest(lambda t: t, name="base"),
@@ -176,12 +208,18 @@ class TestSpyre(TestCase):
             subtest(lambda t: t.view(-1), name="flat"),
             subtest(lambda t: t.t(), name="transposed"),
             subtest(lambda t: t.unsqueeze(0), name="unsqueezed"),
+            # A detached whole tensor is not a view, but its views are: the
+            # root check must accept them.
+            subtest(lambda t: t.detach().view(-1), name="detached_flat"),
+            subtest(lambda t: t.detach().t(), name="detached_transposed"),
         ],
     )
     def test_fill_whole_tensor_view(self, view):
         d = torch.zeros(64, 64).to("spyre")
         view(d).fill_(3.0)
         self.assertTrue(d.cpu().eq(3.0).all())
+        view(d).zero_()
+        self.assertTrue(d.cpu().eq(0.0).all())
 
     @parametrize(
         "shape, dtype",
@@ -335,9 +373,7 @@ class TestSpyre(TestCase):
         reserve = {0: {"min": 70, "max": 630, "granularity": 70}}
         expected = torch.arange(70 * 64, dtype=torch.float32).reshape(70, 64)
         d = expected.to("spyre", dynamic=reserve)
-        with self.assertRaisesRegex(
-            RuntimeError, "view of a Spyre tensor is not supported yet"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "partial view of a Spyre tensor"):
             d[10:20].fill_(3.0)
         self.assertTrue(torch.equal(d.cpu(), expected))
 
@@ -588,6 +624,130 @@ class TestSpyre(TestCase):
         del src
         torch.accelerator.synchronize()
         torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+            subtest(torch.float16, name="fp16"),
+        ],
+    )
+    @parametrize("entry", ["copy", "to", "to_layout", "to_dynamic"])
+    def test_non_blocking_pageable_h2d_source_reusable(self, dtype, entry):
+        # As on CUDA, a pageable source may be overwritten as soon as a
+        # non-blocking H2D returns. Queued matmuls hold the DMA back, so a DMA
+        # that read the source late would see the overwrite. Every layout here
+        # is dense, so int8 and fp32 take the DCI-less path, the one that reads
+        # the source late; fp16 takes the conversion path.
+        from torch_spyre._C import (
+            SpyreTensorLayout,
+            get_device_dtype,
+            get_elem_in_stick,
+        )
+
+        eps = get_elem_in_stick(dtype)
+        # A 2-D default layout is tiled and keeps the conversion, so the
+        # reservation, which needs a 2-D host shape, gets rows outermost.
+        shape = (64, eps) if entry == "to_dynamic" else (64 * eps,)
+        src = ((torch.arange(64 * eps) % 31) + 1).to(dtype).reshape(shape)
+        expected = src.clone()
+        _queue_matmuls()
+        if entry == "copy":
+            dev = torch.empty(shape, dtype=dtype, device="spyre")
+            dev.copy_(src, non_blocking=True)
+        elif entry == "to":
+            dev = src.to("spyre", non_blocking=True)
+        elif entry == "to_layout":
+            layout = SpyreTensorLayout(list(shape), dtype)
+            dev = src.to("spyre", non_blocking=True, device_layout=layout)
+        else:
+            rows_outermost = SpyreTensorLayout(
+                device_size=[64, 1, eps],
+                stride_map=[eps, eps, 1],
+                device_dtype=get_device_dtype(dtype),
+                valid_elements={(0,): 64, (1, 2): eps},
+            )
+            dev = src.to(
+                "spyre",
+                non_blocking=True,
+                device_layout=rows_outermost,
+                dynamic={0: {"min": 8, "max": 64, "granularity": 8}},
+            )
+        src.fill_(-1)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+            subtest(torch.float16, name="fp16"),
+        ],
+    )
+    def test_non_blocking_pinned_h2d_source(self, dtype):
+        # A pinned source is not staged: the DMA, held back by queued matmuls,
+        # reads it after the call returns. int8 and fp32 take the raw pinned
+        # DMA, fp16 the conversion path.
+        src = ((torch.arange(8192) % 31) + 1).to(dtype).pin_memory()
+        dev = torch.empty(8192, dtype=dtype, device="spyre")
+        _queue_matmuls()
+        dev.copy_(src, non_blocking=True)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(dev.cpu(), src, rtol=0, atol=0)
+
+    def test_h2d_to_with_device_layout_accepts_copy(self):
+        # torch's .to() parser, which reads non_blocking here, rejects copy.
+        from torch_spyre._C import SpyreTensorLayout
+
+        src = torch.ones(64, 128, dtype=torch.float16)
+        layout = SpyreTensorLayout([64, 128], torch.float16)
+        dev = src.to("spyre", device_layout=layout, copy=True)
+        torch.testing.assert_close(dev.cpu(), src, rtol=0, atol=0)
+
+    @parametrize("form", ["keyword", "positional"])
+    @parametrize("entry", ["to_layout", "to_dynamic"])
+    def test_non_blocking_forwarded_by_spyre_to(self, form, entry):
+        # .to(device_layout=) and .to(dynamic=) copy through copy_tensor; it
+        # must get the caller's non_blocking flag in either spelling.
+        from unittest import mock
+
+        import torch_spyre._C as spyre_c
+
+        src = torch.ones(64, 128, dtype=torch.float16)
+        extra = (
+            {"device_layout": spyre_c.SpyreTensorLayout([64, 128], torch.float16)}
+            if entry == "to_layout"
+            else {"dynamic": {0: {"min": 8, "max": 64, "granularity": 8}}}
+        )
+        for non_blocking in (False, True):
+            args = (
+                ("spyre", torch.float16, non_blocking)
+                if form == "positional"
+                else ("spyre",)
+            )
+            kwargs = {} if form == "positional" else {"non_blocking": non_blocking}
+            with mock.patch.object(
+                spyre_c, "copy_tensor", wraps=spyre_c.copy_tensor
+            ) as copy:
+                dev = src.to(*args, **kwargs, **extra)
+                torch.accelerator.synchronize()
+            self.assertEqual(copy.call_args.kwargs["non_blocking"], non_blocking)
+            torch.testing.assert_close(dev.cpu(), src, rtol=0, atol=0)
+
+    @parametrize("non_blocking", [False, True])
+    def test_empty_source_to_with_device_layout(self, non_blocking):
+        # copy_tensor, which .to(device_layout=) calls directly, used to crash
+        # on a zero-size source instead of copying nothing.
+        from torch_spyre._C import SpyreTensorLayout
+
+        src = torch.empty(0, 64, dtype=torch.float16)
+        layout = SpyreTensorLayout([0, 64], torch.float16)
+        dev = src.to("spyre", device_layout=layout, non_blocking=non_blocking)
+        torch.accelerator.synchronize()
+        self.assertEqual(dev.shape, src.shape)
+        self.assertEqual(dev.cpu().shape, src.shape)
 
     @parametrize(
         "dtype",
@@ -951,7 +1111,6 @@ class TestSpyre(TestCase):
             subtest(
                 dtype,
                 name=str(dtype).removeprefix("torch."),
-                decorators=[_EAGER_BOOL_READBACK_XFAIL],
             )
             for dtype in (torch.float32, torch.int32, torch.int64)
         ],
@@ -1277,6 +1436,17 @@ class TestSpyre(TestCase):
             sliced_expanded.cpu(),
             torch.tensor([data[1]] * 4, dtype=torch.float16),
         )
+
+    def test_eager_expand_broadcast_reduction(self):
+        """Eager dispatch compiles a standalone kernel over the already-
+        materialised expand() output, a distinct trigger from the compiled
+        path's fused expand+sum kernel, so it needs its own check."""
+        x_cpu = torch.randint(-3, 4, (70,), dtype=torch.int32).to(torch.float16)
+        x = x_cpu.to("spyre")
+        actual = x.expand(2, 32, 70).sum(dim=-1).cpu().float()
+        expected = x_cpu.float().expand(2, 32, 70).sum(dim=-1)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_d2h_copy_of_strided_slice(self):
         """D2H of a strided slice (e.g. t[::2]) must produce the slice's

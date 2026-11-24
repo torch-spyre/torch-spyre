@@ -25,7 +25,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
+import pytest
 import sympy
+import torch
 from unittest import TestCase, mock
 
 from torch_spyre._inductor import config
@@ -35,7 +37,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _coarse_tile_loop_trip_count,
     _lx_planning_size,
 )
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -49,6 +51,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
+from utils_inductor import cached_randn, compare_with_cpu
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -274,7 +277,7 @@ class TestCoarseTileLoopTripCount(TestCase):
 
     @staticmethod
     def _tiled(loop_count):
-        return CoarseTileInfo(
+        return LoopMember(
             loop_group_id=(0,) * len(loop_count),
             loop_count=loop_count,
             loop_tiled_dims=[[] for _ in loop_count],
@@ -282,15 +285,15 @@ class TestCoarseTileLoopTripCount(TestCase):
         )
 
     def test_untiled_op_is_one_trip(self):
-        op = types.SimpleNamespace(loop_info=None)
+        op = types.SimpleNamespace(loop_member=None)
         self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
 
     def test_single_level_concrete_count(self):
-        op = types.SimpleNamespace(loop_info=self._tiled([4]))
+        op = types.SimpleNamespace(loop_member=self._tiled([4]))
         self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
 
     def test_nested_levels_multiply(self):
-        op = types.SimpleNamespace(loop_info=self._tiled([2, 4]))
+        op = types.SimpleNamespace(loop_member=self._tiled([2, 4]))
         self.assertEqual(_coarse_tile_loop_trip_count(op), 8)
 
     _UNRESOLVED = mock.patch(
@@ -303,7 +306,7 @@ class TestCoarseTileLoopTripCount(TestCase):
         one trip, not propagated as a symbol into RelayoutCandidate.cost_ns
         (a float consumed by min()/round() in the solver)."""
         n = sympy.Symbol("n", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([n]))
+        op = types.SimpleNamespace(loop_member=self._tiled([n]))
         with self._UNRESOLVED:
             self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
 
@@ -324,7 +327,7 @@ class TestCoarseTileLoopTripCount(TestCase):
 
     def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
         n = sympy.Symbol("n", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
+        op = types.SimpleNamespace(loop_member=self._tiled([n, 4]))
         with self._UNRESOLVED:
             self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
 
@@ -332,7 +335,7 @@ class TestCoarseTileLoopTripCount(TestCase):
         """An unbacked count is one trip, not the unbacked-symint fallback hint
         that concretize_expr would return."""
         u = sympy.Symbol("u0", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([u // 8, 4]))
+        op = types.SimpleNamespace(loop_member=self._tiled([u // 8, 4]))
         with mock.patch(
             "torch_spyre._inductor.pass_utils.concretize_expr", return_value=1024
         ) as concretize:
@@ -343,7 +346,7 @@ class TestCoarseTileLoopTripCount(TestCase):
         """A symbolic count that concretize_expr resolves (the declared maximum
         or the hint) is priced at that value, not as one trip."""
         n = sympy.Symbol("n", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([n // 8, 2]))
+        op = types.SimpleNamespace(loop_member=self._tiled([n // 8, 2]))
         with mock.patch(
             "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
         ):
@@ -354,7 +357,7 @@ class TestCoarseTileLoopTripCount(TestCase):
         from torch_spyre._inductor.cost_features import _loop_features
 
         n = sympy.Symbol("n", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([n // 8]))
+        op = types.SimpleNamespace(loop_member=self._tiled([n // 8]))
         with mock.patch(
             "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
         ):
@@ -3165,6 +3168,138 @@ class TestTopologicalSort(TestCase):
             self._names([root, mid, a, b], lambda buf: -buf.size),
             ["root", "mid", "b", "a"],
         )
+
+
+@pytest.mark.skipif(
+    not _HAS_ORTOOLS, reason="default cpsat layout_solver needs ortools"
+)
+class TestPerCoreViewFrameMismatch:
+    """Regression coverage for #3084's per-core view frame-consistency fix
+    in pass_utils.py (writer/reader of the same buffer compared in
+    inconsistent logical-vs-tiled frames). Exercises current behavior."""
+
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
+
+    def test_matmul_k_split_output_feeds_second_op_multicore(self):
+        m, k, n = 64, 128, 64
+
+        def matmul_then_scale(a, b, scale):
+            mm = torch.matmul(a, b)
+            return mm * scale + mm
+
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        scale = cached_randn((1,), differentiation=2)
+
+        with config.patch(
+            {"lx_planning": True, "allow_all_ops_in_lx_planning": True, "sencores": 8}
+        ):
+            compare_with_cpu(matmul_then_scale, a, b, scale)
+
+    def test_batched_matmul_k_split_feeds_reduction(self):
+        b, m, k, n = 2, 32, 64, 32
+
+        def bmm_then_reduce(x, y):
+            mm = torch.matmul(x, y)
+            return mm.sum(dim=-1) + mm.sum(dim=-2).sum(dim=-1, keepdim=True)
+
+        x = cached_randn((b, m, k))
+        y = cached_randn((b, k, n), differentiation=1)
+
+        with config.patch(
+            {"lx_planning": True, "allow_all_ops_in_lx_planning": True, "sencores": 8}
+        ):
+            compare_with_cpu(bmm_then_reduce, x, y)
+
+
+@pytest.mark.skipif(
+    not _HAS_ORTOOLS, reason="default cpsat layout_solver needs ortools"
+)
+class TestPerCoreViewFrameMismatchExtended:
+    """Extends TestPerCoreViewFrameMismatch with a wider sencores sweep,
+    including sencores=1 to cover _per_core_view_on_buf's single-core
+    path."""
+
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
+
+    @pytest.mark.parametrize(
+        "m,k,n,sencores",
+        [
+            (64, 128, 64, 1),
+            (64, 128, 64, 4),
+            (64, 128, 64, 8),
+            (128, 256, 128, 8),
+            (32, 64, 32, 4),
+            (128, 128, 128, 16),
+        ],
+    )
+    def test_matmul_k_split_feeds_pointwise_consumer(self, m, k, n, sencores):
+        def matmul_then_scale(a, b, scale):
+            mm = torch.matmul(a, b)
+            return mm * scale + mm
+
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        scale = cached_randn((1,), differentiation=2)
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(matmul_then_scale, a, b, scale)
+
+    @pytest.mark.parametrize(
+        "b,m,k,n,sencores",
+        [
+            (2, 32, 64, 32, 1),
+            (2, 32, 64, 32, 4),
+            (2, 32, 64, 32, 8),
+            (4, 16, 32, 16, 4),
+        ],
+    )
+    def test_batched_matmul_k_split_feeds_reduction(self, b, m, k, n, sencores):
+        def bmm_then_reduce(x, y):
+            mm = torch.matmul(x, y)
+            return mm.sum(dim=-1) + mm.sum(dim=-2).sum(dim=-1, keepdim=True)
+
+        x = cached_randn((b, m, k))
+        y = cached_randn((b, k, n), differentiation=1)
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(bmm_then_reduce, x, y)
+
+    @pytest.mark.parametrize(
+        "m,k,n,sencores",
+        [(64, 64, 64, 1), (64, 64, 64, 4), (64, 64, 64, 8)],
+    )
+    def test_matmul_output_feeds_second_matmul(self, m, k, n, sencores):
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        c = cached_randn((n, m), differentiation=2)
+
+        def chained_matmul(x, y, z):
+            mid = torch.matmul(x, y)
+            return torch.matmul(mid, z) + mid.sum()
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(chained_matmul, a, b, c)
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat inv-scale tests need ortools")

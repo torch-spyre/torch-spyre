@@ -44,6 +44,7 @@ from torch.testing._internal.common_utils import (
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
+from torch_spyre._inductor.codegen import superdsc
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
@@ -968,57 +969,17 @@ class TestInsertPaddingIR(unittest.TestCase):
     def test_padded_read_step_shared_by_two_dims_is_rejected(self) -> None:
         """A per-trip step that two non-trivial dims of y could own is an error.
 
-        The stamped step is a stride of y's layout; when two dims of size above one
-        share it, there is no telling which one the loop walks, and re-striding the
+        The step is a stride of y's layout; when two dims of size above one share
+        it, there is no telling which one the loop walks, and re-striding the
         wrong one would read the wrong place after the first trip.  It must raise
         rather than leave the unpadded step in place (#5573).
         """
-        from torch._inductor.ir import FixedLayout
-
         from torch_spyre._inductor.errors import Unsupported
-        from torch_spyre._inductor.padding import (
-            _refresh_loop_advance_for_padded_read,
-        )
-
-        class _Buf:
-            def __init__(self, name, size, stride):
-                self._name = name
-                self._layout = FixedLayout(
-                    torch.device("cpu"), torch.float16, size, stride
-                )
-
-            def get_name(self):
-                return self._name
-
-            def get_layout(self):
-                return self._layout
+        from torch_spyre._inductor.padding import restride_loop_step
 
         # Two dims of size 2 and 3 share stride 4 (an overlapping view).
-        y = _Buf("y", [2, 3, 5], [4, 4, 1])
-        padded = _Buf("y_padded", [2, 3, 8], [24, 8, 1])
-
-        from torch_spyre._inductor.loop_info import CoarseTileInfo
-
-        info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[2],
-            loop_tiled_dims=[[]],
-            squeezed_advance_per_read=[[[(4, 1)]]],
-        )
-
-        class _Op:
-            loop_info = info
-
-            def get_read_writes(self):
-                from torch._inductor.dependencies import MemoryDep
-                import sympy
-
-                x = sympy.Symbol("d0")
-                dep = MemoryDep("y_padded", x, (x,), (6,))
-                return type("RW", (), {"reads": [dep]})()
-
         with self.assertRaisesRegex(Unsupported, "cannot tell which dim"):
-            _refresh_loop_advance_for_padded_read(_Op(), y, padded)
+            restride_loop_step(4, [2, 3, 5], [4, 4, 1], [24, 8, 1], "y")
 
     def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
         """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.
@@ -1077,6 +1038,99 @@ class TestInsertPaddingIR(unittest.TestCase):
         )
 
         torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.5, rtol=0.05)
+
+    def _assert_pads_y_operand(
+        self, ops: list[Operation], k: int, padded_size: list[int]
+    ) -> None:
+        """One matmul over K, reading one padded copy of y at ``padded_size``."""
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1, "Expected exactly one matmul op")
+        mm = matmuls[0]
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        self.assertEqual(int(reduction.reduction_ranges[0]), k)
+        padded = self._padded_buf_ops(self._ops_before(ops, mm))
+        self.assertEqual(len(padded), 1, "expected exactly one padded buffer")
+        self.assertEqual(
+            [int(s) for s in padded[0].get_size()],
+            padded_size,
+            "y is padded along its K in the operand's own shape",
+        )
+        self.assertIn(
+            padded[0].get_name(),
+            self.captured_read_names[mm.get_name()],
+            "the matmul must read the padded copy of y",
+        )
+
+    def test_y_view_folding_k_into_one_buffer_dim_pads_the_operand(self) -> None:
+        """y is ``b.view(B, G, N)`` of a ``[B, G * N]`` buffer, with K = G unaligned.
+
+        The view puts K inside one host dim of the buffer (coordinate ``n + N * k``),
+        so that dim is not K and cannot be padded to K_padded in place: it would be
+        "padded" from G * N down to K_padded.  The pass pads a copy of the operand
+        as the matmul reads it, ``[B, K_padded, N]``.
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        B, H, G, N = 4, 16, 2, 128
+        assert G % stick_size != 0
+
+        e_cpu = torch.zeros(H, G, dtype=dtype)
+        e_cpu[torch.arange(H), torch.arange(H) // (H // G)] = 1
+        b_cpu = torch.randn(B, G * N, dtype=dtype)
+
+        def fn(e, b):
+            return torch.matmul(e, torch.nn.functional.silu(b).view(B, G, N))
+
+        ops, result = self.compile_and_run(fn, (e_cpu.to("spyre"), b_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, G, [B, stick_size, N])
+        # The one-hot e copies one fp16 SiLU value into each output element.
+        expected = fn(e_cpu.float(), b_cpu.float())
+        torch.testing.assert_close(result.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_y_view_of_a_slice_folding_k_pads_the_operand(self) -> None:
+        """As above, with y a slice of a wider buffer: the ``B`` part of an in_proj's
+        ``[x | B | C]`` output.  K's coordinate also carries the slice offset
+        (``n + N * k + INNER``).
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        B, H, G, N, INNER = 4, 16, 2, 128, 1024
+        e_cpu = torch.zeros(H, G, dtype=dtype)
+        e_cpu[torch.arange(H), torch.arange(H) // (H // G)] = 1
+        xbc_cpu = torch.randn(B, INNER + 2 * G * N, dtype=dtype)
+
+        def fn(e, xbc):
+            _, b, _ = torch.nn.functional.silu(xbc).split([INNER, G * N, G * N], -1)
+            return torch.matmul(e, b.view(B, G, N))
+
+        ops, result = self.compile_and_run(fn, (e_cpu.to("spyre"), xbc_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, G, [B, stick_size, N])
+        expected = fn(e_cpu.float(), xbc_cpu.float())
+        torch.testing.assert_close(result.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_y_slice_along_k_pads_only_the_slice(self) -> None:
+        """``x @ w[:K]`` reads K rows of a weight with more than K_padded rows.
+
+        K's coordinate is K's own, but its host dim holds R > K_padded rows, so
+        padding that dim to K_padded would shrink it.  The pass pads a copy of the
+        ``[K, N]`` slice instead.
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        M, K, R, N = 55, 67, 200, 128
+        k_padded = K + stick_size - K % stick_size
+        assert K % stick_size != 0 and R > k_padded
+
+        x_cpu = torch.randn(M, K, dtype=dtype)
+        w_cpu = torch.randn(R, N, dtype=dtype)
+
+        def fn(x, w):
+            return x @ w[:K]
+
+        ops, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, K, [k_padded, N])
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
     def test_linear_unaligned_in_features(self) -> None:
         """``F.linear`` (bias included) compiles and is correct for unaligned
@@ -1474,6 +1528,186 @@ class TestMatmulPaddingNaN(unittest.TestCase):
         result = compiled(a_spyre, b_spyre)
         expected = fn(a_cpu, b_cpu)
         self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+
+# (activation shape, kernel shape) for each layout batchmatmul is lowered from.
+# N (the kernel's last dim) is never a multiple of the stick (64 elements at
+# fp16, 32 at fp32), so the kernel and the output carry padding columns.
+MATMUL_NAN_PAD_CASES = {
+    "2d": ((64, 128), (128, 100)),
+    "decode_m1": ((1, 256), (256, 438)),  # 7 sticks of N, split over cores
+    "n_below_stick": ((33, 64), (64, 10)),
+    "k_unaligned": ((64, 100), (100, 130)),  # K padded by copies, N masked
+    "3d": ((3, 64, 128), (3, 128, 100)),
+    "3d_shared_weight": ((3, 64, 128), (128, 100)),
+    "4d": ((2, 3, 64, 128), (2, 3, 128, 100)),
+    "4d_shared_weight": ((2, 3, 64, 128), (128, 100)),
+    "broadcast_activation_batch": ((1, 64, 128), (4, 128, 100)),
+    "broadcast_weight_batch": ((4, 64, 128), (1, 128, 100)),
+    "broadcast_heads": ((2, 1, 64, 128), (2, 3, 128, 100)),
+}
+
+MATMUL_NAN_PAD_CORES = [1, 4, 32]
+
+MATMUL_NAN_PAD_DTYPES = [torch.float16]
+
+# Reading back the padding of an M=1 output fails in the copy to the host (out
+# of bounds for its storage), so a padding check cannot see the decode case;
+# test_chained_matmul covers it through the visible values instead.
+# TODO: read back the M=1 padding and drop this exclusion.
+MATMUL_NAN_PAD_READBACK_CASES = [
+    case for case, (a_shape, _) in MATMUL_NAN_PAD_CASES.items() if a_shape[-2] != 1
+]
+
+
+def _stick_padded(n: int, dtype: torch.dtype) -> int:
+    elems = get_elem_in_stick(dtype)
+    return math.ceil(n / elems) * elems
+
+
+def _nan_padded_kernel(
+    shape: tuple[int, ...], dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A spyre kernel of ``shape`` whose padding columns hold NaN.
+
+    The tensor is built on the host at the stick-padded width with NaN past the
+    logical N, copied to the device and reinterpreted at ``shape``, so the NaN
+    sits in the device padding. Returns the device tensor and its CPU values.
+    """
+    *lead, k, n = shape
+    full = torch.randn(*lead, k, _stick_padded(n, dtype), dtype=dtype)
+    full[..., n:] = float("nan")
+    device = try_reinterpret_host_shape(full.to("spyre"), [*lead, k, n])
+    return device, full[..., :n].clone()
+
+
+@instantiate_parametrized_tests
+class TestMatmulCoordinateMaskingNaN(unittest.TestCase):
+    """A matmul masks its kernel's padding columns, so NaN there stays out.
+
+    The kernel's padding columns only reach the output's padding columns, so a
+    lone matmul shows correct values with or without the mask. Without it the
+    output padding is NaN, though, and a consumer that reads it, such as a
+    matmul taking the output as its activation (N becomes its K), returns NaN.
+    Each test fails without the mask in ``_get_matmul_coordinate_mask``.
+    """
+
+    def setUp(self) -> None:
+        # Every parametrization compiles the same code object, and Dynamo's
+        # guards do not cover the Spyre config: without a reset, a run with
+        # other sencores/lx_planning would reuse the first run's kernels.
+        torch._dynamo.reset()
+
+    def _assert_close_to_cpu(self, result: torch.Tensor, expected: torch.Tensor):
+        result_cpu = result.cpu()
+        self.assertFalse(
+            result_cpu.isnan().any().item(), "compiled Spyre output contains NaN"
+        )
+        # fp16 accumulation on the device against an fp32 reference: the
+        # error stays below 0.5% of the output's magnitude on these shapes, so
+        # 1% bounds it without hiding a wrong column.
+        scale = expected.abs().max().item()
+        torch.testing.assert_close(
+            result_cpu.float(), expected, rtol=1e-2, atol=1e-2 * scale
+        )
+
+    def _assert_padding_is_zero(self, result: torch.Tensor):
+        *lead, n = result.shape
+        full = try_reinterpret_host_shape(
+            result, [*lead, _stick_padded(n, result.dtype)]
+        ).cpu()
+        padding = full[..., n:]
+        self.assertTrue(
+            (padding == 0).all().item(),
+            f"output padding is not 0 (masked to 0): {padding.unique()}",
+        )
+
+    @parametrize("dtype", MATMUL_NAN_PAD_DTYPES)
+    @parametrize("cores", MATMUL_NAN_PAD_CORES)
+    @parametrize("kernel", ["graph_input", "computed_hbm", "computed_lx"])
+    @parametrize("case", MATMUL_NAN_PAD_READBACK_CASES)
+    def test_padded_kernel_columns(self, case, kernel, cores, dtype) -> None:
+        a_shape, w_shape = MATMUL_NAN_PAD_CASES[case]
+        torch.manual_seed(0)
+        a_cpu = torch.randn(a_shape, dtype=dtype)
+        w_spyre, w_cpu = _nan_padded_kernel(w_shape, dtype)
+
+        if kernel == "graph_input":
+
+            def fn(x, w):
+                return x @ w
+
+        else:
+            # The kernel and the output are intermediates, which LX planning
+            # places in LX; the pointwise ops carry the padding through as is.
+            def fn(x, w):
+                return (x @ (w * 2)) * 0.5
+
+        placements: list[dict[str, str]] = []
+        real_parse_op_spec = superdsc.parse_op_spec
+
+        def record_placements(*args, **kwargs):
+            spec, mapping = real_parse_op_spec(*args, **kwargs)
+            if spec.opfunc == BATCH_MATMUL_OP:
+                placements.append(
+                    {
+                        role: next(iter(arg.allocation))
+                        for role, arg in zip(("kernel", "output"), spec.args[1:])
+                    }
+                )
+            return spec, mapping
+
+        with (
+            ts_inductor_config.patch(
+                {"sencores": cores, "lx_planning": kernel == "computed_lx"}
+            ),
+            # A compile served from the FX graph cache skips codegen, so the
+            # placements would not be recorded.
+            t_inductor_config.patch(force_disable_caches=True),
+            patch.object(superdsc, "parse_op_spec", side_effect=record_placements),
+        ):
+            result = torch.compile(fn, fullgraph=True, dynamic=False)(
+                a_cpu.to("spyre"), w_spyre
+            )
+
+        self.assertTrue(placements, "no batchmatmul was compiled")
+        if kernel == "computed_lx":
+            self.assertTrue(
+                any("lx" in p.values() for p in placements),
+                f"no matmul kernel or output was placed in LX: {placements}",
+            )
+        else:
+            self.assertTrue(
+                all("lx" not in p.values() for p in placements),
+                f"a matmul kernel or output was placed in LX: {placements}",
+            )
+        self._assert_close_to_cpu(result, fn(a_cpu.float(), w_cpu.float()))
+        self._assert_padding_is_zero(result)
+
+    @parametrize("dtype", MATMUL_NAN_PAD_DTYPES)
+    @parametrize("cores", MATMUL_NAN_PAD_CORES)
+    @parametrize("memory", ["hbm", "lx"])
+    @parametrize("case", list(MATMUL_NAN_PAD_CASES))
+    def test_chained_matmul(self, case, memory, cores, dtype) -> None:
+        """``(x @ w) @ y``: the first output's padding becomes the second K."""
+        a_shape, w_shape = MATMUL_NAN_PAD_CASES[case]
+        torch.manual_seed(0)
+        a_cpu = torch.randn(a_shape, dtype=dtype)
+        w_spyre, w_cpu = _nan_padded_kernel(w_shape, dtype)
+        y_cpu = torch.randn(w_shape[-1], 64, dtype=dtype)
+
+        def fn(x, w, y):
+            return (x @ w) @ y
+
+        with ts_inductor_config.patch(
+            {"sencores": cores, "lx_planning": memory == "lx"}
+        ):
+            result = torch.compile(fn, fullgraph=True, dynamic=False)(
+                a_cpu.to("spyre"), w_spyre, y_cpu.to("spyre")
+            )
+        self._assert_close_to_cpu(
+            result, fn(a_cpu.float(), w_cpu.float(), y_cpu.float())
+        )
 
 
 if __name__ == "__main__":

@@ -50,8 +50,6 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
-import dataclasses
-
 import sympy
 import torch
 from sympy import Expr
@@ -66,6 +64,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
@@ -74,6 +73,8 @@ from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
+from .loop_facts import enclosing_loops, is_looped, read_advances_anywhere
+from .loop_node import move_before, record_member
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -91,6 +92,7 @@ from .pass_utils import (
     prepend_dim_valid_elements,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
+    try_device_coordinates,
 )
 from .views import compute_coordinates, matching_dim
 from torch_spyre._C import (
@@ -125,10 +127,7 @@ def _move_ops_before(
     topological order is preserved.
     """
     for o in new_ops:
-        operations.remove(o)
-    idx = operations.index(anchor)
-    for i, o in enumerate(new_ops):
-        operations.insert(idx + i, o)
+        move_before(operations, anchor, o)
 
 
 def restride_loop_step(
@@ -203,6 +202,7 @@ class _PaddedLoadHandler(WrapperHandler):
         padded_indexer,
         var_ranges: dict,
         padded_stride: list[int],
+        orig_offset: int = 0,
     ):
         super().__init__(inner)
         self._orig_name = orig_name
@@ -212,11 +212,14 @@ class _PaddedLoadHandler(WrapperHandler):
         self._padded_indexer = padded_indexer
         self._var_ranges = var_ranges
         self._padded_stride = padded_stride
+        self._orig_offset = orig_offset
 
     def load(self, name, index):
         if name != self._orig_name:
             return super().load(name, index)
         index = concretize_index(sympy.sympify(index), set(self._var_ranges))
+        # A view's coordinates start at its layout's offset (0 for a buffer).
+        index = index - self._orig_offset
         # A loop induction variable is not an iteration variable of this op, so
         # ``compute_coordinates`` cannot place it and would drop the term; the
         # padded read would then read tile 0 on every trip. Take the term out,
@@ -241,7 +244,7 @@ class _PaddedLoadHandler(WrapperHandler):
 
 def _rebuild_matmul(
     op: ComputedBuffer,
-    y_buf: Buffer,
+    y_buf: Buffer | ReinterpretView,
     y_padded_buf: Buffer,
     operations: list[Operation],
 ) -> ComputedBuffer:
@@ -258,6 +261,9 @@ def _rebuild_matmul(
     read-copy buffer for a loop-invariant y can be transposed and column-major
     (see test_bmm_invariant_y_unaligned_k_pads_for_each_tile).  Re-striding the live load
     index covers all of these without knowing which position K occupies.
+
+    ``y_buf`` may be a ``ReinterpretView`` of y's buffer (``_y_read_view``): the
+    load index is then decomposed against the view's size, stride and offset.
     """
     reduction = op.data
     assert isinstance(reduction, Reduction)
@@ -267,6 +273,7 @@ def _rebuild_matmul(
     y_layout = y_buf.get_layout()
     y_size = [concretize_expr(s) for s in y_layout.size]
     y_stride = [concretize_expr(s) for s in y_layout.stride]
+    y_offset = concretize_expr(y_layout.offset)
     padded_name = y_padded_buf.get_name()
     padded_indexer = y_padded_buf.get_layout().make_indexer()
     y_padded_stride = [concretize_expr(s) for s in y_padded_buf.get_layout().stride]
@@ -297,6 +304,7 @@ def _rebuild_matmul(
             padded_indexer,
             var_ranges,
             y_padded_stride,
+            y_offset,
         )
         with V.set_ops_handler(handler):
             return _orig_inner_fn(index, reduction_index)
@@ -313,74 +321,86 @@ def _rebuild_matmul(
     )
 
 
-def _refresh_loop_advance_for_padded_read(
-    op: ComputedBuffer, y_buf: Buffer, y_padded_buf: Buffer
-) -> None:
-    """Re-stride the per-trip step of the read that now targets the padded y.
+def _k_owns_host_dim(
+    coord: Expr, dim_size: int, reduction_var, k_val: int, op_vars: set
+) -> bool:
+    """Whether y's buffer holds K as one whole host dim, so padding that dim pads K.
 
-    ``splice_while_loops`` stamps ``squeezed_advance_per_read`` before padding,
-    as the loop variable's coefficient in the read of y, which is a stride of
-    y's own layout.  Padding retargets that read to a buffer whose K is larger,
-    so the stride of every dim outside K grows (for example the per-expert stride
-    of a tiled weight, 67 * 128 to 128 * 128).  The stamped step would walk the
-    padded buffer by the unpadded stride, and every trip after the first would
-    read the wrong place (#5573).
-
-    A step that is the stride of one dim of y becomes that dim's stride in the
-    padded buffer.  A step that is no dim's stride is left alone.  A step shared by
-    several dims of size above one cannot be mapped, and raises ``Unsupported``
-    rather than leave a step that would silently read the wrong place.
+    K's host coordinate must be the reduction variable alone, over a dim of exactly
+    K.  Otherwise the matmul reads y through a view, and growing that dim to
+    K_padded pads the wrong thing: a view that folds K into a wider dim
+    (``n + N * k``, a ``[B, G * N]`` buffer read as ``[B, G, N]``) or a dim with
+    more than K rows (a slice along K) would be shrunk, or would keep rows past K
+    in the padded reduction.  A coordinate with symbols that are not the op's own
+    is left to the in-place padding.
     """
-    info = getattr(op, "loop_info", None)
-    if info is None or not info.squeezed_advance_per_read:
-        return
-    old_size = [concretize_expr(s) for s in y_buf.get_layout().size]
-    old_stride = [concretize_expr(s) for s in y_buf.get_layout().stride]
-    new_stride = [concretize_expr(s) for s in y_padded_buf.get_layout().stride]
-    if len(old_stride) != len(new_stride):
-        return
-    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-    squeezed = [
-        [list(level) for level in per_read]
-        for per_read in info.squeezed_advance_per_read
-    ]
-    changed = False
-    for idx, dep in enumerate(reads):
-        if dep.name != y_padded_buf.get_name() or idx >= len(squeezed):
-            continue
-        for level in squeezed[idx]:
-            for pos, (step, extent) in enumerate(level):
-                # The same rule the index uses (_PaddedLoadHandler), so the two
-                # sources of the advance cannot disagree until the record is gone.
-                new_step = restride_loop_step(
-                    step, old_size, old_stride, new_stride, y_buf.get_name()
-                )
-                if new_step != step:
-                    level[pos] = (new_step, extent)
-                    changed = True
-    if changed:
-        op.loop_info = dataclasses.replace(info, squeezed_advance_per_read=squeezed)
+    if coord.free_symbols - op_vars:
+        return True
+    return sympy.expand(coord - reduction_var) == 0 and dim_size == k_val
 
 
-def _loop_info_without_advance(info, new_op):
-    """Loop group membership of ``info`` with no per-trip advance on ``new_op``.
+def _read_advances_per_trip(op: ComputedBuffer, dep: MemoryDep) -> bool:
+    """Whether a for_each_tile loop around ``op`` moves its ``dep`` read every trip.
 
-    ``tiled_dims_per_read`` and ``squeezed_advance_per_read`` are positional in the
-    op's own reads.  A padding op reads different buffers than the matmul it pads
-    for, so the matmul's records would land on the wrong reads (for example the
-    tiled ``x``'s advance on the loop-invariant ``y`` being padded).  The padding
-    op re-runs identical work every trip, so it advances nothing.
+    The padding ops do not advance (they read ``y`` at a fixed address), so a padded
+    copy of such a read would pad the first trip's tile on every trip.
     """
-    n_reads = len([d for d in new_op.get_read_writes().reads if hasattr(d, "name")])
-    levels = len(info.loop_count)
-    return dataclasses.replace(
-        info,
-        tiled_dims_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
-        output_tiled_dims=[[] for _ in range(levels)],
-        squeezed_advance_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
-        squeezed_advance_output=[[] for _ in range(levels)],
-        propagation=None,
+    return read_advances_anywhere(op, dep)
+
+
+def _y_read_view(
+    op: ComputedBuffer, y_buf: Buffer, y_dep: MemoryDep, reduction_var, k_val: int
+) -> tuple[ReinterpretView, int]:
+    """The elements of ``y_buf`` the matmul reads, as a view of it, and its K dim.
+
+    The read index is ``offset + sum(stride * var)`` over the matmul's own variables,
+    which is the view: one dim per variable, over the variable's range, with its
+    coefficient as stride.  The dims are ordered by stride, outermost first, so a
+    copy of the view keeps ``y_buf``'s element order.  K is the dim of
+    ``reduction_var``.  A read that is not a view of distinct elements (a floor-div
+    or modulo index, a stride that is not a positive integer, overlapping dims)
+    raises ``Unsupported``.
+    """
+    ranges = dict(y_dep.ranges)
+    index = concretize_index(sympy.sympify(y_dep.index), set(ranges))
+    for symbol in loop_induction_symbols(index, ranges):
+        index = index - index.coeff(symbol) * symbol
+    index = sympy.expand(index)
+    variables = [v for v in ranges if v in index.free_symbols]
+    strides = {v: index.coeff(v) for v in variables}
+    offset = sympy.expand(index - sum(strides[v] * v for v in variables))
+
+    def unsupported(reason: str) -> Unsupported:
+        return Unsupported(
+            f"insert_bmm_padding: {op.get_name()} reads {y_buf.get_name()} at "
+            f"{y_dep.index}, {reason}"
+        )
+
+    if not (
+        offset.is_Integer
+        and offset >= 0
+        and all(st.is_Integer and st > 0 for st in strides.values())
+    ):
+        raise unsupported("which is not offset + stride * variable")
+    if reduction_var not in strides or concretize_expr(ranges[reduction_var]) != k_val:
+        raise unsupported(f"which does not read K={k_val} along {reduction_var}")
+    dims = sorted(variables, key=lambda v: strides[v], reverse=True)
+    size = [concretize_expr(ranges[v]) for v in dims]
+    stride = [int(strides[v]) for v in dims]
+    # Distinct elements: each dim's stride steps past everything the inner dims reach.
+    reach = 1
+    for st, n in zip(reversed(stride), reversed(size)):
+        if st < reach:
+            raise unsupported("whose dims overlap")
+        reach += st * (n - 1)
+    layout = FixedLayout(
+        y_buf.get_device(),
+        y_buf.get_dtype(),
+        [sympy.Integer(n) for n in size],
+        [sympy.Integer(st) for st in stride],
+        sympy.Integer(int(offset)),
     )
+    return ReinterpretView(data=y_buf, layout=layout), dims.index(reduction_var)
 
 
 def insert_bmm_padding(graph: GraphLowering) -> None:
@@ -398,6 +418,12 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
     generated_dim definition: y is the input whose index contains a symbol
     present in the output but absent from x (N).  This handles M==K==N and
     M=1 (decode phase) correctly.
+
+    y's buffer is padded in place when it holds K as one whole host dim.  When the
+    matmul reads it through a view that does not (a reshape folding K into a
+    wider dim, or a slice along K; see ``_k_owns_host_dim``), the padded buffer is
+    a copy of the elements the matmul reads, in y's element order, with K padded
+    (``_y_read_view``), unless a for_each_tile loop moves that read every trip.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -442,6 +468,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # y's K host dim: the dim whose host coordinate contains reduction_var.
         y_buf_tmp = graph.get_buffer(y_dep.name)
         y_host_k_dim: int | None = None
+        y_h_coords: list[Expr] = []
         if y_buf_tmp is not None and isinstance(y_buf_tmp.get_layout(), FixedLayout):
             y_h_coords = host_coordinates(y_buf_tmp.get_layout(), y_dep, None)
             y_host_k_dim = next(
@@ -452,6 +479,24 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
                 ),
                 None,
             )
+
+        # When y's buffer does not hold K as one whole host dim, pad a copy of what
+        # the matmul reads instead.  A read that a loop moves every trip keeps the
+        # in-place padding.
+        y_read: ReinterpretView | None = None
+        y_read_k_dim = 0
+        if y_host_k_dim is not None and not _read_advances_per_trip(op, y_dep):
+            assert y_buf_tmp is not None
+            if not _k_owns_host_dim(
+                y_h_coords[y_host_k_dim],
+                concretize_expr(y_buf_tmp.get_layout().size[y_host_k_dim]),
+                reduction_var,
+                k_val,
+                set(y_dep.ranges),
+            ):
+                y_read, y_read_k_dim = _y_read_view(
+                    op, y_buf_tmp, y_dep, reduction_var, k_val
+                )
 
         x_name = x_dep.name
         y_name = y_dep.name
@@ -485,15 +530,22 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # lower_pad_sequence builds the padded buffer at K_padded host size;
         # reduction_ranges is NOT changed.  superdsc._extend_matmul_k_to_padded
         # widens sdsc_iteration_space[K] to K_padded at SDSC codegen time.
-        y_size = [concretize_expr(s) for s in y_buf.get_size()]
-        if y_host_k_dim is None:
+        # y as it is padded and redirected: its buffer, or the part of it the
+        # matmul reads when the buffer does not hold K as one whole dim.
+        y_src: Buffer | ReinterpretView = y_buf if y_read is None else y_read
+        y_size = [concretize_expr(s) for s in y_src.get_size()]
+        if y_read is not None:
+            y_k_dim = y_read_k_dim
+        elif y_host_k_dim is None:
             y_k_dim = len(y_size) - 2
         else:
             y_k_dim = y_host_k_dim
         y_padded_size = list(y_size)
         y_padded_size[y_k_dim] = k_padded
         patch_env(V.graph)
-        y_fx_node = find_fx_node(y_name, V.graph)
+        # A view is padded from the view itself: an FX node for the buffer would
+        # pad the whole buffer.
+        y_fx_node = None if y_read is not None else find_fx_node(y_name, V.graph)
 
         # No orig_stl: this pass runs before stickification, so the new ops keep
         # host FixedLayouts and propagate_spyre_tensor_layouts lays them out.
@@ -504,7 +556,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             dtype=dtype,
             dim=y_k_dim,
             insert_before=matmul_fx_node,
-            arg_buf=y_buf if y_fx_node is None else None,
+            arg_buf=y_src if y_fx_node is None else None,
         )
 
         # --- Relocate new ops before the matmul ---
@@ -512,20 +564,30 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         _move_ops_before(operations, y_new_ops, op)
 
         # When coarse-tiling runs pre-stickification, the consuming matmul
-        # already carries loop_info.  The padding ops must inherit it so they
-        # remain contiguous in the loop group for build_loop_scheduler_nodes.
-        if hasattr(op, "loop_info"):
+        # already sits in a loop.  The padding ops must join it so they remain
+        # contiguous in the loop group.
+        if is_looped(op):
+            levels = enclosing_loops(op)
             for new_op in y_new_ops:
                 if isinstance(new_op, ComputedBuffer):
-                    new_op.loop_info = _loop_info_without_advance(  # type: ignore[attr-defined]
-                        op.loop_info, new_op
+                    # The padding op re-runs identical work every trip and reads y
+                    # at a fixed address, so its index has no loop term.
+                    # TODO(#5863 8.3): like the restickify copy of #6277, this
+                    # loop-invariant copy inherits the matmul's loop_tiled_dims, which
+                    # are indexed against the matmul's dims, not the copy's; clear them
+                    # (or place the copy before the node) when padding is node-aware.
+                    record_member(
+                        new_op,
+                        [
+                            (level.tiled_dims, level.tiled_reduction_dims)
+                            for level in levels
+                        ],
                     )
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
         # preserved as-is.  Only y's loads are redirected to the padded buffer.
-        new_op = _rebuild_matmul(op, y_buf, y_padded_buf, operations)
-        _refresh_loop_advance_for_padded_read(new_op, y_buf, y_padded_buf)
+        _rebuild_matmul(op, y_src, y_padded_buf, operations)
 
 
 # --------------------------------------------------------------------------- #
@@ -637,11 +699,21 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     ``_restickify_restore_elided_dim`` that the padding pass added the gap dim,
     which it never did.
 
-    Only a restickify with exactly one elided operand counts: that is the case the
-    codegen assert covers (one operand's within-stick coordinate has no loop
-    symbol).  When both operands carry one, the restore is a no-op and the slice
-    write compiles correctly (``torch.cat([a, b], -1).sum(-1)`` on
-    ``(32, 8, 16, 1)``, or the copy-back into a mutated graph input).
+    Two shapes of restickify reach the raise.  One operand elided (exactly one
+    within-stick coordinate is symbol-free) is the case the codegen assert covers,
+    and it raises wherever it appears, as on main.  The two coordinates on
+    different dims is what a dense stick relocation produces, and it raises only
+    when the write really is into a sub-range of the target: a cat operand covers
+    ``[1, 80, 6400]`` of a ``[1, 80, 8400]`` buffer, where the old-stick dim
+    cannot be padded in place.
+
+    A write that covers the whole target is not a slice and compiles, even with
+    the two coordinates on different dims -- a copy-back into a mutated graph
+    input whose target layout is transposed covers ``[64, 64]`` of ``[64, 64]``.
+    Raising unconditionally instead broke exactly that
+    (``test_infeasible_target_layout_preserves_copy_back``), while narrowing it to
+    the elided case let a relocated write into a cat slice through, where codegen
+    emitted wrong addresses rather than raising.
 
     TODO(#6163): restickify into a fresh buffer sized to a stick multiple, then
     copy it into the slice (see the TODO in ``_pad_restickify_output``); then
@@ -657,16 +729,80 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     if in_dep is None or not isinstance(real, FixedTiledLayout):
         return
     write_dep = _write_dep(op)
-    in_coords = device_coordinates(in_layout.device_layout, in_dep)
-    out_coords = device_coordinates(real.device_layout, write_dep)
+    # This runs on every pointwise op with a mutation-layout output, which the
+    # padding pass never computed coordinates for before.  Probe rather than
+    # compute, so an unrepresentable coordinate leaves the op to fail with its
+    # own error instead of the generic one from here.  The trade-off: a sliced
+    # restickify whose coordinates cannot be represented on either side now
+    # skips this guard, and codegen reports it instead.  Layout selection
+    # rejects such a read before codegen, so nothing reaches here that way
+    # today; if that changes, the error moves rather than the behaviour.
+    in_coords = try_device_coordinates(in_layout.device_layout, in_dep, None)
+    out_coords = try_device_coordinates(real.device_layout, write_dep, None)
     if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):
         return
-    if bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols):
-        raise Unsupported(
-            f"insert_restickify_padding: restickify written into a slice of "
-            f"another buffer on {op.get_name()} (for example torch.cat of "
-            f"tensors that need a restickify) cannot be padded in place"
+    elided = bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols)
+    if not elided and _covers_whole_target(layout, real):
+        return
+    raise Unsupported(
+        f"insert_restickify_padding: restickify written into a slice of "
+        f"another buffer on {op.get_name()} (for example torch.cat of "
+        f"tensors that need a restickify) cannot be padded in place"
+    )
+
+
+def _covers_whole_target(
+    layout: MutationLayoutSHOULDREMOVE, real: FixedTiledLayout
+) -> bool:
+    """Whether the mutating write spans all of the buffer it writes into.
+
+    A cat operand writes a sub-range of the cat buffer and is a slice; a
+    copy-back into a mutated graph input writes the whole target and is not.
+
+    Element count, not the size list: a copy-back through a reshaped view of the
+    same storage (a ``(4096,)`` input mutated as ``x.view(64, 64)``) covers the
+    whole buffer with a different shape, and comparing size lists would call it a
+    slice and raise where main does not.
+
+    The offset comes from the view being mutated, not from ``layout``, whose own
+    offset ``MutationLayoutSHOULDREMOVE`` never sets: a same-sized write partway
+    into the target is still a slice. Anything that does not concretize is treated
+    as a slice, which keeps the raise rather than letting an unpadded write
+    through.
+    """
+
+    def numel(sizes) -> int:
+        n = 1
+        for s in sizes:
+            n *= int(concretize_expr(s))
+        return n
+
+    try:
+        if numel(layout.size) != numel(real.size):
+            return False
+        return int(concretize_expr(_mutated_view_offset(layout))) == int(
+            concretize_expr(real.offset)
         )
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _mutated_view_offset(layout: MutationLayoutSHOULDREMOVE) -> Expr:
+    """The storage offset of the view ``layout`` mutates.
+
+    ``layout.target`` is the mutated node: a ``StorageBox`` for a whole buffer, a
+    ``ReinterpretView`` for a slice of one, and the view's own layout carries the
+    offset that tells them apart.
+    """
+    target = getattr(layout, "target", None)
+    target_layout = (
+        target.get_layout()
+        if target is not None and hasattr(target, "get_layout")
+        else None
+    )
+    if target_layout is not None and hasattr(target_layout, "offset"):
+        return target_layout.offset
+    return getattr(layout, "offset", sympy.Integer(0))
 
 
 def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
@@ -1279,6 +1415,7 @@ def _pad_num_sticks(
             [new_num_sticks, *stl.device_size],
             [0, *stl.stride_map],
             stl.device_dtype,
+            prepend_dim_valid_elements(stl, 1),
             stl.element_arrangement,
         ),
     )

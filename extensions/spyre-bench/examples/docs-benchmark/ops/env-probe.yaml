@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: env-probe, owner: example-team, description: "shows what the command's environment holds"}
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: op-lib-cpu-fp32
+  workload: {type: kernel/op, op: probe, dtype: fp32, shape: [1], load: {executor: iterations, iterations: 1}}
+  run:
+    repeats: 1
+    timeout: 1m
+    command: ["{python}", "tools/show_env.py", "--token", "example-not-a-secret", "--raw", "{raw_dir}", "--out", "{repeat_dir}"]
+  variants:
+    - name: env_probe

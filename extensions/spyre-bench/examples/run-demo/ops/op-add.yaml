@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# `run.command` is an argv template: {case.*} values are resolved by plan, {python}, {raw_dir}, {repeat} and the other
+# run tokens by run.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: run-demo-fp16}
+spec: {type: kernel/op-library, backend: spyre, library: torch-spyre, precision: fp16, harness: harness-a, extensions: {spyre: {mode: a}}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-add}
+spec:
+  type: perf
+  level: kernel
+  tier: sanity
+  system: run-demo-fp16
+  workload: {type: kernel/op, op: add, dtype: fp16, shape: [1, 512], load: {executor: iterations, iterations: 100, warmup_iterations: 3}}
+  run:
+    repeats: 3
+    timeout: 5m
+    est: 1m
+    isolation: process
+    command: ["{python}", "stub_bench.py", "--op", "{case.op}", "--shape", "{case.shape}", "--raw", "{raw_dir}", "--repeat", "{repeat}", "--out", "{repeat_dir}"]
+  variants:
+    - name: op_add_fp16

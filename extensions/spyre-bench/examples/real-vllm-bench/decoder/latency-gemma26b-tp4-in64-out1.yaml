@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Shape of the producer's latency Benchmarks; the model and the test name are substituted.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: latency-gemma26b-tp4-in64-out1, description: 'one batch end to end (vllm bench latency)', owner: spyre-inference}
+spec:
+  type: perf
+  level: model
+  tier: extended
+  env: {DTLOG_LEVEL: error}
+  system: {type: llm/vllm, backend: spyre}
+  workload: {type: llm/latency}
+  run:
+    cache: warm
+    repeats: 1
+    command: [uv, run, --active, --no-sync, python3, .github/scripts/run_vllm_benchmarks.py, --configs-dir, vllm-benchmarks/benchmarks/spyre, --suite, nightly, --bench-types, latency, --tests, "{case}", --results-dir, "{raw_dir}"]
+  est_hours: 0.25
+  identity:
+    mode: ingest
+    profile: vllm
+    name: latency_gemma26b_tp4_in64_out1
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: run_mode, value: latency}
+      - {key: tensor_parallel, value: 4}
+      - {key: input_len, value: 64}
+      - {key: output_len, value: 1}
+  variants:
+    - name: latency_gemma26b_tp4_in64_out1
+      environment: spyre-4card
+      system: {type: llm/vllm, backend: spyre, token: gemma-4-26b-a4b-it, model: gemma-4-26b-a4b-it, precision: fp16, tp: 4, flags: {load-format: auto, max-model-len: 128}}
+      workload: {type: llm/latency, shape: {batch_size: 1, input_len: 64, output_len: 1}, load: {executor: iterations, iterations: 2, warmup_iterations: 1}}

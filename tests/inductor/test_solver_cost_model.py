@@ -257,8 +257,8 @@ def _issue_4387_matmul(cores, m_split, n_split, k_split):
     )
 
 
-def test_upstream_matmul_price_rejects_an_over_budget_split(monkeypatch):
-    monkeypatch.setattr(cost_model.config, "sencores", 32)
+@cost_model.config.patch(sencores=32)
+def test_upstream_matmul_price_rejects_an_over_budget_split():
     params = cost_model.CostParams(use_bundled_cost_model=False)
     priced = cost_model._matmul_ns_upstream([_issue_4387_matmul(32, 4, 4, 2)], params)
     assert priced > 0
@@ -267,8 +267,8 @@ def test_upstream_matmul_price_rejects_an_over_budget_split(monkeypatch):
 
 
 @pytest.mark.parametrize("infinity", [float("inf"), sympy.oo, sympy.zoo])
+@cost_model.config.patch(sencores=32)
 def test_upstream_matmul_price_rejects_a_symbolic_infinity(monkeypatch, infinity):
-    monkeypatch.setattr(cost_model.config, "sencores", 32)
     monkeypatch.setattr(
         cost_model, "_matmul_execution_cost", lambda *args, **kwargs: infinity
     )

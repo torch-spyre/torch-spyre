@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+# Where the shared vLLM benchmark bytes live. A definition names a variable, never a value: the
+# address and the credential are the launcher's business, so the same declaration works on a CI
+# runner, a dev pod and an air-gapped lab.
+apiVersion: bench/v1alpha1
+kind: Store
+metadata:
+  name: spyre-datasets
+  description: the curated dataset repository holding the recorded traces
+spec:
+  type: core/artifactory
+  endpoint: {env: ARTIFACTORY_BASE_URL}
+  root: {env: ARTIFACTORY_DATASETS_PATH}
+  auth: {mode: token, refs: [{env: ARTIFACTORY_TOKEN}]}
+  visibility: internal

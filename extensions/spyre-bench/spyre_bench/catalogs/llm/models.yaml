@@ -1,0 +1,115 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+# The models the shared vLLM benchmarks serve. A Model names its weights by role; `model_id` hashes
+# the (role, asset) set, so bumping a revision below starts a new benchmark rather than bending the
+# old trend line.
+#
+# A revision of all zeros next to `revision_pinned` is this repository's convention for "not pinned
+# yet" (the schema cannot say "unpinned" there); the annotation marks it and the runner lets the hub
+# resolve its default. Pinned revisions match the CI cache config, so an offline host already has them.
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: micro-g3.3-8b-instruct-1b, description: the small decoder the smoke cases use}
+spec:
+  assets: [{role: weights, asset: micro-g3.3-8b-instruct-1b-weights}]
+  family: granite
+  architecture: decoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-3.3-8b-instruct}
+spec:
+  assets: [{role: weights, asset: granite-3.3-8b-instruct-weights}]
+  family: granite
+  architecture: decoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-3.3-8b-instruct-fp8}
+spec:
+  assets: [{role: weights, asset: granite-3.3-8b-instruct-fp8-weights}]
+  family: granite
+  architecture: decoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-4.1-8b}
+spec:
+  assets: [{role: weights, asset: granite-4.1-8b-weights}]
+  family: granite
+  architecture: decoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-4.1-8b-fp8}
+spec:
+  assets: [{role: weights, asset: granite-4.1-8b-fp8-weights}]
+  family: granite
+  architecture: decoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: gemma-4-26b-a4b}
+spec:
+  assets: [{role: weights, asset: gemma-4-26b-a4b-weights}]
+  family: gemma
+  architecture: decoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: gemma-4-26b-a4b-it}
+spec:
+  assets: [{role: weights, asset: gemma-4-26b-a4b-it-weights}]
+  family: gemma
+  architecture: decoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: ministral-3-14b-instruct-bf16}
+spec:
+  assets: [{role: weights, asset: ministral-3-14b-instruct-bf16-weights}]
+  family: mistral
+  architecture: decoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-embedding-125m-english}
+spec:
+  assets: [{role: weights, asset: granite-embedding-125m-english-weights}]
+  family: granite
+  architecture: encoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-embedding-278m-multilingual}
+spec:
+  assets: [{role: weights, asset: granite-embedding-278m-multilingual-weights}]
+  family: granite
+  architecture: encoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: multilingual-e5-large}
+spec:
+  assets: [{role: weights, asset: multilingual-e5-large-weights}]
+  architecture: encoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: all-roberta-large-v1}
+spec:
+  assets: [{role: weights, asset: all-roberta-large-v1-weights}]
+  architecture: encoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: bge-reranker-v2-m3}
+spec:
+  assets: [{role: weights, asset: bge-reranker-v2-m3-weights}]
+  architecture: encoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: bge-reranker-large}
+spec:
+  assets: [{role: weights, asset: bge-reranker-large-weights}]
+  architecture: encoder-only
