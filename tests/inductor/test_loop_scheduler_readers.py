@@ -188,6 +188,34 @@ class TestFinalizer(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestPerPassDump(_Graph):
+    """The ``SPYRE_LOG_PASSES`` dump prints the real nested list."""
+
+    def _dump(self, graph, log_passes):
+        from torch_spyre._inductor import passes
+
+        with mock.patch.object(passes, "logger") as log:
+            log.isEnabledFor.return_value = True
+            with config.patch({"log_passes": log_passes}):
+                passes._log_after_pass(graph, "somepass")
+        return log.debug.call_args
+
+    def test_dump_indents_a_loops_body_under_its_node(self):
+        a = self._buf("a")
+        b = self._buf("b", reads="a", gid=(0,))
+        graph = self._graph([a, self._loop("loopnode0", [b])])
+        call = self._dump(graph, "somepass")
+        self.assertEqual(call.args[:2], ("AFTER %s\n%s", "somepass"))
+        text = call.args[2]
+        self.assertIn("loopnode0: LoopNode trip_count=4", text)
+        self.assertIn("\n  b: ComputedBuffer", text)
+        self.assertNotIn("\nb: ComputedBuffer", text)
+
+    def test_dump_is_off_for_a_pass_not_listed(self):
+        graph = self._graph([self._buf("a")])
+        self.assertIsNone(self._dump(graph, "other"))
+
+
 class TestFormatOperations(_Graph):
     def test_flat_list_output_is_unchanged(self):
         # The text a flat list printed before nodes existed: one entry per op,
