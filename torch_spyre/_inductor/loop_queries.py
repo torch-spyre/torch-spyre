@@ -43,7 +43,7 @@ from torch._inductor.ir import ExternKernel, Operation
 
 from .loop_facts import _in_built_node, pending_levels
 from .loop_node import LoopNode, OpsView
-from .pass_utils import trip_count_estimate
+from .pass_utils import op_read_writes, trip_count_estimate
 
 
 @dataclass(eq=False, frozen=True)
@@ -80,10 +80,25 @@ class _Leaf:
         self.loops = loops  # execution loops, outermost first
 
 
+class _BufferIndex:
+    """Per-buffer accesses, built once from the program on the first buffer query."""
+
+    __slots__ = ("uses", "readers", "intervals")
+
+    def __init__(self) -> None:
+        self.uses: dict[str, list[int]] = {}  # buffer -> sorted distinct times
+        self.readers: dict[str, list[Operation]] = {}  # each reading op once
+        self.intervals: dict[str, tuple[int, int] | None] = {}
+
+
 class LoopProgram:
     """The loop structure of a graph's operations, answered per op."""
 
     def __init__(self, source) -> None:
+        self._input_names: tuple[str, ...] = tuple(
+            getattr(source, "graph_input_names", ())
+        )
+        self._index: _BufferIndex | None = None
         if hasattr(source, "operations"):
             source = source.operations
         if isinstance(source, OpsView):
@@ -192,3 +207,77 @@ class LoopProgram:
         if loop is None:
             raise KeyError(node.get_name())
         return loop
+
+    # Buffer queries. The index is built lazily on the first one; it is a function
+    # of this program object only, so nothing outlives an edit of the graph.
+
+    def input_names(self) -> tuple[str, ...]:
+        return self._input_names
+
+    def _buffers(self) -> _BufferIndex:
+        if self._index is not None:
+            return self._index
+        index = _BufferIndex()
+        first: dict[str, tuple[int, Operation, bool]] = {}  # time, op, is a write
+        times: dict[str, set[int]] = {}
+        for leaf in self._leaves:
+            op = leaf.op
+            t = self.time(op)
+            rw = op_read_writes(op)
+            written = {d.name for d in rw.writes}
+            read = {d.name for d in rw.reads}
+            for name in written | read:
+                times.setdefault(name, set()).add(t)
+                # A write wins a tie: an op that updates a buffer in place makes it.
+                cur = first.get(name)
+                if cur is None or t < cur[0]:
+                    first[name] = (t, op, name in written)
+            for name in read:
+                index.readers.setdefault(name, []).append(op)
+        for name in self._input_names:
+            times.setdefault(name, set())
+        index.uses = {name: sorted(ts) for name, ts in times.items()}
+        carried: dict[str, list[Loop]] = {}
+        for loop in self._node_loops.values():
+            assert loop.node is not None
+            for carry in loop.node.carries:
+                carried.setdefault(carry.storage_name, []).append(loop)
+        for name, ts in index.uses.items():
+            if not ts:
+                index.intervals[name] = None
+                continue
+            lo, hi = ts[0], ts[-1]
+            _, writer, wrote = first[name]
+            birth = self._leaf(writer).loops if wrote else ()
+            widen = list(carried.get(name, ()))
+            for op in index.readers.get(name, ()):
+                for loop in self._leaf(op).loops:
+                    if not any(loop is b for b in birth):
+                        widen.append(loop)
+                        break  # outermost loop that holds the read, not the birth
+            for loop in widen:
+                span = self.span(loop)
+                if span is not None:
+                    lo, hi = min(lo, span[0]), max(hi, span[1])
+            index.intervals[name] = (lo, hi)
+        self._index = index
+        return index
+
+    def uses(self, buffer: str) -> list[int]:
+        """Sorted distinct ``time`` of the ops that read or write ``buffer``."""
+        return list(self._buffers().uses.get(buffer, ()))
+
+    def runtime_reads(self, buffer: str) -> int:
+        """Sum of ``executions_estimate`` over the ops that read ``buffer``."""
+        return sum(
+            self.executions_estimate(op)
+            for op in self._buffers().readers.get(buffer, ())
+        )
+
+    def live_interval(self, buffer: str) -> tuple[int, int] | None:
+        """Inclusive slots ``buffer`` is live over; ``None`` when it is unused.
+
+        The uses' range, widened for a read to the span of the outermost loop that
+        holds the read but not the buffer's birth (a value read again every trip
+        must survive the back edge), and for a carry to its node's span."""
+        return self._buffers().intervals.get(buffer)

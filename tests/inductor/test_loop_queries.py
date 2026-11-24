@@ -23,13 +23,20 @@ from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ir import ExternKernel
 from torch.utils._ordered_set import OrderedSet
 
-from torch_spyre._inductor.loop_node import LoopMember, LoopNode, OpsView
+from torch_spyre._inductor.loop_node import (
+    LoopCarryRecord,
+    LoopMember,
+    LoopNode,
+    OpsView,
+)
 from torch_spyre._inductor.loop_queries import LoopProgram
 from torch_spyre._inductor.pass_utils import trip_count_estimate
 
 
 def _dep(name):
-    return MemoryDep(name, sympy.Integer(0), (), ())
+    """``"x@512"`` is a second dep on ``x`` with a different index."""
+    base, _, off = name.partition("@")
+    return MemoryDep(base, sympy.Integer(int(off or 0)), (), ())
 
 
 class _Op:
@@ -80,6 +87,9 @@ class _Extern(ExternKernel):
     def get_operation_name(self):
         return self._name
 
+    def get_read_writes(self):
+        return ReadWrites(OrderedSet(), OrderedSet([_dep(self._name)]), OrderedSet())
+
     def __repr__(self):
         return f"_Extern({self._name})"
 
@@ -96,8 +106,8 @@ class _Alloc(_Extern):
         return True
 
 
-def _node(name, body, trip=4, induction=None):
-    return LoopNode(name, body, induction=induction, trip_count=trip)
+def _node(name, body, trip=4, induction=None, carries=()):
+    return LoopNode(name, body, induction=induction, trip_count=trip, carries=carries)
 
 
 def _Op_in(p, name):
@@ -172,3 +182,79 @@ def test_a_symbolic_count_stays_symbolic_and_its_estimate_resolves():
 def test_an_op_not_in_the_program_raises_with_its_name():
     with pytest.raises(KeyError, match="ghost"):
         LoopProgram([_Op("a")]).slot(_Op("ghost"))
+
+
+# Task 1 review follow-ups
+def test_a_top_level_extern_with_a_pending_member_runs_once_outside_loops():
+    ext = _Extern("ext")
+    ext.loop_member = LoopMember(
+        loop_group_id=(0,),
+        loop_count=[5],
+        loop_tiled_dims=[[]],
+        loop_tiled_reduction_dims=[[]],
+    )
+    p = LoopProgram([_Op("a"), ext])
+    assert p.loops_of(ext) == () and p.executions(ext) == 1
+
+
+def test_nested_pending_loops_are_shared_by_group_path():
+    a = _Op("a", gid=(0, 1), counts=[2, 3])
+    b = _Op("b", gid=(0, 1), counts=[2, 3])
+    c = _Op("c", gid=(0,), counts=[2])
+    p = LoopProgram([a, b, c])
+    outer = p.loops_of(a)[0]
+    assert outer is p.loops_of(b)[0] and outer is p.loops_of(c)[0]
+    inner = p.loops_of(a)[1]
+    assert inner is p.loops_of(b)[1] and p.loops_of(c) == (outer,)
+    assert [p.executions(x) for x in (a, b, c)] == [6, 6, 2]
+    assert p.span(inner) == (0, 1) and p.span(outer) == (0, 2)
+
+
+# Buffer queries
+def test_a_value_born_outside_and_read_inside_lives_for_the_whole_loop():
+    x = _Op("x", writes=["x"])
+    r = _Op("r", reads=["x"])
+    p = LoopProgram([x, _node("n0", [_Op("k0"), r, _Op("k2")], trip=4), _Op("z")])
+    assert p.uses("x") == [0, 2] and p.live_interval("x") == (0, 3)
+
+
+def test_a_body_temporary_keeps_a_per_trip_lifetime():
+    alloc = _Alloc("t")
+    w = _Op("w", writes=["t"])
+    r = _Op("r", reads=["t"])
+    p = LoopProgram([_node("n0", [_Op("k"), alloc, w, r, _Op("k2")], trip=4)])
+    assert p.live_interval("t") == (1, 3)
+
+
+def test_a_write_inside_a_loop_does_not_widen():
+    x, w = _Op("x", writes=["x"]), _Op("w", writes=["x"])
+    p = LoopProgram([x, _node("n0", [_Op("k"), w, _Op("k2")], trip=4)])
+    assert p.live_interval("x") == (0, 2)
+
+
+def test_a_carry_storage_covers_its_loop():
+    init = _Op("init", writes=["acc"])
+    upd = _Op("upd", reads=["acc"], writes=["acc"])
+    rec = LoopCarryRecord(storage_name="acc", update_name="upd")
+    n = _node("n0", [_Op("k"), upd, _Op("k2")], trip=4, carries=[rec])
+    assert LoopProgram([init, n]).live_interval("acc") == (0, 3)
+
+
+def test_runtime_reads_count_each_reading_op_per_execution():
+    x, r = _Op("x", writes=["x"]), _Op("r", reads=["x"])
+    inner = _node("n1", [r], trip=3)
+    p = LoopProgram([x, _node("n0", [inner], trip=4), _Op("z", reads=["x"])])
+    assert p.runtime_reads("x") == 13
+
+
+def test_an_unused_buffer_has_no_uses_and_no_lifetime():
+    p = LoopProgram(SimpleNamespace(operations=[_Op("a")], graph_input_names=["in0"]))
+    assert p.uses("in0") == [] and p.live_interval("in0") is None
+    assert p.live_interval("nope") is None
+    assert p.input_names() == ("in0",) and LoopProgram([]).input_names() == ()
+
+
+def test_one_op_reaching_a_buffer_twice_counts_once():
+    r = _Op("r", reads=["x", "x@512"])
+    p = LoopProgram([_Op("x", writes=["x"]), _node("n0", [r], trip=4)])
+    assert p.uses("x") == [0, 1] and p.runtime_reads("x") == 4
