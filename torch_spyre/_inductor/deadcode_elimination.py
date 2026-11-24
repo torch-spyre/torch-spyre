@@ -14,6 +14,7 @@
 
 from torch._inductor.ir import (
     ComputedBuffer,
+    ExternKernel,
     FallbackKernel,
     MutationLayoutSHOULDREMOVE,
     Operation,
@@ -21,8 +22,8 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import ReadWrites
 from torch._inductor.graph import GraphLowering
 
-from .loop_info import LoopCarryRecord
-from .loop_node import LoopNode, all_ops
+from .loop_node import LoopCarryRecord
+from .loop_node import LoopNode, all_ops, remove_op
 
 
 def live_operations(graph: GraphLowering) -> frozenset[str]:
@@ -117,39 +118,44 @@ def _mutation_targets(op: Operation) -> list[str]:
     if isinstance(op, LoopNode):
         return op.mutation_targets()
     target = _mutation_target(op)
-    return [] if target is None else [target]
+    if target is not None:
+        return [target]
+    if isinstance(op, ExternKernel) and not isinstance(op, FallbackKernel):
+        # An ExternKernel names the buffers it writes in place.  A fallback is
+        # left out: its names do not cover all it does, so has_side_effects
+        # stays the decider.
+        return list(op.get_mutation_names())
+    return []
 
 
 def _mutation_target_is_live(op: Operation, live_bufs: set[str]) -> bool:
     """Whether a side-effecting op's write can still be observed.
 
-    Only a ``MutationLayoutSHOULDREMOVE`` names a target, so anything else
-    side-effecting (an impure ``FallbackKernel``) is assumed observable.  A
-    ``LoopNode`` is observable when any side-effecting op of its body is:
-    one whose mutation target is live, or an impure fallback.
+    An op that names no target (an impure ``FallbackKernel``) is assumed
+    observable.  A ``LoopNode`` is observable when any side-effecting op of
+    its body is: one whose mutation target is live, or an impure fallback.
     """
     if isinstance(op, LoopNode):
         return any(
             _has_side_effects(leaf) and _mutation_target_is_live(leaf, live_bufs)
             for leaf in all_ops(op.body)
         )
-    target = _mutation_target(op)
-    return target is None or target in live_bufs
+    targets = _mutation_targets(op)
+    return not targets or bool(set(targets) & live_bufs)
 
 
 def _has_side_effects(op: Operation) -> bool:
     """Return True if op must not be eliminated regardless of whether its
     outputs are used.
 
-    A mutation writes into a buffer it does not own, so it has side effects;
-    whether that write can still be observed is ``_mutation_target_is_live``'s
-    call.  FallbackKernel delegates to is_impure on the underlying op overload.
-    A ``LoopNode`` has side effects when any op of its body has.  All other op
-    types are pure.
+    An op that writes a buffer it does not own has side effects; whether that
+    write is still observable is ``_mutation_target_is_live``'s call.  A
+    ``FallbackKernel`` delegates to is_impure on its op overload.  A
+    ``LoopNode`` has side effects when any op of its body has.
     """
     if isinstance(op, LoopNode):
         return op.has_side_effects()
-    if _mutation_target(op) is not None:
+    if _mutation_targets(op):
         return True
     if isinstance(op, FallbackKernel):
         return op.has_side_effects()
@@ -187,4 +193,4 @@ def deadcode_elimination(graph: GraphLowering) -> None:
             rw = leaf.get_read_writes()
             for dep in rw.writes:
                 graph.removed_buffers.add(dep.name)
-        operations.remove(op)
+        remove_op(operations, op)

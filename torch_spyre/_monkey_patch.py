@@ -144,23 +144,17 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
 
 
 def _parse_dynamic_to_args(self, args, kwargs):
-    """Validate a ``.to(..., dynamic=...)`` call and return its target dtype.
+    """Validate a ``.to(..., dynamic=...)`` call; return (dtype, non_blocking).
 
     dynamic= only makes sense for the initial host-to-device copy, so raise
     unless this is an eager CPU -> "spyre" transfer. The returned dtype is
     None when the caller didn't ask for a conversion. Parsed with torch's own
-    ``.to()`` parser so dtype is honoured whether it is passed positionally or
-    by keyword. A non-default memory_format is rejected; non_blocking is
-    accepted (the transfer is always synchronous).
+    ``.to()`` parser so dtype and non_blocking are honoured whether they are
+    passed positionally or by keyword. A non-default memory_format is rejected.
     """
     import torch
 
-    # non_blocking is a hint: the transfer below is always synchronous, which
-    # is a valid way to honour non_blocking=True, so it is accepted and
-    # deliberately not forwarded.
-    device, dtype, _non_blocking, memory_format = torch._C._nn._parse_to(
-        *args, **kwargs
-    )
+    device, dtype, non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
     message = (
         'dynamic= is only supported for CPU -> "spyre" transfers, e.g. '
         f"{_DYNAMIC_USAGE_HINT}"
@@ -176,37 +170,50 @@ def _parse_dynamic_to_args(self, args, kwargs):
             f"dynamic= does not support memory_format={memory_format}; "
             "only the default memory format is supported"
         )
-    return dtype
+    return dtype, non_blocking
 
 
-def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
-    """Allocate at the ceiling, copy the real data in, mark the dim dynamic."""
+def _layout_to_non_blocking(args, kwargs) -> bool:
+    """``non_blocking`` of a ``.to(..., device_layout=...)`` call.
+
+    Parsed with torch's own ``.to()`` parser, as on the ``dynamic=`` path. That
+    parser rejects ``copy``, which a host-to-device transfer satisfies either
+    way, so a ``copy`` keyword is dropped first.
+    """
     import torch
 
-    # This path calls spyre_empty_reserved directly via pybind11, bypassing
-    # the ATen dispatcher path that ordinarily self-inits the runtime (via
-    # the H2D stream pool inside spyre_copy_from -> getCurrentStream). On a
-    # fresh process this can be the very first device op, so the runtime
-    # must be brought up explicitly here first -- same idiom as
-    # manual_seed/CCL-backend/profiler init elsewhere in this package.
+    kwargs = {key: value for key, value in kwargs.items() if key != "copy"}
+    return torch._C._nn._parse_to(*args, **kwargs)[2]
+
+
+def _reserve_and_copy(
+    src, spec: _DynamicSpec, allocate, non_blocking: bool = False
+) -> "torch.Tensor":
+    """Allocate at the ceiling, copy the real data in, mark the dim dynamic.
+
+    The shared body of the two reserved transfers. ``allocate(size, stride,
+    dtype)`` is the native allocation: ``spyre_empty_reserved`` with the layout
+    derived from the shape, or ``spyre_empty_reserved_with_layout`` with the
+    layout given. Everything else is the same for both, so it lives here once.
+    """
+    import torch
+
+    # This path calls the allocator directly via pybind11, bypassing the ATen
+    # dispatcher path that ordinarily self-inits the runtime (via the H2D
+    # stream pool inside spyre_copy_from -> getCurrentStream). On a fresh
+    # process this can be the very first device op, so the runtime must be
+    # brought up explicitly here first -- same idiom as manual_seed/CCL-backend/
+    # profiler init elsewhere in this package.
     if not torch.spyre.is_initialized():
         torch.spyre._impl._lazy_init()
 
     # Local import, same lazy-import convention as the rest of this file
     # (see _UNSET above): torch_spyre._C is a native extension module and
     # this file must stay importable before it's guaranteed ready.
-    from torch_spyre._C import copy_tensor, spyre_empty_reserved
+    from torch_spyre._C import copy_tensor
 
-    dst = spyre_empty_reserved(
-        src.size(),
-        src.stride(),
-        src.dtype,
-        spec.dim,
-        spec.min,
-        spec.max,
-        spec.granularity,
-    )
-    copy_tensor(src, dst, non_blocking=False)
+    dst = allocate(src.size(), src.stride(), src.dtype)
+    copy_tensor(src, dst, non_blocking=non_blocking)
 
     # mark_dynamic must run eagerly, before any compile, so Dynamo treats
     # `dim` as symbolic from the first trace.
@@ -222,6 +229,49 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     # inside the trace are still written by the traced function.
     torch._dynamo.mark_dynamic(dst, spec.dim)
     return dst
+
+
+def _transfer_reserved(
+    src, spec: _DynamicSpec, non_blocking: bool = False
+) -> "torch.Tensor":
+    """Reserve at the ceiling with the layout derived from the shape."""
+    from torch_spyre._C import spyre_empty_reserved
+
+    def allocate(size, stride, dtype):
+        return spyre_empty_reserved(
+            size, stride, dtype, spec.dim, spec.min, spec.max, spec.granularity
+        )
+
+    return _reserve_and_copy(src, spec, allocate, non_blocking)
+
+
+def _transfer_reserved_with_layout(
+    src, spec: _DynamicSpec, device_layout, non_blocking: bool = False
+):
+    """``_transfer_reserved`` with the device layout given instead of derived.
+
+    The layout describes the buffer at ``max``, so the reserved host dimension
+    must occupy exactly one device dimension of it, whole (the one whose
+    stride-map entry is the host stride of the reserved dimension), not the
+    stick-elements dimension, with extent ``max``. The native allocation
+    checks that before anything is allocated and raises a ``RuntimeError``
+    naming the rule it broke.
+    """
+    from torch_spyre._C import spyre_empty_reserved_with_layout
+
+    def allocate(size, stride, dtype):
+        return spyre_empty_reserved_with_layout(
+            size,
+            stride,
+            dtype,
+            device_layout,
+            spec.dim,
+            spec.min,
+            spec.max,
+            spec.granularity,
+        )
+
+    return _reserve_and_copy(src, spec, allocate, non_blocking)
 
 
 def _sharding_key(tensor) -> tuple | None:
@@ -297,17 +347,18 @@ def _patch_tensor_for_spyre():
 
     def spyre_to(self, *args, device_layout=None, dynamic=None, **kwargs):
         if dynamic is not None:
-            if device_layout is not None:
-                raise ValueError(
-                    "dynamic= cannot be combined with device_layout=: a "
-                    "reserved tensor's layout is derived from its max size"
-                )
-            dtype = _parse_dynamic_to_args(self, args, kwargs)
+            dtype, non_blocking = _parse_dynamic_to_args(self, args, kwargs)
             spec = _parse_dynamic_spec(dynamic, self.size())
             # Convert on the host first: the reserved buffer is allocated
             # and filled at the dtype the caller asked for.
             src = self if dtype is None or dtype == self.dtype else orig_to(self, dtype)
-            return _transfer_reserved(src, spec)
+            if device_layout is not None:
+                # The caller's layout describes the buffer at the declared
+                # max; it is checked against the declaration, not derived.
+                return _transfer_reserved_with_layout(
+                    src, spec, device_layout, non_blocking
+                )
+            return _transfer_reserved(src, spec, non_blocking)
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
             # the operation device-local so Inductor sees and lowers the dtype
@@ -406,7 +457,9 @@ def _patch_tensor_for_spyre():
             if self.device.type == "cpu":
                 from torch_spyre._C import copy_tensor
 
-                copy_tensor(self, dst, non_blocking=False)
+                copy_tensor(
+                    self, dst, non_blocking=_layout_to_non_blocking(args, kwargs)
+                )
                 return dst
             else:  # device to device copy
                 # If device_layout is the same as self and copy is not True, return self

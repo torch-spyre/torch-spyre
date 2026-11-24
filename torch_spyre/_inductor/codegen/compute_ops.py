@@ -27,7 +27,10 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+from torch_spyre._inductor.sharded_hbm import (
+    verify_mixed_ring_args,
+    verify_non_unified_split,
+)
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
@@ -382,12 +385,13 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
         and tensor.data_format == DataFormats.SEN143_FP8
         and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
     ):
-        # After device-size flattening a rank-4+ tensor produces a 3-element
-        # dim_order (one collapsed leading dim + the two trailing stick dims).
-        # The [-2:] slice always selects the two stick dims regardless of how
-        # many leading dims were collapsed, because flattening only touches
-        # leading dims and the trailing stick dims are preserved as-is by
-        # _flatten_device_size (keep_trailing_dims=2). Ranks above 3 are safe.
+        # stickDimOrder_ must contain exactly the two QFP8WT stick dims (K and
+        # N), never the outer batch dim(s).  For a rank-3 KERNEL (no batch dims)
+        # dim_order is already ["in", "mb"] so [-2:] is a no-op.  For a rank-4+
+        # KERNEL (one or more batch dims collapsed into the leading positions by
+        # _flatten_device_size) dim_order is e.g. ["out","in","mb"] or
+        # ["x","in","mb"]; taking [-2:] strips the batch prefix and leaves only
+        # the 2D-stick pair that a 2D-stick tensor requires.
         dim_order = layout_info["dim_order"]
         if len(dim_order) < 2:
             raise ValueError(
@@ -396,7 +400,7 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
             )
         return {
             **layout_info,
-            "stick_dim_order": list(dim_order),
+            "stick_dim_order": list(dim_order[-2:]),
             "stick_size": [2, 64],
         }
     return layout_info
@@ -949,7 +953,9 @@ def generate_sdsc(
     non_unified_args = [t for t in sdsc_spec.args if t.non_unified]
     if non_unified_args:
         if len(non_unified_args) != len(sdsc_spec.args):
-            raise Unsupported("non-unified kernels need every tensor argument sharded")
+            # Only a cross-shard (ring) reduction mixes the two: sharded
+            # inputs, one ordinary output written by the chain's end core.
+            verify_mixed_ring_args(sdsc_spec, non_unified_args)
         verify_non_unified_split(sdsc_spec, non_unified_args)
     for tensor in sdsc_spec.args:
         if tensor.non_unified:
@@ -1026,7 +1032,7 @@ def generate_sdsc(
             #
             # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
             # a minted symbol names a loop-nesting *level*, not a
-            # dimension -- _general_tile_advance (spyre_kernel.py) sums
+            # dimension -- _index_tile_advance (spyre_kernel.py) sums
             # every host dim tiled at a level into ONE combined
             # coefficient on that level's minted symbol before this
             # tensor's device_tile_advance_expr is ever built, so by the

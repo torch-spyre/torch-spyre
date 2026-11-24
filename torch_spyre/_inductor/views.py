@@ -799,8 +799,14 @@ def normalize_coordinates(
                 num = den = mod = sympy.S.One
                 terms.append(Term(num, den, var, mod, dim_size, offset))
             else:
-                assert offset == 0
-                terms.append(Term(None, None, None, None, dim_size))
+                # A constant coordinate on the last (stick) dim is valid: the offset
+                # is the HBM base address baked into the device coordinate by the
+                # layout engine.  Keep it in the Term so downstream code can use it
+                # as a constant address contribution.  Any other size-1 dim must
+                # have a zero offset: such a term is dropped when fusing, so a
+                # nonzero offset would be silently lost.
+                assert dim_idx == len(size) - 1 or offset == 0
+                terms.append(Term(None, None, None, None, dim_size, offset))
             continue
         # If any free symbols are not loop vars, check if they're indirect symbols
         # with known sizes (from indirect_sizes). If so, treat them like loop vars.
@@ -1457,7 +1463,7 @@ def tiling_expr_to_device_expr(
     for var in vars:
         # step must be var's own coefficient, not index's value at var=1 --
         # those only coincide when index has zero constant term. `index` can
-        # legitimately carry one here: _general_tile_advance builds it from
+        # legitimately carry one here: _index_tile_advance builds it from
         # dep.index, which bakes in literal offsets from Python-level slicing
         # (e.g. key[..., start:end, :] for KV-block >= 1 contributes a
         # constant +start*row_stride term alongside the tiled-dim symbol).

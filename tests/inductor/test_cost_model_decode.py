@@ -48,7 +48,6 @@ from torch_spyre._inductor.cost_features import (
     _level_loop_vars,
     _loop_factor_for_index,
     _loop_var_advances,
-    _stamped_advances,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
@@ -378,13 +377,14 @@ def test_the_extractor_scales_a_per_trip_body_matmul_by_its_trip(monkeypatch):
         get_buffer=lambda name: None,
     )
 
-    def macs(loop_info):
-        op.loop_info = loop_info
+    def macs(loop_member):
+        op.loop_member = loop_member
         with V.set_graph_handler(graph):
             return dcm.extract_op_features(op).matmul_macs
 
     def loop(tiled_out):
         return SimpleNamespace(
+            loop_group_id=(0,),
             loop_count=[16],
             loop_tiled_dims=[tiled_out],
             loop_tiled_reduction_dims=[[]],
@@ -411,12 +411,10 @@ def _op(*hints):
 # ------------------------------------------------------------- level pairing
 
 
-def _factor(index, levels, op, stamped=None):
+def _factor(index, levels, op):
     """The read/write factor the extractor computes for ``index``."""
     loop_vars = _level_loop_vars(op, levels)
-    return _loop_factor_for_index(
-        index, levels, _loop_var_advances(index, loop_vars, stamped)
-    )
+    return _loop_factor_for_index(index, levels, _loop_var_advances(index, loop_vars))
 
 
 def test_an_advancing_read_is_not_multiplied_by_the_trip_count():
@@ -481,14 +479,12 @@ def test_nested_loops_of_different_trip_count_keep_their_own_variables():
 
 
 def test_a_loop_variable_without_a_coefficient_does_not_advance_the_read():
-    """Synthetic stamp-consistency check, not an observed lowered-kernel case.
+    """Synthetic check, not an observed lowered-kernel case.
 
-    The lowering advances a dependency only when its index has a nonzero
-    coefficient on the loop variable (``_stamp_direct_loop_info``). ``u0`` being a
-    free symbol is not enough: the synthetic index ``4096*FloorDiv(u0, 2)`` has
-    coefficient 0, so under that rule it would be stamped pinned, and the price
-    follows the same rule (re-entered every trip). No lowered kernel is known to
-    produce this read."""
+    A dependency advances only when its index has a nonzero coefficient on the loop
+    variable. ``u0`` being a free symbol is not enough: the synthetic index
+    ``4096*FloorDiv(u0, 2)`` has coefficient 0, so the price treats it as pinned
+    (re-entered every trip). No lowered kernel is known to produce this read."""
     from torch.utils._sympy.functions import FloorDiv
 
     levels = [(8, set(), 0)]
@@ -497,28 +493,6 @@ def test_a_loop_variable_without_a_coefficient_does_not_advance_the_read():
     assert _loop_var_advances(pinned, [u0]) == [False]
     assert _factor(pinned, levels, op) == 8
     assert _factor(4096 * u0 + d2, levels, op) == 1  # coefficient 4096: advances
-
-
-def test_the_lowerings_stamp_decides_over_the_index():
-    """Synthetic stamp-consistency check, not an observed lowered-kernel case.
-
-    When the lowering's stamp and the index disagree, the stamp wins: code
-    generation follows the stamp, so the price follows it too. The read below keeps
-    ``u0`` in its index but carries an empty ("pinned") stamp. It is constructed for
-    the check; no reachable read with ``u0`` in its index and a pinned stamp is
-    known."""
-    levels = [(8, set(), 0)]
-    op = _op(_hint(u0, 8))
-    pool_read = 64 * u0 + d2
-    pinned_stamp = _stamped_advances([[]], None, 1)
-    advancing_stamp = _stamped_advances([[(0, sympy.Integer(1))]], None, 1)
-    squeezed_stamp = _stamped_advances([[]], [[(sympy.Integer(64), 1)]], 1)
-    assert (pinned_stamp, advancing_stamp, squeezed_stamp) == ([False], [True], [True])
-    assert _factor(pool_read, levels, op, pinned_stamp) == 8
-    assert _factor(d2, levels, op, advancing_stamp) == 1
-    # A stamp that does not cover every level is not used.
-    assert _stamped_advances([[], []], None, 1) is None
-    assert _stamped_advances([[]], [[], []], 1) is None
 
 
 # ------------------------------------------------ wiring in extract_op_features
@@ -548,7 +522,8 @@ def _looped_op(trips, tiled_out, hints, write_index, read_indices, data=None):
         name="buf1",
         data=data,
         dim_hints=list(hints),
-        loop_info=SimpleNamespace(
+        loop_member=SimpleNamespace(
+            loop_group_id=tuple(range(len(trips))),
             loop_count=list(trips),
             loop_tiled_dims=[list(level) for level in tiled_out],
             loop_tiled_reduction_dims=[[] for _ in trips],
@@ -680,7 +655,6 @@ def _looped_matmul_features(
     it_space,
     work_slices=None,
     ranges=None,
-    output_tiled_dims=None,
 ):
     """``extract_op_features`` on a batch-matmul body op inside a loop nest."""
     from torch_spyre._inductor.constants import BATCH_MATMUL_OP
@@ -693,9 +667,7 @@ def _looped_matmul_features(
     op = _looped_op(trips, tiled_out, hints, write_index, read_indices, data=data)
     op.get_size = lambda: list(size)
     if tiled_red is not None:
-        op.loop_info.loop_tiled_reduction_dims = [list(lv) for lv in tiled_red]
-    if output_tiled_dims is not None:
-        op.loop_info.output_tiled_dims = output_tiled_dims
+        op.loop_member.loop_tiled_reduction_dims = [list(lv) for lv in tiled_red]
     monkeypatch.setattr(dcm, "iteration_space_from_op", lambda _op: it_space)
     monkeypatch.setattr(dcm, "_indirect_write_elems", lambda *_: None)
     with V.set_graph_handler(_StubGraph()):
@@ -1053,29 +1025,6 @@ def test_a_record_without_a_loop_keeps_its_allocator_price(monkeypatch):
     assert _allocator_compute_ns(no_macs) == pytest.approx(direct, rel=1e-12)
 
 
-def test_the_extractor_follows_a_pinned_stamp_on_a_read_carrying_the_loop_variable(
-    monkeypatch,
-):
-    """Synthetic stamp-consistency check, not an observed lowered-kernel case.
-
-    The lowering's per-read stamp, when it covers every read, is what the price
-    follows: here the second read keeps ``u0`` in its index but is stamped pinned,
-    so it is priced as re-read every trip. The read is constructed for the check;
-    no reachable read of this shape is known."""
-    op = _looped_op(
-        [8],
-        [[]],
-        [_hint(u0, sympy.Integer(8))],
-        write_index=64 * d0 + d2,
-        read_indices=[4096 * u0 + d2, 64 * u0 + d2],
-    )
-    op.loop_info.tiled_dims_per_read = [[[(0, sympy.Integer(1))]], [[]]]
-    op.loop_info.squeezed_advance_per_read = []
-    factors = _factors(monkeypatch, op, {d0: 64, d2: 64})
-    assert factors["arg0"] == 1  # stamped advancing
-    assert factors["arg1"] == 8  # stamped pinned despite u0 in its index
-
-
 def test_the_extractor_marks_the_reads_that_advance_with_the_loop_variable(monkeypatch):
     """``advances_with_loop_var`` is what confines the partitioned-read price to the
     for_each_tile loop's tiled operand: set for a read whose index carries the loop
@@ -1171,45 +1120,6 @@ def _read(feature, name):
     return next(a for a in feature.args if a.name == name)
 
 
-def test_a_stamped_pinned_read_carrying_the_loop_variable_is_not_eligible(
-    monkeypatch,
-):
-    op = _looped_op(
-        [8],
-        [[]],
-        [_hint(u0, sympy.Integer(8))],
-        write_index=64 * d0 + d2,
-        read_indices=[4096 * u0 + d2],
-    )
-    op.loop_info.tiled_dims_per_read = [[[]]]
-    op.loop_info.squeezed_advance_per_read = []
-    pinned = _read(_features(monkeypatch, op, {d0: 64, d2: 64}), "arg0")
-    assert (pinned.advances_with_loop_var, pinned.loop_factor) == (False, 8)
-
-
-def test_a_squeezed_advance_stamp_is_eligible_without_the_variable_in_the_index(
-    monkeypatch,
-):
-    """The rebased direct read ``read_copy_elision`` builds: the loop variable left
-    the index, and the stamp carries the advance (one expert bank slice per trip).
-    It is the same walked read as before the rebase, so it is eligible."""
-    op = _looped_op(
-        [8],
-        [[]],
-        [_hint(u0, sympy.Integer(8))],
-        write_index=64 * d0 + d2,
-        read_indices=[d2],
-    )
-    op.loop_info.tiled_dims_per_read = [[[]]]
-    op.loop_info.squeezed_advance_per_read = [[[(sympy.Integer(4096), 1)]]]
-    walked = _read(
-        _features(monkeypatch, op, {d0: 64, d2: 64}, candidate_work_slices=[{d2: 4}]),
-        "arg0",
-    )
-    assert (walked.advances_with_loop_var, walked.loop_factor) == (True, 1)
-    assert walked.has_partitioning_candidate
-
-
 def test_a_zero_coefficient_loop_variable_is_not_eligible_without_stamps(monkeypatch):
     from torch.utils._sympy.functions import FloorDiv
 
@@ -1253,7 +1163,7 @@ def test_a_read_walked_only_by_the_levels_tiled_dim_is_a_coarse_loop_read(
 # menu and the default params.
 
 
-def _row_tiled_expert_matmul(read_stamps):
+def _row_tiled_expert_matmul():
     """One expert per trip of an 8-trip loop that also tiles the output rows ``d0``.
 
     ``arg0`` is the activation tile; its index carries ``d0`` and ``u0``.
@@ -1273,13 +1183,9 @@ def _row_tiled_expert_matmul(read_stamps):
         ),
     )
     op.get_size = lambda: [64, 64]
-    op.loop_info.tiled_dims_per_read = read_stamps
-    op.loop_info.squeezed_advance_per_read = []
     return op
 
 
-_ADVANCES = [[(0, sympy.Integer(64))]]  # one level, advancing
-_PINNED = [[]]  # one level, the explicit "pinned" verdict
 _IT_SPACE = {d0: 64, d1: 64, d2: 64}
 _MENU = [{d0: 2, d1: 4}, {d1: 8}]  # 8 cores: the delivery estimate is nonzero
 
@@ -1328,9 +1234,7 @@ def test_the_allocator_prices_loop_delivery_only_for_reads_the_loop_variable_wal
 ):
     """Both reads advance by the lowering's stamps: both are walked once and both
     get the allocator's loop-delivery estimate."""
-    walked = _allocator_features(
-        monkeypatch, _row_tiled_expert_matmul([_ADVANCES, _ADVANCES])
-    )
+    walked = _allocator_features(monkeypatch, _row_tiled_expert_matmul())
     flags = {
         a.name: (a.advances_with_loop_var, a.loop_factor, a.has_partitioning_candidate)
         for a in walked.args
@@ -1340,29 +1244,6 @@ def test_the_allocator_prices_loop_delivery_only_for_reads_the_loop_variable_wal
     assert _delivery_ns(walked) > _delivery_ns(_without(walked, "arg0")) > 0
 
 
-def test_a_read_whose_advance_moved_to_its_restickify_copy_gets_no_loop_delivery(
-    monkeypatch,
-):
-    """Synthetic stamp-consistency check, not an observed lowered-kernel case.
-
-    Through the allocator: the activation read below keeps ``u0`` in its index but
-    carries an empty ("pinned") stamp, and the row tile ``d0`` still walks it
-    (factor 1). The free-symbol rule priced it as a loop-walked operand; by the
-    stamp it is not one, so only the bank keeps the estimate. The read is
-    constructed for the check: no reachable read with ``u0`` in its index and a
-    pinned stamp is known, and whether ``insert_restickify`` (which the test name
-    recalls) or any other pass produces one is not established."""
-    moved = _allocator_features(
-        monkeypatch, _row_tiled_expert_matmul([_PINNED, _ADVANCES])
-    )
-    activation, bank = _read(moved, "arg0"), _read(moved, "arg1")
-    assert (activation.advances_with_loop_var, activation.loop_factor) == (False, 1)
-    assert activation.has_partitioning_candidate
-    assert (bank.advances_with_loop_var, bank.loop_factor) == (True, 1)
-    assert _delivery_ns(moved) == pytest.approx(_delivery_ns(_without(moved, "arg0")))
-    assert _delivery_ns(moved) > 0
-
-
 def test_the_report_omits_the_loop_delivery_estimate(monkeypatch):
     """The report extracts without the legal menu, so no read has partitioning
     evidence and the estimate is omitted for every shape, eligible or not. Its
@@ -1370,7 +1251,7 @@ def test_the_report_omits_the_loop_delivery_estimate(monkeypatch):
     does."""
     from torch_spyre._inductor.cost_model import CostParams
 
-    op = _row_tiled_expert_matmul([_ADVANCES, _ADVANCES])
+    op = _row_tiled_expert_matmul()
     report = _features(monkeypatch, op, _IT_SPACE)
     assert [a.advances_with_loop_var for a in report.args if a.role == "input"] == [
         True,
@@ -1378,29 +1259,6 @@ def test_the_report_omits_the_loop_delivery_estimate(monkeypatch):
     ]
     assert not any(a.has_partitioning_candidate for a in report.args)
     assert _delivery_ns(report, CostParams()) == 0
-
-
-def test_a_rebased_bank_read_keeps_the_estimate_of_its_pre_rebase_form(monkeypatch):
-    """The gained case, through the allocator's extraction. The pre-rebase bank read
-    carries ``u0``; the rebased one (``read_copy_elision``) drops it and keeps the
-    advance in the squeezed stamp. One physical read, one price. Under the
-    free-symbol rule the rebased form lost the estimate. (Today the allocator never
-    sees a rebased matmul read: its pricing projection rebases pointwise copies only,
-    and the elision itself runs after planning.)"""
-    before = _row_tiled_expert_matmul([_PINNED, _ADVANCES])
-    rebased = _row_tiled_expert_matmul([_PINNED, [[]]])
-    rebased.get_read_writes().reads[1].index = 64 * d2 + d1
-    rebased.loop_info.squeezed_advance_per_read = [[[]], [[(sympy.Integer(4096), 1)]]]
-    bank_before = _read(_allocator_features(monkeypatch, before), "arg1")
-    priced = _allocator_features(monkeypatch, rebased)
-    bank_after = _read(priced, "arg1")
-    assert (bank_after.advances_with_loop_var, bank_after.loop_factor) == (True, 1)
-    assert (
-        bank_after.has_partitioning_candidate == bank_before.has_partitioning_candidate
-    )
-    assert _delivery_ns(priced) == pytest.approx(
-        _delivery_ns(_allocator_features(monkeypatch, before))
-    )
 
 
 # DMA requests of looped matmul operand reads, at the MoE expert-loop shape: 128
@@ -1676,46 +1534,16 @@ def test_the_symbolic_operand_price_equals_the_concrete_price_at_every_candidate
     assert (priced[0] > 0) == ("arg1" not in declined)
 
 
-def test_a_stamped_level_without_a_loop_variable_follows_its_stamp(monkeypatch):
-    """Review repro (H=16 heads, T=64, N=128, K=64; ``[H, T, N]`` output).
-
-    The loop tiles output dim 0 with tile size 1, so the iteration space has no
-    symbol for it (``_tiled_symbols_per_level`` skips unit-size ranges) and the level
-    declares a dim but names no symbol. The level has no paired ``for_each_tile``
-    variable (no loop-variable hint). The lowering's stamp says the output advances
-    at that level, and the stamp is consulted whether or not a variable is paired:
-    the write is walked once and the matmul work is the loop's true total
-    ``16 * T * N * K``, not 16 times it.
-
-    Synthetic, mirroring the reviewer's repro. Which lowerings reach it (a
-    ``spyre_hint`` or solver coarse loop, or a hint/level count mismatch) is the
-    reviewer's statement, not independently established here.
-    """
-    H, T, N, K = 16, 64, 128, 64
-    m, n, r0 = sympy.symbols("m n r0", integer=True)
-    feature = _looped_matmul_features(
-        monkeypatch,
-        size=[H, T, N],
-        ranges=[1, T, N],  # the unit-size head range has no iteration symbol
-        k=K,
-        trips=[H],
-        tiled_out=[[0]],
-        output_tiled_dims=[[(0, 1)]],
-        write_index=N * m + n,
-        read_indices=[K * m + r0, N * r0 + n],
-        it_space={m: T, n: N, r0: K},
-    )
-    assert _output_factor(feature) == 1
-    assert feature.matmul_macs == H * T * N * K
-
-
-def test_a_stamped_coarse_loop_read_keeps_loop_delivery_disabled(monkeypatch):
-    """Complete coarse-loop stamps affect traffic, without enabling loop delivery.
+def test_a_coarse_loop_read_without_a_paired_variable_keeps_loop_delivery_disabled(
+    monkeypatch,
+):
+    """A coarse loop affects traffic (the read is walked by the level's tiled dim),
+    without enabling loop delivery.
 
     The allocator has a legal partitioning menu, but no paired for_each_tile
-    variable. Applying #4995's stamp-precedence fix must keep that distinction.
+    variable, so no read advances with a loop variable.
     """
-    op = _row_tiled_expert_matmul([_ADVANCES, _PINNED])
+    op = _row_tiled_expert_matmul()
     op.dim_hints = []
     feature = _allocator_features(monkeypatch, op)
     read = _read(feature, "arg0")

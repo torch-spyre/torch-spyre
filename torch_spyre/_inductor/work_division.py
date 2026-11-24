@@ -1203,7 +1203,8 @@ def _reduction_syms(
     write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
     if write is None:
         return frozenset()
-    return frozenset(s for s in splits if write.index.coeff(s) == 0)
+    index_syms = write.index.free_symbols
+    return frozenset(set(splits) - index_syms)
 
 
 def _core_division(
@@ -1244,7 +1245,9 @@ def _view_for_div(
     tiling; how the tiling owns the buffer is :func:`_tile_view_for_div`.
     """
     splits = division.splits
-    syms = _reduction_syms(op, splits)
+    # ``division`` is one of ``op``'s own candidates, built by _core_division
+    # or OpSplitSpace.division, so its reduction axes are already known.
+    syms = division.reduction_syms
     return _per_core_view_from_prep(
         _prep_for(op, dep, buf_name, prep_cache),
         splits,
@@ -1496,7 +1499,7 @@ def build_op_split_space(
     return OpSplitSpace(
         op=op,
         context=context,
-        output_axes=frozenset(a for a in axes if write.index.coeff(a) != 0),
+        output_axes=frozenset(a for a in axes if a in write.index.free_symbols),
         factor_domains={axis: context.factor_domain(axis) for axis in axes},
         tiling=tiling,
     )
@@ -1639,8 +1642,8 @@ class ResidencyEdge:
         view across the cross product; this is the single-pair form, for a
         caller holding one untiled candidate per side rather than a list.
         """
-        parent = CoreDivision(splits=parent_splits)
-        consumer = CoreDivision(splits=consumer_splits)
+        parent = _core_division(self.parent_op, parent_splits)
+        consumer = _core_division(self.consumer_op, consumer_splits)
         if self._cores_used(parent) != self._cores_used(consumer):
             return False
         parent_view = self.parent_view(parent)
@@ -2321,12 +2324,26 @@ def log2(arg):
 def piecewise(*args):
     """``piecewise``, symbolic-aware, mirroring the :func:`sympy.Piecewise`
     API: each argument is an ``(expr, cond)`` pair, evaluated in order.
-    Dispatches to ``sympy.Piecewise`` when a condition is symbolic, otherwise
-    returns the evaluated value. The last ``cond`` must be a catch-all (e.g.
-    ``True``) so the non-symbolic loop always returns."""
-    if any(isinstance(cond, sympy.Basic) for _expr, cond in args):
-        return sympy.Piecewise(*args)
-    for expr, cond in args:
+    Arms whose condition is already false are dropped, and a condition that is
+    already true ends the list, so a decided condition selects its value
+    without building a sympy node. Dispatches to ``sympy.Piecewise`` when a
+    remaining condition is symbolic, otherwise returns the evaluated value. The
+    last ``cond`` must be a catch-all (e.g. ``True``) so the non-symbolic loop
+    always returns."""
+    kept = []
+    for value, cond in args:
+        if cond is False or cond is sympy.false:
+            continue
+        if cond is True or cond is sympy.true:
+            if not kept:
+                return value
+            kept.append((value, True))
+            break
+        kept.append((value, cond))
+
+    if any(isinstance(cond, sympy.Basic) for _expr, cond in kept):
+        return sympy.Piecewise(*kept)
+    for expr, cond in kept:
         if cond:
             return expr
     raise ValueError("piecewise(...) requires a catch-all True branch")

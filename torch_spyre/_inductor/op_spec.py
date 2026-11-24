@@ -210,16 +210,21 @@ class TensorWorkDivision:
 
         if not isinstance(other, TensorWorkDivision):
             return False
-        # core_mapping imports this module's TensorWorkDivision.
-        from .core_mapping import same_owner_maps
+        key = self.ownership_key
+        return key is not None and key == other.ownership_key
 
-        return same_owner_maps(
-            self.work_slices,
-            self.core_id_to_work_slice,
-            self.physical_core_count,
-            other.work_slices,
-            other.core_id_to_work_slice,
-            other.physical_core_count,
+    @functools.cached_property
+    def ownership_key(self) -> "tuple | None":
+        """This division's :func:`~.core_mapping.ownership_key`, computed once.
+
+        Cached on the instance, so ``work_slices`` and ``core_id_to_work_slice``
+        must not be changed after the first ownership comparison.
+        """
+        # core_mapping imports this module's TensorWorkDivision.
+        from .core_mapping import ownership_key
+
+        return ownership_key(
+            self.work_slices, self.core_id_to_work_slice, self.physical_core_count
         )
 
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
@@ -291,12 +296,12 @@ class TensorArg:
                   docs/source/compiler/hbm_pool_planning.md.
         device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
             unit step of each tiled Inductor iteration symbol (d0, d1, ...), built by
-            SpyreKernel._general_tile_advance from CoarseTileInfo.tiled_dims_per_read /
-            output_tiled_dims's per-level (dim, extent) decisions: one term per nesting
-            level, substituted with that level's own minted symbol, reprojected to
+            SpyreKernel._index_tile_advance from the coefficient of each loop's
+            variable in the access's index: one term per nesting level, in that
+            level's own symbol, reprojected to
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
-            ops without loop_info/coarse tiling.
+            ops without loop_member/coarse tiling.
         work_division: Optional tensor-specific ownership used when it differs
             from the operation's work division.
         kernel_local: True when nothing outside the kernel that produced this
@@ -392,7 +397,7 @@ class OpSpec:
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
         tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
-            to its own nesting level's trip count (CoarseTileInfo.loop_count
+            to its own nesting level's trip count (LoopMember.loop_count
             for that level). Used by SDSC codegen to compute each tiled
             tensor's full pre-tiling extent as
             (per-unit-step device element advance) * trip_count, without
