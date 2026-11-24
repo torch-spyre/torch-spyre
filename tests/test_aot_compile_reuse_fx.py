@@ -15,11 +15,7 @@
 """CPU tests: ``aot_compile`` reuses the graphs a parallel precompile pool left in
 the FX graph cache (``TORCH_SPYRE_AOT_REUSE_FX=1``)."""
 
-import inspect
 import os
-import subprocess
-import sys
-import textwrap
 
 import pytest
 import torch
@@ -112,42 +108,20 @@ def _aot_compile(fn, dynamic):
     return compiled
 
 
-def _load_in_new_process(path, tmp_path, dynamic):
-    """Loads the saved function in a fresh process with empty caches."""
-    script = tmp_path / "load.py"
-    script.write_text(
-        inspect.getsource(kern)
-        + textwrap.dedent(
-            f"""
-            import torch
-            from torch._inductor import compile_fx as cfx
-
-            calls = []
-            real = cfx.fx_codegen_and_compile
-            cfx.fx_codegen_and_compile = lambda *a, **k: calls.append(1) or real(*a, **k)
-            with open({str(path)!r}, "rb") as f:
-                fn = torch.compiler.load_compiled_function(f)
-            ok = True
-            for rows in ((4, 6) if {dynamic!r} else (4,)):
-                g = torch.Generator().manual_seed(0)
-                a = torch.randn(rows, 8, generator=g)
-                b = torch.randn(rows, 8, generator=g)
-                ok = ok and torch.allclose(fn(a, b), kern(a, b))
-            print("RESULT", ok, len(calls))
-            """
-        )
-    )
-    env = dict(os.environ, TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "empty-cache"))
-    out = subprocess.run(
-        [sys.executable, str(script)],
-        env=env,
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert out.returncode == 0, out.stderr[-4000:]
-    return out.stdout.split("RESULT")[-1].split()
+def _load_with_empty_caches(path, compiles, dynamic):
+    """Loads the saved function with empty caches and runs it: it must compile
+    nothing. In this process, not a new one: on a Spyre host a new process would
+    open the card that this one already holds (torch.compile asks the accelerator
+    for its current stream)."""
+    with fresh_cache():
+        torch._dynamo.reset()
+        compiles[0] = 0
+        with open(path, "rb") as f:
+            fn = torch.compiler.load_compiled_function(f)
+        for rows in (4, 6) if dynamic else (4,):
+            a, b = _inputs(rows)
+            assert torch.allclose(fn(a, b), kern(a, b))
+        assert compiles[0] == 0
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
@@ -168,7 +142,7 @@ def test_aot_compile_takes_the_pool_graph(
         assert len(reuse_log) == 2
         path = tmp_path / "kern.aot"
         compiled.save_compiled_function(str(path))
-    assert _load_in_new_process(path, tmp_path, dynamic) == ["True", "0"]
+    _load_with_empty_caches(path, compiles, dynamic)
 
 
 def test_switch_off_keeps_the_old_behavior(monkeypatch, compiles, reuse_log, tmp_path):
@@ -181,7 +155,7 @@ def test_switch_off_keeps_the_old_behavior(monkeypatch, compiles, reuse_log, tmp
         assert not pp._pool_fx_keys and reuse_log == []
         path = tmp_path / "kern.aot"
         compiled.save_compiled_function(str(path))
-    assert _load_in_new_process(path, tmp_path, False) == ["True", "0"]
+    _load_with_empty_caches(path, compiles, False)
 
 
 def test_another_graph_is_compiled(monkeypatch, compiles, reuse_log):
@@ -215,7 +189,7 @@ def test_an_entry_of_a_plain_compile_is_reused(
         assert reuse_log[-1].endswith("not a pool key")
         path = tmp_path / "kern.aot"
         compiled.save_compiled_function(str(path))
-    assert _load_in_new_process(path, tmp_path, False) == ["True", "0"]
+    _load_with_empty_caches(path, compiles, False)
 
 
 def test_a_stale_entry_is_not_reused(monkeypatch, compiles, reuse_log):
@@ -248,7 +222,7 @@ def test_a_corrupt_entry_is_compiled_again(monkeypatch, compiles, reuse_log, tmp
         assert "FX miss, compiled" in reuse_log[-1]
         path = tmp_path / "kern.aot"
         compiled.save_compiled_function(str(path))
-    assert _load_in_new_process(path, tmp_path, False) == ["True", "0"]
+    _load_with_empty_caches(path, compiles, False)
 
 
 def test_a_graph_built_for_the_childs_thread_count_is_not_reused(
@@ -287,6 +261,46 @@ def test_the_pool_notes_the_key_its_child_writes(monkeypatch, compiles, reuse_lo
         compiles[0] = 0
         _aot_compile(with_constant, False)
         assert compiles[0] == 0 and "reused FX entry" in reuse_log[-1]
+
+
+def test_switch_off_the_pool_keys_a_graph_with_the_modes_off(monkeypatch, compiles):
+    """With the switch off too, the pool takes a graph's key as compile_fx_inner
+    does, with the dispatch modes off, so a second pool finds the entry its child
+    wrote and forks no child for it. On the card the key helpers can raise under
+    Dynamo's fake mode: the old probe, keyed with the fake mode on, then had no key
+    and forked again for a graph the cache held. Simulated here on CPU."""
+    real = FxGraphCache.prepare_key
+
+    def raising_under_fake_mode(*args, **kwargs):
+        if torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE):
+            raise RuntimeError("a key helper that needs real tensors")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(FxGraphCache, "prepare_key", raising_under_fake_mode)
+    monkeypatch.delenv(pp.AOT_REUSE_ENV, raising=False)
+    with fresh_cache():
+        _precompile_in_pool(with_constant, False)
+        torch._dynamo.reset()
+        a, b = _inputs()
+        compiles[0] = 0
+        with pp.fork_inner_compiles(1) as pool:
+            out = torch.compile(with_constant, backend=_backend, fullgraph=True)(a, b)
+        assert (pool.submitted, compiles[0]) == (0, 0)
+        assert torch.allclose(out, with_constant(a, b))
+
+
+def test_an_unchecked_torch_release_ignores_the_switch(
+    monkeypatch, compiles, reuse_log
+):
+    monkeypatch.setenv(pp.AOT_REUSE_ENV, "1")
+    monkeypatch.setattr(pp, "AOT_REUSE_RELEASES", ((2, 0),))
+    monkeypatch.setattr(pp, "_aot_reuse_release_warned", False)
+    with fresh_cache():
+        _precompile_in_pool(kern, False)
+        compiles[0] = 0
+        _aot_compile(kern, False)
+    assert compiles[0] == 1 and not pp._pool_fx_keys
+    assert len(reuse_log) == 1 and "ignored" in reuse_log[0]
 
 
 @pytest.mark.parametrize("plain_mode", [True, False])

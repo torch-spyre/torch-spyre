@@ -736,15 +736,43 @@ def _fx_cache_has(key: Optional[str]) -> bool:
 
 AOT_REUSE_ENV = "TORCH_SPYRE_AOT_REUSE_FX"
 
-# FX graph cache keys of the graphs a pool of this process compiled in a child (or
+# The reuse rests on internals of these torch releases: which flags
+# ``compile_fx_inner`` reads, the ``precompile_enabled`` field of the FX key, and
+# why torch keeps the two caches apart (pytorch#156611). On any other release the
+# switch is ignored and ``aot_compile`` compiles as without it. A torch upgrade
+# re-checks ``_pool_graph_state``'s argument and moves this tuple, as it does
+# ``loop_scheduler.SUPPORTED_RELEASES``.
+AOT_REUSE_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
+
+# Process-wide state, like the swap of ``_spyre_inner_compile`` in
+# ``fork_inner_compiles``: compiles run on one thread at a time (Dynamo's compile
+# lock), and neither this dict nor ``_aot_reuse_counts`` is ever cleared:
+# ``_pool_fx_keys`` grows by one entry per graph key a pool sees. It holds the FX
+# graph cache keys of the graphs a pool of this process compiled in a child (or
 # found in the FX graph cache), kept while ``TORCH_SPYRE_AOT_REUSE_FX=1``, with the
 # key's debug lines, so a lookup that misses can name the fields that differ from
 # the pool's keys.
 _pool_fx_keys: dict = {}
+_aot_reuse_release_warned = False
 
 
 def _aot_reuse_on() -> bool:
-    return os.environ.get(AOT_REUSE_ENV, "0") == "1"
+    global _aot_reuse_release_warned
+    if os.environ.get(AOT_REUSE_ENV, "0") != "1":
+        return False
+    release = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
+    if release in AOT_REUSE_RELEASES:
+        return True
+    if not _aot_reuse_release_warned:
+        _aot_reuse_release_warned = True
+        logger.warning(
+            "aot_compile reuse: %s=1 ignored, torch %s is not a release it was "
+            "checked on (%s)",
+            AOT_REUSE_ENV,
+            torch.__version__,
+            ", ".join(f"{major}.{minor}" for major, minor in AOT_REUSE_RELEASES),
+        )
+    return False
 
 
 def _pool_graph_state(*args: Any, **kwargs: Any) -> tuple:
@@ -775,6 +803,8 @@ def _pool_graph_state(*args: Any, **kwargs: Any) -> tuple:
     the key so that the FX graph cache and the bundled AOTAutograd cache do not mix
     their entries (pytorch#156611). Forward graphs only.
     """
+    # ``config.patch`` below is process-wide too: safe under the same one-thread
+    # rule, and it is undone before the call returns.
     if not (_aot_reuse_on() and torch._functorch.config.bundled_autograd_cache):
         return None, ""
     if kwargs.get("is_backward", False):
