@@ -713,8 +713,19 @@ def _delinearize_index(
     separately -- peeled apart in decreasing-stride order, the same
     mixed-radix approach ``tile.py``'s ``compute_tile_offset`` uses.
 
+    A dim's coordinate can also combine a loop-index symbol AND a
+    compile-time constant together: a tile body's own offset slice along a
+    dimension that stays symbolic -- e.g. the upper half of
+    ``t.chunk(2, dim=-1)`` reads column ``d1 + 12800`` -- adds a same-dim
+    constant on top of the loop symbol (issue #6329). The mixed-radix
+    peeling above runs across every live dim, not just symbol-free ones, so
+    such a dim's digit is added onto its already-matched symbol instead of
+    only ever being assigned a bare digit; a dim needing no part of the
+    constant simply gets digit 0 added, so a symbol-only dim decomposes the
+    same way as before.
+
     Raises ``AssertionError`` if two dims share a non-zero stride, if the
-    constant portion doesn't decompose evenly across the constant dims, if
+    constant portion doesn't decompose evenly across the live dims, if
     a recovered digit is out of bounds for its dim's size, or if a leftover
     symbolic term is not an integer multiple of a single symbol or its
     coefficient is not a multiple of a stride it may be folded into -- all
@@ -737,7 +748,7 @@ def _delinearize_index(
 
     coords: list[sympy.Expr | None] = []
     seen_strides: dict[sympy.Expr, int] = {}
-    const_dims: list[int] = []
+    live_dims: list[int] = []
     for i, (sz, st) in enumerate(zip(size, stride)):
         if sz == 1:
             coords.append(sympy.Integer(0))
@@ -758,20 +769,33 @@ def _delinearize_index(
             # here, it returns the WHOLE expression unchanged.
             coords.append(sympy.Integer(0))
             continue
+        live_dims.append(i)
         sym_coeff = symbolic_remaining.coeff(st)
         if sym_coeff != 0:
             coords.append(sym_coeff)
         else:
             # No surviving symbol carries this dim's stride: either it is
             # genuinely absent (coordinate 0) or its coordinate is a literal
-            # constant folded into const_total above. Resolved below, once
-            # every constant dim is known, by peeling const_total apart from
-            # the largest stride down.
-            const_dims.append(i)
+            # constant folded into const_total above. Resolved below by
+            # peeling const_total apart from the largest stride down.
             coords.append(None)
 
+    # Peel const_total apart across every live dim, largest stride first --
+    # not only the dims with no symbol match. A dim can carry a loop symbol
+    # AND a same-dim compile-time offset together: the upper half of
+    # `t.chunk(2, dim=-1)` inside a for_each_tile body reads column
+    # `d1 + 12800`, a symbol plus a constant within the SAME marker
+    # dimension, produced by the tile body's own slicing on top of the
+    # marker's write index (issue #6329). A symbol-free dim absorbs its
+    # digit outright, as before; a symbol-matched dim gets its digit added
+    # on top of the symbol instead of only ever being assigned a bare
+    # digit -- both are positions in the same mixed-radix decomposition
+    # `tile.py`'s compute_tile_offset uses, just no longer restricted to
+    # symbol-free dims. A dim that doesn't need any part of const_total
+    # simply gets digit 0 added, so previously-passing cases decompose the
+    # same way as before.
     const_residual = const_total
-    for i in sorted(const_dims, key=lambda d: stride[d], reverse=True):
+    for i in sorted(live_dims, key=lambda d: stride[d], reverse=True):
         st = int(stride[i])
         digit, const_residual = divmod(const_residual, st)
         if digit < 0 or digit >= size[i]:
@@ -780,12 +804,15 @@ def _delinearize_index(
                 f"{i} is out of bounds for size {size[i]!r} (index "
                 f"{index!r}, offset {offset!r}, const_total {const_total!r})."
             )
-        coords[i] = sympy.Integer(digit)
+        existing_coord = coords[i]
+        coords[i] = (
+            existing_coord if existing_coord is not None else sympy.Integer(0)
+        ) + digit
     if const_residual != 0:
         raise AssertionError(
             f"_delinearize_index: {const_residual} left over after "
             f"decomposing the constant portion of index {index!r} (offset "
-            f"{offset!r}) across const dims {const_dims!r}; cannot recover "
+            f"{offset!r}) across dims {live_dims!r}; cannot recover "
             "distinct per-dim coordinates for this index."
         )
     assert all(c is not None for c in coords), (

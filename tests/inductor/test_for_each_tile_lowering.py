@@ -281,6 +281,21 @@ class TestDelinearizeIndex(unittest.TestCase):
         )
         self.assertEqual(coords, [8 * d2 + 3, d1])
 
+    def test_symbol_plus_constant_within_the_same_dim_recovers_both(self):
+        """Core #6329 repro: the upper half of a tile's own
+        ``t.chunk(2, dim=-1)`` reads column ``d1 + 12800`` from the full,
+        unsliced tile -- a loop symbol AND a same-dim compile-time offset
+        together. The symbol used to claim the whole dimension on its own,
+        leaving the chunk-boundary constant with no dim left to peel into
+        and raising instead of recovering ``d1 + 12800``."""
+        import sympy
+
+        d0, d1 = sympy.symbols("d0 d1")
+        coords = self._delinearize(
+            25600 * d0 + d1 + 12800, size=[64, 25600], stride=[25600, 1], offset=0
+        )
+        self.assertEqual(coords, [d0, d1 + 12800])
+
     def test_layout_without_foldable_dim_recovers_zero(self):
         """A [1, 1] tile (tile_size=1 over an [N, 1] operand) or a broadcast
         dim loads at index 0; with nothing left to fold, nothing must raise."""
