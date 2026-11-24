@@ -19,7 +19,7 @@ JSON output schema (array of objects)
   model_name          : config stem, e.g. "gpt-oss-20b"
   yaml_file           : config filename, e.g. "gpt-oss-20b.yaml"
   operation           : torch op name, e.g. "torch.mul"
-  classification      : "spyre_enabled" | "not_implemented" | "cpu_fallback"
+  classification      : "spyre_enabled" | "spyre_failed" | "cpu_fallback"
   test_name           : pytest node id, e.g. "test_model_ops_db_torch_mul__1_float16"
   status              : "XPASS" | "XFAIL" | "FALLBACK"
   input_shapes        : list[str] of per-tensor shape strings, e.g. ["[1,12,4096]"]
@@ -773,9 +773,7 @@ class _TestLogAnalyzer:
         key = f"{op}|{test}"
         record = {
             "operation": op,
-            "classification": "spyre_enabled"
-            if status == "XPASS"
-            else "not_implemented",
+            "classification": "spyre_enabled" if status == "XPASS" else "spyre_failed",
             "test_name": test,
             "input_shapes": shapes,
             "input_strides": strides,
@@ -816,8 +814,10 @@ def _build_spyre_failed(
     xpass_variants: list[dict], xfail_variants: list[dict]
 ) -> list[dict]:
     """
-    Build the 'spyre_failed' section: operations that have BOTH xpass AND xfail
-    variants (partial support — some shapes work, some don't).
+    Build the 'spyre_failed' section: every operation that has at least one
+    xfail variant. This includes partial support (some shapes work, some don't)
+    and ops that only have xfail variants (formerly 'not_implemented'; those
+    now have xpass_count == 0).
 
     Special handling: If an operation appears in both spyre_enabled (xpass) and
     cpu_fallback, it should be moved entirely to cpu_fallback with all details.
@@ -829,10 +829,10 @@ def _build_spyre_failed(
     for v in xfail_variants:
         xfail_by_op[v["operation"]].append(v)
 
-    mixed_ops = set(xpass_by_op) & set(xfail_by_op)
+    failed_ops = set(xfail_by_op)
     result = []
-    for op_name in sorted(mixed_ops):
-        xp = xpass_by_op[op_name]
+    for op_name in sorted(failed_ops):
+        xp = xpass_by_op.get(op_name, [])
         xf = xfail_by_op[op_name]
         result.append(
             {
@@ -933,8 +933,9 @@ def parse_log_file(
     Implements the same priority logic as run_all_test.py:
     1. CPU fallback takes precedence - ops with fallback warnings are moved from
        spyre_enabled to cpu_fallback with full variant details
-    2. Operations in both XPASS and XFAIL are classified as spyre_failed
-    3. Remaining XPASS ops are spyre_enabled, XFAIL ops are not_implemented
+    2. Operations with any XFAIL variant (including XFAIL-only ops) are
+       classified as spyre_failed
+    3. Remaining XPASS ops are spyre_enabled;
     """
     raw_lines = text.splitlines()
 
@@ -983,13 +984,10 @@ def parse_log_file(
     # Update xpass_ops set after removal
     xpass_ops = {v["operation"] for v in xpass_list}
 
-    # PRIORITY 2: Derive spyre-failed (mixed): ops with both XPASS and XFAIL variants
-    # Remove those ops from the clean spyre_enabled / not_implemented groups
-    mixed_ops = {v["operation"] for v in xpass_list} & {
-        v["operation"] for v in xfail_list
-    }
-    pure_xpass = [v for v in xpass_list if v["operation"] not in mixed_ops]
-    pure_xfail = [v for v in xfail_list if v["operation"] not in mixed_ops]
+    # PRIORITY 2: Derive spyre-failed: every op with at least one XFAIL variant
+    # (mixed XPASS/XFAIL and XFAIL-only).
+    failed_ops = {v["operation"] for v in xfail_list}
+    pure_xpass = [v for v in xpass_list if v["operation"] not in failed_ops]
 
     # Build cpu_fallback list with full variant information (matching run_all_test.py format)
     cpu_fallback_list = []
@@ -1018,14 +1016,14 @@ def parse_log_file(
         "summary": {
             "total_tests": stats["tests_total"],
             "spyre_enabled_count": len({v["operation"] for v in pure_xpass}),
-            "not_implemented_count": len({v["operation"] for v in pure_xfail}),
+            "not_implemented_count": 0,
             "cpu_fallback_count": len(analyzer.fallback_ops),
-            "spyre_failed_count": len(mixed_ops),
+            "spyre_failed_count": len(failed_ops),
         },
         # Operations breakdown
         "operations": {
             "spyre_enabled": _group_by_operation(pure_xpass),
-            "not_implemented": _group_by_operation(pure_xfail),
+            "not_implemented": [],
             "cpu_fallback": cpu_fallback_list,
             "spyre_failed": _build_spyre_failed(xpass_list, xfail_list),
         },
