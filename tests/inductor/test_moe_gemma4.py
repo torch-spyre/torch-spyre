@@ -231,7 +231,7 @@ TOPK_FLOAT_IDS = _xfail(
 )
 # topk of a DL16_TO_FP32 input (the FP32 softmax of a BF16 [12, 128] input): the
 # compiled DL16_TO_FP32 shuffle rejects the stick dim, which is not a whole stick
-# pair per core. #5495 does not help, it shuffles Pointwise ops only.
+# pair per core.
 TOPK_STAGGERED_INPUT = _xfail(
     InductorError,
     "#5856: compiled topk of a DL16_TO_FP32 input: the DL16_TO_FP32 shuffle "

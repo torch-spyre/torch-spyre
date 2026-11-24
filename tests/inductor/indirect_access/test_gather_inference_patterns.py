@@ -53,6 +53,11 @@ _GATHER_STICK_MISMATCH = (
     "(the issue reported an 'op_spec has 3 args' abort, then a 'cannot re-tile' error).",
     r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
+_CAST_STAGGERED_READ = rejection(
+    5856,
+    "Eager `topk` on device-converted FP32 tensors may produce incorrect indices due to FP16-to-FP32 conversion inaccuracies..",
+    r"eager spyre <-> cpu mismatch",
+)
 _CAST_STICK_INCOMPATIBLE = rejection(
     5856,
     "Eager topk of an fp16 tensor cast to fp32 on device: the topk reduction of the small fp32 tensor raises 'no mechanism to resolve stick incompatibility'.",
@@ -588,7 +593,7 @@ class TestGatherInferencePatternsEagerCompile:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
         _xfail_existing(
             execution_mode,
-            eager=_CAST_STICK_INCOMPATIBLE,
+            eager=_CAST_STAGGERED_READ,
             compiled=_TOPK_CAST_COMPILED,
         )
         kv = cached_randn((8, 8, 64), differentiation="topk05", dtype=torch.float16)

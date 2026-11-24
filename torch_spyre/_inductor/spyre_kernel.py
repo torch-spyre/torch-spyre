@@ -53,6 +53,7 @@ from .constants import (
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
     SHUFFLE_OP,
+    STAGGERED_EAS,
 )
 from . import config as _spyre_config
 from .core_mapping import (
@@ -118,6 +119,8 @@ from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
+
+_ALL_EAS = frozenset({ElementArrangement.STANDARD, *STAGGERED_EAS})
 
 
 class RValue(ABC):
@@ -624,6 +627,10 @@ def _matching_read_deps(
         for i, dep in enumerate(read_deps)
         if mutation_real_name.get(dep.name, dep.name) == name
     ]
+
+
+def _is_shuffle(in_ea, out_ea) -> bool:
+    return in_ea != out_ea and {in_ea, out_ea} <= _ALL_EAS
 
 
 class SpyreKernel(Kernel[CSEVariable]):
@@ -1477,12 +1484,11 @@ class SpyreKernel(Kernel[CSEVariable]):
 
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
+            in_ea = args[-2].element_arrangement
+            out_ea = args[-1].element_arrangement
             if is_restickify_coords(in_coords, out_coords):
                 op = RESTICKIFY_OP
-            elif (
-                args[-2].element_arrangement != args[-1].element_arrangement
-                and not indirect_syms_used
-            ):
+            elif _is_shuffle(in_ea, out_ea) and not indirect_syms_used:
                 op = SHUFFLE_OP
             else:
                 op = IDENTITY_OP
