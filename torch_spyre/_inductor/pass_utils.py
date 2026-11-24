@@ -18,7 +18,7 @@ import math
 import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -4664,7 +4664,8 @@ def read_with_max_reduction_overlap(
     return best_read
 
 
-class _ViewPrep(NamedTuple):
+@dataclass(frozen=True)
+class _ViewPrep:
     """Candidate-invariant precompute shared across every core-division
     candidate of one ``(op, dep, buf_name)``.
 
@@ -4693,6 +4694,14 @@ class _ViewPrep(NamedTuple):
     num_stick: int
     num_stick_stride: int
     is_matmul: bool
+    # Finished views of this ``(op, dep, buf_name)``, keyed by candidate (see
+    # ``_per_core_view_from_prep``). Every prep gets its own dict.
+    view_cache: dict = field(default_factory=dict, compare=False, repr=False)
+    # ``direct_axis_ownership_failure`` results, keyed by ``(sym, dev_dim,
+    # extent, sym's split, physical split)``: with the prep fixed, those
+    # determine every argument, and candidates that share them repeat the
+    # same proof.
+    ownership_proofs: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 def _prepare_per_core_view(
@@ -4781,7 +4790,40 @@ def _per_core_view_from_prep(
     *,
     ownership: TensorWorkDivision | None = None,
 ) -> tuple[PerCoreView, bool, bool]:
-    """Evaluate a view from complete symbol-keyed ownership or candidate splits."""
+    """Evaluate a view from complete symbol-keyed ownership or candidate splits.
+
+    Views from candidate splits are memoized on ``prep``: the same producer and
+    consumer candidates are viewed once per residency edge they take part in.
+    The result depends only on ``prep``, the splits, whether any reduction axis
+    is split, and the three config flags read below, and it is immutable.
+    """
+    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
+    if ownership is not None or prep is None:
+        return _per_core_view_from_prep_uncached(
+            prep, splits, has_partial_reduction, ownership=ownership
+        )
+    key = (
+        frozenset(splits.items()),
+        has_partial_reduction,
+        config.lx_planner_relayout,
+        config.lx_extended_ownership,
+        config.core_id_k_fast_emission,
+    )
+    result = prep.view_cache.get(key)
+    if result is None:
+        result = _per_core_view_from_prep_uncached(prep, splits, has_partial_reduction)
+        prep.view_cache[key] = result
+    return result
+
+
+def _per_core_view_from_prep_uncached(
+    prep: Optional[_ViewPrep],
+    splits: dict[sympy.Symbol, int],
+    has_partial_reduction: bool,
+    *,
+    ownership: TensorWorkDivision | None = None,
+) -> tuple[PerCoreView, bool, bool]:
+    """``_per_core_view_from_prep`` without the cache."""
     num_cores = (
         ownership.physical_core_count
         if ownership is not None
@@ -4988,13 +5030,22 @@ def _per_core_view_from_prep(
                 extent = padded_extent
             # Prove every logical partition, independent of the physical core
             # order. Step 4 preserves that order using the same partition IDs.
-            if reason := direct_axis_ownership_failure(
-                extent,
-                per_sym[sym],
-                prep.dep_device_coordinates[dev_dim].xreplace({sym: _LOOP_POINT}),
-                device_size[dev_dim],
-                split,
-            ):
+            proof_key = (sym, dev_dim, extent, per_sym[sym], split)
+            if proof_key in prep.ownership_proofs:
+                reason = prep.ownership_proofs[proof_key]
+            else:
+                reason = prep.ownership_proofs[proof_key] = (
+                    direct_axis_ownership_failure(
+                        extent,
+                        per_sym[sym],
+                        prep.dep_device_coordinates[dev_dim].xreplace(
+                            {sym: _LOOP_POINT}
+                        ),
+                        device_size[dev_dim],
+                        split,
+                    )
+                )
+            if reason:
                 logger.debug(
                     "cannot prove stride-selected ownership for iteration %s "
                     "on device dim %s: %s; require exact decomposition",
@@ -5116,7 +5167,6 @@ def _per_core_view_from_prep(
         core_to_slot=tuple(pruned_core_to_slot),
         num_cores=num_cores,
     )
-    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
     return (view, has_partial_reduction, True)
 
 
