@@ -323,8 +323,12 @@ node is not registered in `graph.name_to_op`. Each leaf op in a built node has
 `_wrap` groups runs of ops that share a `loop_group_id` prefix of length
 `depth + 1` into a node, recursively, so a longer path yields a nested node. A
 node's body is the span from its first member to its last. An op that sits between
-two members without being one (an op of no loop, or an `ExternKernel`) stays in
-the span where it is, since moving it would change program order. `collapse`
+two members without being one (an op of no loop, or an allocation) stays in the
+span where it is. An extern kernel that does work (`runs_once_outside_loops`)
+cannot run inside a counted loop, so `_wrap` moves it, from any depth, to
+immediately before the outermost node, keeping the order of the ops it moves; one
+that reads a buffer the loop writes is refused (`Unsupported`). `expand` leaves a
+moved op where it was moved. `collapse`
 (called at the end of `splice_while_loops`) and `build_pending_loop_nodes` (for
 the loop-tiling lowering) call `_wrap` and then `_record_node_facts`, which:
 
@@ -332,7 +336,8 @@ the loop-tiling lowering) call `_wrap` and then `_record_node_facts`, which:
    `_loop_chain`;
 2. sets `node.strict_loop_vars` from the members' records, and raises if the
    members of one node disagree (a loop is made by one lowering);
-3. deletes `loop_member` from every op the node holds.
+3. deletes `loop_member` from every op the node holds, and from every op moved
+   before it.
 
 ### What a member is
 

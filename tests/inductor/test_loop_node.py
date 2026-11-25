@@ -38,6 +38,7 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.deadcode_elimination import (
     _has_side_effects,
     deadcode_elimination,
@@ -334,18 +335,31 @@ class TestCollapse(unittest.TestCase):
         self.assertEqual(graph.operations, ops)
 
     def test_extern_kernel_with_loop_info_is_not_a_member(self):
+        """An extern kernel runs once, before its loop. Ahead of the loop's first
+        member it is already there, and the round trip keeps it. Between members
+        node build moves it before the node, so this round trip deliberately does
+        not give back the list it was given: ``expand`` restores the moved order."""
         ext = MagicMock(spec=ExternKernel)
         ext.loop_member = LoopMember((0,), [4], [[]], [[]])
         ext.get_name.return_value = "ext"
+        ext.is_no_op.return_value = False
+        ext.get_read_writes.return_value = ReadWrites(
+            OrderedSet(), OrderedSet([_dep("ext")]), OrderedSet()
+        )
         a = _Op("a", (0,), [4])
         out = _round_trip(self, [ext, a])
         self.assertIs(out[0], ext)
         self.assertEqual(out[1].body, [a])
-        # Between members, it stays in the span like any other non-member. (Fresh
-        # ops: the first collapse spent the lowering's record on ``a``.)
+        # Between members it is moved before the node. (Fresh ops: the first
+        # collapse spent the lowering's record on ``a``.)
         a2, b2 = _Op("a2", (0,), [4]), _Op("b2", (0,), [4])
-        (node,) = _round_trip(self, [a2, ext, b2])
-        self.assertEqual(node.body, [a2, ext, b2])
+        graph = _graph([a2, ext, b2])
+        collapse(graph)
+        moved, node = graph.operations
+        self.assertIs(moved, ext)
+        self.assertEqual(node.body, [a2, b2])
+        expand(graph)
+        self.assertEqual(graph.operations, [ext, a2, b2])
 
     def test_induction_and_carries(self):
         u0, u1 = sympy.Symbol("u0"), sympy.Symbol("u1")
@@ -1109,6 +1123,139 @@ class TestDeadcodeOnRealNestedList(unittest.TestCase):
         node = _node("loopnode0", [fb])
         survivors = self._run([node], output_names=[])
         self.assertEqual(survivors, [node])
+
+
+# ---------------------------------------------------------------------------
+# Node build moves an extern kernel out of the loop body
+# ---------------------------------------------------------------------------
+
+
+class _Extern(_Op, ExternKernel):
+    """A stub extern kernel: it runs once, so node build moves it out of a body."""
+
+    def is_no_op(self):
+        return False
+
+    # ir.Operation's dataclass __eq__ compares fields this stub never sets.
+    def __eq__(self, other):
+        return self is other
+
+    def __hash__(self):
+        return id(self)
+
+
+class _Alloc(_Extern):
+    """A stub allocation: an extern kernel that is a no-op stays where it is."""
+
+    def is_no_op(self):
+        return True
+
+
+def test_an_extern_between_members_moves_before_its_node():
+    a, b = _Op("a", gid=(0,), counts=[4]), _Op("b", gid=(0,), counts=[4])
+    ext = _Extern("ext", gid=(0,), counts=[4])
+    graph = _graph([_Op("pre"), a, ext, b])
+    collapse(graph)
+    assert [x.get_name() for x in graph.operations] == ["pre", "ext", "loopnode0"]
+    assert [x.get_name() for x in graph.operations[2].body] == ["a", "b"]
+    assert not hasattr(ext, "loop_member")  # it runs once; its record is spent
+
+
+def test_an_extern_in_a_nested_body_moves_before_the_outermost_node():
+    o1, o2 = _Op("o1", (0,), [2]), _Op("o2", (0,), [2])
+    i1, i2 = _Op("i1", (0, 0), [2, 4]), _Op("i2", (0, 0), [2, 4])
+    ext = _Extern("ext", (0, 0), [2, 4])
+    graph = _graph([o1, i1, ext, i2, o2])
+    collapse(graph)
+    assert _names(graph.operations) == ["ext", "loopnode0"]
+    outer = graph.operations[1]
+    assert ext not in list(all_ops(outer.body))
+    assert _names(all_ops(outer.body)) == ["o1", "i1", "i2", "o2"]
+    assert ext._loop_chain == ()
+    assert not hasattr(ext, "loop_member")
+
+
+def test_two_sibling_loops_each_get_their_own_extern_first():
+    a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+    c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+    e0, e1 = _Extern("e0", (0,), [4]), _Extern("e1", (1,), [4])
+    graph = _graph([a, e0, b, c, e1, d])
+    collapse(graph)
+    assert _names(graph.operations) == ["e0", "loopnode0", "e1", "loopnode1"]
+    assert graph.operations[1].body == [a, b]
+    assert graph.operations[3].body == [c, d]
+
+
+def test_moved_externs_keep_their_order():
+    a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+    e1, e2 = _Extern("e1", (0,), [4]), _Extern("e2", (0,), [4])
+    graph = _graph([a, e1, e2, b])
+    collapse(graph)
+    assert _names(graph.operations) == ["e1", "e2", "loopnode0"]
+
+
+def test_an_extern_feeding_a_body_op_still_comes_before_it():
+    a = _Op("a", (0,), [4])
+    ext = _Extern("mask", gid=(0,), counts=[4])
+    r = _Op("r", gid=(0,), counts=[4], reads=["mask"])
+    graph = _graph([a, ext, r])
+    collapse(graph)
+    assert graph.operations[0] is ext
+    assert graph.operations[1].body == [a, r]
+    expand(graph)
+    flat = graph.operations
+    assert flat.index(ext) < flat.index(r)
+
+
+def test_an_extern_reading_a_buffer_its_loop_writes_is_refused():
+    w = _Op("w", gid=(0,), counts=[4])
+    ext = _Extern("ext", gid=(0,), counts=[4], reads=["w"])
+    with pytest.raises(Unsupported, match=r"reads \['w'\], which the loop writes"):
+        collapse(_graph([w, ext, _Op("z", gid=(0,), counts=[4])]))
+
+
+def test_an_extern_reading_a_carry_storage_is_refused():
+    """The update writes the carry's storage in place, not under its own name;
+    an extern in the body that reads the storage cannot run before the loop."""
+    init = _Op("acc")
+    upd = _Op("upd", (0,), [4], reads=["acc"], writes=["upd"])
+    upd.layout = MagicMock(spec=MutationLayoutSHOULDREMOVE)
+    upd.layout.get_buffer.return_value = init
+    # _mutation_target only accepts a ComputedBuffer.
+    upd.__class__ = type("_MutOp", (_Op, ComputedBuffer), {})
+    ext = _Extern("ext", (0,), [4], reads=["acc"])
+    z = _Op("z", (0,), [4])
+    with pytest.raises(
+        Unsupported,
+        match=r"_Extern ext in counted loop loopnode0 reads \['acc'\], which the "
+        r"loop writes, so it cannot be placed before the loop",
+    ):
+        collapse(_graph([init, upd, ext, z]))
+
+
+def test_an_allocation_in_a_body_stays_in_place():
+    a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+    alloc = _Alloc("alloc", (0,), [4])
+    graph = _graph([a, alloc, b])
+    collapse(graph)
+    (node,) = graph.operations
+    assert node.body == [a, alloc, b]
+
+
+def test_expand_after_a_move_keeps_producers_first():
+    pre = _Op("pre")
+    a = _Op("a", (0,), [4], reads=["pre"])
+    ext = _Extern("ext", (0,), [4], reads=["pre"])
+    r = _Op("r", (0,), [4], reads=["a", "ext"])
+    graph = _graph([pre, a, ext, r])
+    collapse(graph)
+    expand(graph)
+    flat = graph.operations
+    assert _names(flat) == ["pre", "ext", "a", "r"]
+    seen: set[str] = set()
+    for op in flat:
+        assert {d.name for d in op.get_read_writes().reads} <= seen, op
+        seen.add(op.get_name())
 
 
 if __name__ == "__main__":

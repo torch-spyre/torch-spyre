@@ -24,6 +24,14 @@ around each leaf op (``_loop_chain``).  The record is then deleted from every op
 node holds: after the build the nodes are the only owner of the facts, and a pass
 that adds an op to a loop says what it tiles with :func:`record_member`.
 
+A node's body is the span from the loop's first member to its last.  An op that
+sits in that span but is not a member is kept there, in place, with one exception:
+an extern kernel that does work (:func:`runs_once_outside_loops`) cannot run inside
+a counted loop, so node build moves it immediately before the outermost node of its
+loop, keeping the program order of the ops it moves.  Where an op is placed then
+says how it runs.  One that reads a buffer the loop writes cannot go before the
+loop, and node build refuses it (``Unsupported``).
+
 Passes that read the graph flat run against :class:`OpsView`, which iterates
 the leaf ops in program order and refuses edits: a pass that changes the graph
 names the position with the helpers below (``insert_before``, ``move_after``,
@@ -46,6 +54,7 @@ import sympy
 from torch._inductor import dependencies, ir
 from torch.utils._ordered_set import OrderedSet
 
+from .errors import Unsupported
 from .loop_facts import counted_loop_path
 
 if TYPE_CHECKING:
@@ -780,6 +789,35 @@ def _group_path(op: ir.Operation) -> tuple[int, ...]:
     return counted_loop_path(op)
 
 
+def runs_once_outside_loops(op: ir.Operation) -> bool:
+    """True for an op Spyre runs once, outside every counted loop: an extern
+    kernel that does work. Spyre's codegen cannot run one inside a counted loop.
+    A no-op (an allocation such as a zero-element buffer) stays where it is
+    placed, and a ``ComputedBuffer`` is not an extern kernel."""
+    return isinstance(op, ir.ExternKernel) and not op.is_no_op()
+
+
+def _place_before_loop(
+    out: list[ir.Operation], node: LoopNode, ops: list[ir.Operation]
+) -> None:
+    """Append ``ops``, in order, to ``out`` ahead of ``node``: they run once, before
+    the loop. Raises ``Unsupported`` for one that reads a buffer a leaf of ``node``
+    writes (its output, or the storage it mutates), which before the loop would
+    read a value the loop has not produced yet."""
+    if ops:
+        written = {d.name for d in node.get_read_writes().writes}
+        written |= {buf.get_name() for buf in node.get_outputs()}
+        for op in ops:
+            produced = {d.name for d in op.get_read_writes().reads} & written
+            if produced:
+                raise Unsupported(
+                    f"{type(op).__name__} {op.get_name()} in counted loop "
+                    f"{node.get_name()} reads {sorted(produced)}, which the loop "
+                    "writes, so it cannot be placed before the loop"
+                )
+    out.extend(ops)
+
+
 def _carries_of(body: list[ir.Operation]) -> tuple[Any, ...]:
     """``_loop_carry_record``s on the ops directly in ``body``, deduplicated."""
     records: list[Any] = []
@@ -797,16 +835,28 @@ def _wrap(
     inductions: Mapping[int, sympy.Symbol],
     counter: list[int],
     only: frozenset[int] | None = None,
+    moved: list[ir.Operation] | None = None,
 ) -> list[ir.Operation]:
     """Wrap runs of ``ops`` sharing a ``loop_group_id`` prefix of length
     ``depth + 1`` (and extending ``prefix``) into ``LoopNode``s, recursively.
 
     A node's body is the span from its first member to its last member.  An
     op that sits between two members but is not one (no ``loop_member``, an
-    ``ExternKernel``, or an op of another loop) is kept in that span, where it
-    is: moving it would change the program order, and :func:`expand` must give
-    back exactly the list it was given.  Inside the node it is an ordinary
-    body entry; it is wrapped further only if its own path extends the node's.
+    op of another loop) is kept in that span, where it is.  Inside the node it
+    is an ordinary body entry; it is wrapped further only if its own path
+    extends the node's.
+
+    The exception is an op that :func:`runs_once_outside_loops` (an extern
+    kernel that does work): it is taken out of the span, at any depth, and
+    placed immediately before the OUTERMOST node, the ops moved out of one loop
+    in their program order (:func:`_place_before_loop`, which refuses one that
+    reads a buffer the loop writes).  A span holds its nested loops' ops too, so
+    the depth-0 call takes out every such op; one a ``depth > 0`` call takes out
+    is appended to ``moved``, its caller's list, and so also lands before the
+    outermost node.  The depth-0 call appends what it moved to ``moved`` as
+    well, for :func:`_record_node_facts` to spend the records.  :func:`expand`
+    does not restore a moved op's original position: the moved order is the
+    program.
     """
     out: list[ir.Operation] = []
     i = 0
@@ -824,7 +874,8 @@ def _wrap(
         last = max(
             k for k in range(i, len(ops)) if _group_path(ops[k])[: depth + 1] == key
         )
-        run = ops[i : last + 1]
+        run = [op for op in ops[i : last + 1] if not runs_once_outside_loops(op)]
+        hoisted = [op for op in ops[i : last + 1] if runs_once_outside_loops(op)]
         group_idx = key[-1]
         node = LoopNode(
             f"loopnode{counter[0]}",
@@ -834,8 +885,12 @@ def _wrap(
             trip_count=ops[i].loop_member.loop_count[depth],  # type: ignore[attr-defined]
         )
         counter[0] += 1
-        node.body = _wrap(run, depth + 1, key, inductions, counter, only)
+        node.body = _wrap(run, depth + 1, key, inductions, counter, only, hoisted)
         node.carries = _carries_of(node.body)
+        if depth == 0:
+            _place_before_loop(out, node, hoisted)
+        if moved is not None:
+            moved.extend(hoisted)
         out.append(node)
         i = last + 1
     return out
@@ -873,11 +928,12 @@ def build_pending_loop_nodes(graph: Any) -> None:
     operations = graph.operations
     assert not isinstance(operations, OpsView), "needs the real list"
     existing = sum(1 for _ in _nodes_in(operations))
+    moved: list[ir.Operation] = []
     with building_loop():
         operations[:] = _wrap(
-            list(operations), 0, (), pending, [existing], frozenset(pending)
+            list(operations), 0, (), pending, [existing], frozenset(pending), moved
         )
-        _record_node_facts(operations)
+        _record_node_facts(operations, moved)
 
 
 def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
@@ -887,10 +943,13 @@ def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
             yield from _nodes_in(op.body)
 
 
-def _record_node_facts(operations: list[ir.Operation]) -> None:
+def _record_node_facts(
+    operations: list[ir.Operation], moved: Iterable[ir.Operation] = ()
+) -> None:
     """Fill every node's per-member tiling and every leaf's node chain, after the
     nodes were built from the ops' ``loop_member``, then drop that record from the
-    ops the nodes hold."""
+    ops the nodes hold and from the ops ``_wrap`` moved before a node (``moved``):
+    those run once, outside every loop, so their record is spent too."""
     for entry in operations:
         _set_chain(entry, ())
         _fill_tiling(entry)
@@ -922,6 +981,9 @@ def _record_node_facts(operations: list[ir.Operation]) -> None:
         for leaf in all_ops(node.body):
             if hasattr(leaf, "loop_member"):
                 del leaf.loop_member  # type: ignore[attr-defined]
+    for op in moved:
+        if hasattr(op, "loop_member"):
+            del op.loop_member  # type: ignore[attr-defined]
 
 
 def collapse(
@@ -937,14 +999,18 @@ def collapse(
     assert not isinstance(operations, OpsView), "collapse needs the real list"
     if not any(_group_path(op) for op in operations):
         return
+    moved: list[ir.Operation] = []
     with building_loop():
-        operations[:] = _wrap(list(operations), 0, (), inductions or {}, [0])
-        _record_node_facts(operations)
+        operations[:] = _wrap(
+            list(operations), 0, (), inductions or {}, [0], None, moved
+        )
+        _record_node_facts(operations, moved)
 
 
 def expand(graph: Any) -> None:
     """Flatten every ``LoopNode`` in ``graph.operations`` back to its leaf ops,
-    in program order, in place.  The inverse of :func:`collapse`."""
+    in program order, in place.  The inverse of :func:`collapse`, except that an
+    extern kernel :func:`collapse` moved before its loop stays there."""
     operations = graph.operations
     assert not isinstance(operations, OpsView), "expand needs the real list"
     if not has_loop_nodes(operations):
