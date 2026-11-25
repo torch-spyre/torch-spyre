@@ -21,16 +21,21 @@ from utils_inductor import cached_randn, compare_with_cpu, strict_xfail
 
 
 def _xfail_fp16_large_reduction(request):
-    """Strict xfail for an fp16 norm reducing over 50k-400k elements.
+    """Non-strict xfail for an fp16 norm reducing over 50k-400k elements.
 
-    ``var`` runs on Spyre, but its fp16 mean over a reduction this large drifts
-    past the fp16 tolerance (atol 1e-3, rtol 1e-2): up to 0.03-0.09 on a few
-    hundred to 18% of the elements. Local result on deeptools for main 0d212328.
+    ``var`` runs on Spyre, but its fp16 mean over a reduction this large sits
+    at the edge of the fp16 tolerance (atol 1e-3, rtol 1e-2). Whether it passes
+    varies with the backend build and the reduction order: locally it is up to
+    0.03-0.09 off on a few hundred to 18% of the elements, while the compiled
+    group_norm cases did not fail that way in CI and pass locally under
+    deterministic mode. So an unexpected pass must not fail the run.
     """
-    strict_xfail(
-        request,
-        AssertionError,
-        "fp16 reduction over 50k-400k elements exceeds the fp16 tolerance",
+    request.applymarker(
+        pytest.mark.xfail(
+            strict=False,
+            reason="fp16 reduction over 50k-400k elements is at the edge of "
+            "the fp16 tolerance; the outcome varies with the backend build",
+        )
     )
 
 
