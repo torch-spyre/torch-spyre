@@ -729,30 +729,41 @@ def _delinearize_index(
     (digit 2 of 37, base 10, carries into digit 1); it is not a new kind of
     answer, just the same peeling reaching one dim further than before.
 
-    This only recovers a coordinate that is valid once the loop symbol
-    takes its real runtime value -- it does not, and cannot, check that
-    itself: the symbol's own range never reaches this function. What makes
-    it sound anyway is the one call site (``_InlineMarkerHandler.load``):
-    ``index`` is always a genuine Inductor load-site index into a buffer
-    shaped exactly like ``size``/``stride``/``offset``, so the FULL
-    coordinate (symbol plus any digit folded onto it) is guaranteed
-    in-bounds by Inductor's own indexing invariant for every concrete value
-    the symbol takes -- the same guarantee the pre-existing symbol-only
-    branch already leaned on without checking it either. A digit computed
-    here independently of any symbol (no matching coefficient at all) is
-    still fully checked below, since nothing but this function vouches for
-    it.
+    Landing a nonzero digit onto a dim that already carries a symbol is
+    gated on ``fold_into_any_dim`` -- the same gate the coeff-multiple-of-
+    stride fold below already uses, and for the same reason. The one call
+    site (``_InlineMarkerHandler.load``) only guarantees that ``index`` is
+    a genuine Inductor load-site index into a buffer shaped exactly like
+    ``size``/``stride``/``offset``, which by Inductor's own indexing
+    invariant keeps the FLAT index in bounds for every concrete value the
+    symbol takes -- it says nothing about any one per-dim coordinate, which
+    is simply whatever split this function happens to produce. So the
+    combined symbol-plus-digit coordinate can carry past its own dim's
+    size for some values the symbol takes, the same way an inner dim can
+    overflow in the coeff-multiple-of-stride fold below (e.g. ``128*r``
+    into ``[2, 4, 64]`` gives ``b + 2*r``, up to 7). That is harmless only
+    when the caller recomposes the coordinates through the marker's own
+    strides afterward -- every exact split then sums back to the same flat
+    address regardless of any one coordinate's range -- which is exactly
+    what ``fold_into_any_dim`` (``_reads_at_own_strides``) establishes for
+    this call site. Without it, this function refuses rather than hand
+    back a coordinate whose range nothing here can vouch for. A digit
+    landing on a dim with no symbol match is unaffected by this gate: its
+    own value is fully bounds-checked below (``digit >= size[i]``), so it
+    is sound regardless of ``fold_into_any_dim`` -- the same way the
+    pre-existing symbol-only branch's coordinate was never bounds-checked
+    either and did not need to be.
 
     Raises ``AssertionError`` if two dims share a non-zero stride, if the
     constant portion doesn't decompose evenly across the live dims, if
-    a recovered digit is out of bounds for its dim's size, or if a leftover
-    symbolic term is not an integer multiple of a single symbol or its
-    coefficient is not a multiple of a stride it may be folded into -- all
-    of which indicate the one-symbol/one-stride-per-term assumption above
-    doesn't hold for this index. A digit that lands on a symbol-matched dim
-    is bounds-checked the same way (``digit >= size[i]``); the symbol's own
-    contribution to that dim is not and relies on the caller invariant
-    above.
+    a recovered digit is out of bounds for its dim's size, if a nonzero
+    digit would land on a dim that already carries a symbol while
+    ``fold_into_any_dim`` is false, or if a leftover symbolic term is not
+    an integer multiple of a single symbol or its coefficient is not a
+    multiple of a stride it may be folded into -- all of which indicate
+    the one-symbol/one-stride-per-term assumption above doesn't hold for
+    this index, or that combining a digit with a symbol on the same dim
+    is not safe for this caller.
     """
     remaining = sympy.expand(index - offset)
     free_syms = remaining.free_symbols
@@ -815,7 +826,10 @@ def _delinearize_index(
     # `tile.py`'s compute_tile_offset uses, just no longer restricted to
     # symbol-free dims. A dim that doesn't need any part of const_total
     # simply gets digit 0 added, so previously-passing cases decompose the
-    # same way as before.
+    # same way as before. Combining a NONZERO digit onto an already-matched
+    # symbol is only in-bounds once composed through the marker's own
+    # strides (see the docstring), so it requires fold_into_any_dim; a zero
+    # digit changes nothing and is never gated.
     const_residual = const_total
     for i in sorted(live_dims, key=lambda d: stride[d], reverse=True):
         st = int(stride[i])
@@ -827,6 +841,15 @@ def _delinearize_index(
                 f"{index!r}, offset {offset!r}, const_total {const_total!r})."
             )
         existing_coord = coords[i]
+        if digit != 0 and existing_coord is not None and not fold_into_any_dim:
+            raise AssertionError(
+                f"_delinearize_index: a compile-time offset of {digit} for "
+                f"dim {i} would land on top of that dim's own loop symbol "
+                f"{existing_coord!r} (index {index!r}, offset {offset!r}); "
+                "combining them is only safe when the caller composes "
+                "coordinates through the marker's own strides "
+                "(fold_into_any_dim=True)."
+            )
         coords[i] = (
             existing_coord if existing_coord is not None else sympy.Integer(0)
         ) + digit
