@@ -363,9 +363,11 @@ _copy_canonical_tests(
 REDUCTION_WRAP_EXPECT_RAISE = {
     # fp32 -> fp16 on a 1D unaligned tensor (100 elements, not a multiple of 64): the
     # wrap sums the FP32_TO_DL16 result over its stick, which the compiler rejects
-    # until the backend masking bug is fixed.
-    # TODO(#4014): this becomes a positive test when #4014 lands.
+    # until the backend masking bug is fixed. The round-trip copy variant returns the
+    # fp16 destination as well, so its wrap sums the same staggered tensor.
+    # TODO(#4014): these become positive tests when #4014 lands.
     "test_to_dtype_float32_to_float16_100": "issue #4014",
+    "test_round_trip_to_dtype_copy_float32_to_float16_100": "issue #4014",
 }
 
 for _base_name, _fragment in REDUCTION_WRAP_EXPECT_RAISE.items():
