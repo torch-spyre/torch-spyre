@@ -36,9 +36,11 @@ What it checks:
    index uses an enclosing loop's variable must hold a tiling entry in those nodes
    (an op without one reads as "not in the loop", which would drop its advance
    silently).
-7. No body holds an extern kernel that does work (``runs_once_outside_loops``):
-   Spyre cannot run one inside a counted loop, so it runs once, before the loop.
-   An allocation (a no-op extern kernel) may stay in a body.
+7. No body holds an extern kernel that ``runs_once_outside_loops`` (a Spyre
+   extern kernel): Spyre cannot run one inside a counted loop, so it runs once,
+   before the loop. An allocation (a zero-element ``ComputedBuffer``) is not an
+   extern kernel and may stay in a body, and so may an extern kernel on another
+   device.
 
 A loop no node covers is not checked: a loop-tiling lowering requests its
 nodes and the pass loop builds them once the pass has returned. So rule 4 fires

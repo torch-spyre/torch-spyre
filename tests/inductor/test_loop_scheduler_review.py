@@ -776,7 +776,7 @@ def test_constant_written_in_a_body_runs_once_before_the_loop():
     )
 
 
-def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
+def test_extern_inside_a_loop_node_trips_the_scheduler_assertion_on_a_real_compile():
     """A pass that put an extern kernel in a LoopNode body by direct list
     manipulation (bypassing ``insert_at_start``, which refuses it) reaches the
     scheduler's assertion: ``create_scheduler_node`` raises ``RuntimeError``

@@ -83,7 +83,8 @@ def _version(text):
 
 
 class _NopExtern(ir.ExternKernel):
-    """An op whose ``is_no_op()`` is true, like a zero-element allocation."""
+    """Stands for the defensive ``is_no_op()`` clause, not for a production kind:
+    real allocations are zero-element ``ComputedBuffer``s, not extern kernels."""
 
     def is_no_op(self):
         return True
@@ -784,6 +785,16 @@ class TestSchedulerFrontHalf(_Graph):
             "extern kernel .* in the body of .*: the IR places it before the loop",
         ):
             self._scheduler().create_scheduler_node(loop)
+
+    def test_an_extern_on_another_device_in_a_body_is_still_hoisted(self):
+        # The assertion is gated by runs_once_outside_loops: a CPU extern kernel
+        # stays where it is in the IR and the scheduler hoists it, as before.
+        t = self._buf("t", reads="x")
+        ext = self._extern("ext", reads="x", device="cpu")
+        loop = self._loop("loopnode0", [ext, t])
+        sched = self._scheduler()
+        node = sched.create_scheduler_node(loop)
+        self.assertEqual([n.get_name() for n in node.hoisted], ["ext"])
 
     def test_body_with_no_kernel_is_refused(self):
         ext = self._nop("ext", reads="x")

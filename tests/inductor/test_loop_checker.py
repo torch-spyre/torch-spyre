@@ -107,7 +107,8 @@ class _ExternLoopOp(_LoopOp, ExternKernel):
 
 
 class _AllocationLoopOp(_ExternLoopOp):
-    """An extern kernel that does no work (an allocation): it may stay in a body."""
+    """Stands for the defensive ``is_no_op()`` clause, not for a production kind:
+    real allocations are zero-element ``ComputedBuffer``s, not extern kernels."""
 
     def is_no_op(self):
         return True
@@ -283,6 +284,16 @@ class TestMembership(unittest.TestCase):
                 ],
             )
         ]
+        self.assertEqual(find_violations(tree), [])
+
+    def test_an_extern_on_another_device_in_a_body_is_allowed(self):
+        """Rule 7 is Spyre's: ``runs_once_outside_loops`` is false on the CPU."""
+
+        class _CpuExtern(_ExternLoopOp):
+            def get_device(self):
+                return torch.device("cpu")
+
+        tree = [_node("n0", [_LoopOp("a", (0,)), _CpuExtern("x", (0,))])]
         self.assertEqual(find_violations(tree), [])
 
     def test_a_node_with_no_member_is_not_checked(self):

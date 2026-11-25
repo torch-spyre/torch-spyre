@@ -1152,7 +1152,9 @@ class _Extern(_Op, ExternKernel):
 
 
 class _Alloc(_Extern):
-    """A stub allocation: an extern kernel that is a no-op stays where it is."""
+    """Stands for the defensive ``is_no_op()`` clause of ``runs_once_outside_loops``,
+    not for a production kind: real allocations are zero-element ``ComputedBuffer``s,
+    which are not extern kernels at all."""
 
     def is_no_op(self):
         return True
@@ -1238,6 +1240,59 @@ def test_an_extern_reading_a_carry_storage_is_refused():
         r"loop writes, so it cannot be placed before the loop",
     ):
         collapse(_graph([init, upd, ext, z]))
+
+
+def test_an_extern_mutating_a_buffer_the_loop_reads_is_refused():
+    """Moving it before the loop would change what the body reads: it ran after
+    the first member, which read the old value."""
+    x = _Op("X")
+    a = _Op("a", (0,), [4], reads=["X"])
+    ext = _Extern("ext", (0,), [4], reads=["X"], writes=["ext", "X"])
+    b = _Op("b", (0,), [4])
+    with pytest.raises(
+        Unsupported,
+        match=r"_Extern ext in counted loop loopnode0 writes \['X'\], which the "
+        r"loop reads or writes, so it cannot be placed before the loop",
+    ):
+        collapse(_graph([x, a, ext, b]))
+
+
+def test_an_extern_mutating_a_buffer_the_loop_writes_is_refused():
+    w = _Op("w", (0,), [4])
+    ext = _Extern("ext", (0,), [4], writes=["ext", "w"])
+    with pytest.raises(Unsupported, match=r"writes \['w'\], which the loop reads"):
+        collapse(_graph([w, ext, _Op("z", (0,), [4])]))
+
+
+def test_an_extern_reporting_a_mutation_name_is_refused():
+    class _Mutating(_Extern):
+        def get_mutation_names(self):
+            return ["X"]
+
+    a = _Op("a", (0,), [4], reads=["X"])
+    ext = _Mutating("ext", (0,), [4])
+    with pytest.raises(Unsupported, match=r"writes \['X'\]"):
+        collapse(_graph([_Op("X"), a, ext, _Op("b", (0,), [4])]))
+
+
+def test_an_extern_writing_only_its_own_output_still_moves():
+    """The extern's own output is read by a body op, and the loop 'reads' it, but
+    nothing in the body touched it before the extern ran."""
+    a = _Op("a", (0,), [4])
+    ext = _Extern("ext", (0,), [4])
+    r = _Op("r", (0,), [4], reads=["ext"])
+    graph = _graph([a, ext, r])
+    collapse(graph)
+    assert _names(graph.operations) == ["ext", "loopnode0"]
+
+
+def test_inserting_an_extern_that_mutates_a_loop_buffer_is_refused():
+    a = _Op("a", reads=["X"])
+    node = _node("n0", [a])
+    real = [node]
+    with pytest.raises(Unsupported, match=r"writes \['X'\], which the loop reads"):
+        insert_after(real, a, _Extern("ext", writes=["ext", "X"]))
+    assert real == [node]
 
 
 class _CpuExtern(_Extern):

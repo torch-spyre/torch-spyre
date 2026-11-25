@@ -324,10 +324,15 @@ node is not registered in `graph.name_to_op`. Each leaf op in a built node has
 `depth + 1` into a node, recursively, so a longer path yields a nested node. A
 node's body is the span from its first member to its last. An op that sits between
 two members without being one (an op of no loop, or an allocation) stays in the
-span where it is. An extern kernel that does work (`runs_once_outside_loops`)
+span where it is. A Spyre extern kernel (one that `runs_once_outside_loops`)
 cannot run inside a counted loop, so `_wrap` moves it, from any depth, to
-immediately before the outermost node, keeping the order of the ops it moves; one
-that reads a buffer the loop writes is refused (`Unsupported`). `expand` leaves a
+immediately before the outermost node, keeping the order of the ops it moves. One
+that reads a buffer the loop writes, or writes (mutates) a buffer the loop reads or
+writes, is refused (`Unsupported`): before the loop it would read a value not yet
+produced, or change what the body reads. The refusal set also includes a body
+allocation and a non-member output the extern reads: the old scheduler hoisted
+both, and refusing them is harmless. An extern kernel on another device is not
+moved. `expand` leaves a
 moved op where it was moved. `collapse`
 (called at the end of `splice_while_loops`) and `build_pending_loop_nodes` (for
 the loop-tiling lowering) call `_wrap` and then `_record_node_facts`, which:
@@ -414,9 +419,11 @@ body op keeps the op in that body (it runs every trip). Each helper keeps the op
 `_loop_chain` and the nodes' `tiling` right, and each accepts the `OpsView` or the
 real nested list.
 
-An extern kernel never goes in a body. `insert_before`, `insert_after`, `move_before`
-and `move_after` put one next to a body anchor before the anchor's outermost loop
-(or raise `Unsupported` if it reads what the loop writes); `insert_at_start`,
+A Spyre extern kernel (one that `runs_once_outside_loops`) never goes in a body;
+one on another device is placed like any op. `insert_before`, `insert_after`,
+`move_before` and `move_after` put one next to a body anchor before the anchor's
+outermost loop (or raise `Unsupported` if it reads what the loop writes, or writes
+what the loop reads or writes); `insert_at_start`,
 `insert_on_back_edge` and `replace_op` name a body position, so they raise
 `ValueError` for one. An allocation (a no-op) can still go in a body.
 
@@ -462,9 +469,13 @@ otherwise; `building_loop()` suspends it while a loop is half built. The rules:
 4. An op that runs in a counted loop a node covers sits inside that node, not
    outside it and not in the body of another loop's node.
 5. A node's body holds no op that is not a member of the loop (an `ExternKernel`
-   is allowed: the scheduler hoists a once-op out).
+   is reported by rule 7 instead).
 6. An op in nodes the pipeline built points at exactly those nodes
    (`_loop_chain`) and carries no `loop_member`.
+7. No body holds an extern kernel that `runs_once_outside_loops` (a Spyre extern
+   kernel): Spyre cannot run one inside a counted loop, so it runs once, before the
+   loop. An allocation (a zero-element `ComputedBuffer`) is not an extern kernel and
+   may stay in a body, and so may an extern kernel on another device.
 
 ## Carries
 
@@ -512,10 +523,11 @@ reads `min_order` and `max_order` before `compute_ancestors` has set them, and
 leaves `node` unset where `compute_dependencies` expects one. It carries the
 `LoopNode` as `node`, and `loop_count` is the node's `trip_count`.
 
-- **Allocations.** The IR guarantees that no Spyre extern kernel is in a body: node
-  build and the edit helpers place it before the loop (`runs_once_outside_loops`).
-  One that reaches the scheduler is a bug in a pass that bypassed them, and raises
-  `RuntimeError`. A no-op body op (an allocation) becomes an ordinary scheduler node
+- **Allocations.** The IR guarantees that no Spyre extern kernel (one that
+  `runs_once_outside_loops`) is in a body: node build and the edit helpers place it
+  before the loop. One that reaches the scheduler is a bug in a pass that bypassed
+  them, and raises `RuntimeError`. An extern kernel on another device is not
+  covered by that guarantee, and the scheduler still hoists it. A no-op body op (an allocation) becomes an ordinary scheduler node
   emitted once, immediately before the outermost loop's kernel. This is a
   code-generation detail and is equivalent, because a pooled allocation is static
   and has no data effect. One that reads a buffer the loop writes is refused with

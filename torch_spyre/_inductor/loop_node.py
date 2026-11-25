@@ -26,11 +26,12 @@ that adds an op to a loop says what it tiles with :func:`record_member`.
 
 A node's body is the span from the loop's first member to its last.  An op that
 sits in that span but is not a member is kept there, in place, with one exception:
-an extern kernel that does work (:func:`runs_once_outside_loops`) cannot run inside
+a Spyre extern kernel (:func:`runs_once_outside_loops`) cannot run inside
 a counted loop, so node build moves it immediately before the outermost node of its
 loop, keeping the program order of the ops it moves.  Where an op is placed then
 says how it runs.  One that reads a buffer the loop writes cannot go before the
-loop, and node build refuses it (``Unsupported``).
+loop, and node build refuses it (``Unsupported``); so does one that writes a
+buffer the loop reads or writes.
 
 Passes that read the graph flat run against :class:`OpsView`, which iterates
 the leaf ops in program order and refuses edits: a pass that changes the graph
@@ -613,6 +614,7 @@ def _extern_entry(
     if entry is anchor:
         return None
     assert isinstance(entry, LoopNode)
+    # Called for its refusal alone: nothing is appended to the throwaway list.
     _place_before_loop([], entry, [op])
     return entry
 
@@ -644,7 +646,16 @@ def insert_before(
     is raised if it reads what that loop writes.
     """
     real = _real_list(operations)
-    entry = _extern_entry(real, anchor, op)
+    _insert_before(real, anchor, op, _extern_entry(real, anchor, op))
+
+
+def _insert_before(
+    real: list[ir.Operation],
+    anchor: ir.Operation,
+    op: ir.Operation,
+    entry: ir.Operation | None,
+) -> None:
+    """:func:`insert_before` with ``entry`` (:func:`_extern_entry`) already computed."""
     lst, i = _holder(real, anchor if entry is None else entry)
     lst.insert(i, op)
     _adopt(real, op)
@@ -669,11 +680,18 @@ def insert_after(
     anchor's outermost loop (see :func:`insert_before`), not after the anchor.
     """
     real = _real_list(operations)
-    entry = _extern_entry(real, anchor, op)
+    _insert_after(real, anchor, op, _extern_entry(real, anchor, op))
+
+
+def _insert_after(
+    real: list[ir.Operation],
+    anchor: ir.Operation,
+    op: ir.Operation,
+    entry: ir.Operation | None,
+) -> None:
+    """:func:`insert_after` with ``entry`` (:func:`_extern_entry`) already computed."""
     if entry is not None:
-        lst, i = _holder(real, entry)
-        lst.insert(i, op)
-        _adopt(real, op)
+        _insert_before(real, anchor, op, entry)
         return
     lst, i = _holder(real, anchor)
     lst.insert(i + 1, op)
@@ -754,12 +772,12 @@ def _move(
     # Find both before touching either list, so a missing one changes nothing.
     _holder(real, op)
     _holder(real, anchor)
-    _extern_entry(real, anchor, op)  # refuse before anything is detached
+    entry = _extern_entry(real, anchor, op)  # refuse before anything is detached
     if isinstance(op, LoopNode) and owning_list(op.body, anchor) is not None:
         # Taking the node out would take the anchor with it.
         raise ValueError(f"cannot move {op!r} relative to {anchor!r}, which it holds")
     _detach(real, op)
-    (insert_after if after else insert_before)(real, anchor, op)
+    (_insert_after if after else _insert_before)(real, anchor, op, entry)
 
 
 def move_before(
@@ -840,9 +858,9 @@ def _group_path(op: ir.Operation) -> tuple[int, ...]:
 
 def runs_once_outside_loops(op: ir.Operation) -> bool:
     """True for an op Spyre runs once, outside every counted loop: an extern
-    kernel that does work, on the Spyre device. Spyre's codegen cannot run one
-    inside a counted loop. A no-op (an allocation such as a zero-element buffer)
-    stays where it is placed, and a ``ComputedBuffer`` is not an extern kernel.
+    kernel on the Spyre device. Spyre's codegen cannot run one inside a counted
+    loop. An allocation (a zero-element ``ComputedBuffer``) is not an extern
+    kernel and stays where it is placed; the ``is_no_op()`` clause is defensive.
 
     The rule is Spyre codegen's, so an extern kernel on another device (a graph
     lowered on CPU tensors, whose matmul is ``aten.mm``) stays where it is placed.
@@ -861,10 +879,15 @@ def _place_before_loop(
     """Append ``ops``, in order, to ``out`` ahead of ``node``: they run once, before
     the loop. Raises ``Unsupported`` for one that reads a buffer a leaf of ``node``
     writes (its output, or the storage it mutates), which before the loop would
-    read a value the loop has not produced yet."""
+    read a value the loop has not produced yet, and for one that writes a buffer
+    the loop reads or writes (a mutation), which before the loop would change
+    what the body reads, or be overwritten by it. An op's own output is not
+    counted: no body op touches it before the op runs."""
     if ops:
-        written = {d.name for d in node.get_read_writes().writes}
+        rw = node.get_read_writes()
+        written = {d.name for d in rw.writes}
         written |= {buf.get_name() for buf in node.get_outputs()}
+        touched = written | {d.name for d in rw.reads}
         for op in ops:
             produced = {d.name for d in op.get_read_writes().reads} & written
             if produced:
@@ -872,6 +895,18 @@ def _place_before_loop(
                     f"{type(op).__name__} {op.get_name()} in counted loop "
                     f"{node.get_name()} reads {sorted(produced)}, which the loop "
                     "writes, so it cannot be placed before the loop"
+                )
+            mutated = {d.name for d in op.get_read_writes().writes}
+            get_mutation_names = getattr(op, "get_mutation_names", None)
+            if callable(get_mutation_names):
+                mutated |= set(get_mutation_names())
+            mutated.discard(op.get_name())
+            clobbered = mutated & touched
+            if clobbered:
+                raise Unsupported(
+                    f"{type(op).__name__} {op.get_name()} in counted loop "
+                    f"{node.get_name()} writes {sorted(clobbered)}, which the loop "
+                    "reads or writes, so it cannot be placed before the loop"
                 )
     out.extend(ops)
 

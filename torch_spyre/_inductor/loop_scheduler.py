@@ -76,8 +76,9 @@ SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
 PATCHED_SURFACE: tuple[str, ...] = (
     # Patched (per compile, restored afterwards).
     "patched: Scheduler.create_scheduler_node -- a LoopNode becomes one "
-    "LoopSchedulerNode; no-op (allocation) body ops are hoisted, an extern "
-    "kernel in a body is refused",
+    "LoopSchedulerNode; no-op (allocation) body ops and extern kernels on a "
+    "non-Spyre device are hoisted, a Spyre extern kernel "
+    "(runs_once_outside_loops) in a body is refused",
     "patched: Scheduler.update_zero_dim_cpu_tensor -- first call after "
     "Scheduler._init builds self.nodes; splices the hoisted ops in and puts "
     "graph.operations back to the leaf ops",
@@ -159,9 +160,9 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
     changes.  Every body buffer's ``defining_op`` is the outermost loop node,
     the node that is in ``Scheduler.nodes``.
 
-    ``hoisted`` holds the no-op (allocation) scheduler nodes of the body
-    (nested bodies included), in body order, until the scheduler splices them
-    in front of the loop.
+    ``hoisted`` holds the no-op (allocation) scheduler nodes of the body, and
+    the extern kernels on a non-Spyre device (nested bodies included), in body
+    order, until the scheduler splices them in front of the loop.
     """
 
     def __init__(
@@ -343,10 +344,11 @@ def _build_loop_scheduler_node(
 ) -> LoopSchedulerNode:
     """Create the scheduler nodes of ``loop_node``'s body and wrap them.
 
-    The IR guarantees no Spyre extern kernel is in a body: node build and the
-    edit helpers place it before the loop (``runs_once_outside_loops``).  One
+    The IR guarantees no Spyre extern kernel (one that ``runs_once_outside_loops``)
+    is in a body: node build and the edit helpers place it before the loop.  One
     reaching here is a bug in a pass that bypassed them, and raises
-    ``RuntimeError`` rather than being silently moved.
+    ``RuntimeError`` rather than being silently moved.  An extern kernel on
+    another device is not covered by that guarantee and is still hoisted here.
 
     A no-op (an allocation that generates no code) is not a kernel.  It is
     created as an ordinary node and emitted once, immediately before its
