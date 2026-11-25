@@ -3245,6 +3245,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     all_tds = input_tds + [output_td]
 
     it_space = iteration_space_from_op(op)
+    it_space = adjust_it_space_for_padding(op, it_space, input_tds, output_td)
 
     symbol_meta = _collect_symbol_metadata(it_space)
 

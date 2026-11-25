@@ -51,6 +51,10 @@ from torch._inductor.ir import (
 )
 from torch._inductor.utils import fresh_cache, sympy_index_symbol
 from torch._inductor.virtualized import V
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch.utils._ordered_set import OrderedSet
 from utils_inductor import mock_op_split_space
@@ -104,6 +108,7 @@ from torch_spyre._inductor.work_division import (
     _HBM_BW_GBS,
     TensorDep,
     WorkDivisionContext,
+    _cost_model_divide_op,
     _cost_model_matmul_planner,
     _decode_weight_delivery_us,
     _default_split,
@@ -1488,6 +1493,72 @@ class TestWorkDivisionContextPadding(unittest.TestCase):
         )
         self.assertEqual(ctx.it_space[self.rows], 2)
         self.assertEqual(ctx.factor_domain(self.rows), [1, 2])
+
+
+@instantiate_parametrized_tests
+class TestMatMulCostModelUsesPadding(unittest.TestCase):
+    @parametrize(
+        "rows,padded_rows,cols",
+        [
+            (24, 32, 128),
+            (40, 64, 128),
+            (12, 16, 256),
+        ],
+    )
+    def test_m_split_divides_padded_extent(self, rows, padded_rows, cols) -> None:
+        """The matmul cost model splits M over its padded extent.
+
+        x and z are padded on M; iteration_space_from_op returns the host M on
+        purpose, as it does for a real padded input. The cost model must then
+        pick an M split that divides the padded M and use every core, instead of
+        a split of the host M that align_tensors_pure shrinks later.
+        """
+        K = 64
+        cores = 32
+        m, n, k = (_isym("m"), _isym("n"), _isym("k"))
+        op = _computed_buffer(
+            (rows, cols),
+            name="z",
+            reduction_type=BATCH_MATMUL_OP,
+            reduction_ranges=(K,),
+        )
+        x = _tensor_dep("x", (rows, K), (m, k))
+        w = _tensor_dep("w", (K, cols), (k, n))
+        z = _tensor_dep("z", (rows, cols), (m, n))
+
+        x = _with_padded_dim(x, m, padded_rows)
+        z = _with_padded_dim(z, m, padded_rows)
+
+        rw = MagicMock(writes=[z.dep], reads=[x.dep, w.dep])
+        with ExitStack() as stack:
+            for target, value in [
+                ("iteration_space_from_op", {m: rows, n: cols, k: K}),
+                ("collect_tensor_deps", ([x, w], z)),
+                ("op_read_writes", rw),
+                ("get_mem_deps_from_rw", []),
+                ("_apply_input_layout_overrides", []),
+                ("collect_work_division_constraints", ConstraintResult()),
+                ("work_division_transport_indexes", None),
+            ]:
+                stack.enter_context(
+                    patch(
+                        f"torch_spyre._inductor.work_division.{target}",
+                        return_value=value,
+                    )
+                )
+
+            committed = {}
+            stack.enter_context(
+                patch(
+                    "torch_spyre._inductor.work_division.apply_splits",
+                    side_effect=lambda o, s: committed.update(s),
+                )
+            )
+            took = _cost_model_divide_op(op, cores)
+
+        self.assertTrue(took, "the cost model should re-split this matmul")
+        self.assertEqual(padded_rows % committed[m], 0, f"split {committed}")
+        self.assertEqual(math.prod(committed.values()), cores, f"split {committed}")
 
 
 class TestWorkDivisionCandidates(unittest.TestCase):
