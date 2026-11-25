@@ -437,6 +437,21 @@ def _resize_device_layout(
     )
 
 
+def _register_shared_buffer(node: ir.ExternKernel) -> str:
+    """Register the buffer of a node the runtime serves from a cache.
+
+    The cached tensor is shared across forward passes, so its storage must
+    never be written. Inductor would otherwise free the buffer after its last
+    use and hand the storage to a later buffer (``allow_buffer_reuse``) or to a
+    kernel's output (in-place updates); ``never_reuse_buffers`` refuses both.
+    ``should_allocate() == False`` does not: it only stops Inductor from
+    allocating this buffer.
+    """
+    name = V.graph.register_buffer(node)
+    V.graph.never_reuse_buffers.add(name)
+    return name
+
+
 class SpyreConstantFallback(ir.ExternKernel):
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
         wrapper.generate_const_tensor_fallback(self)
@@ -464,7 +479,7 @@ class SpyreConstantFallback(ir.ExternKernel):
             cpp_kernel_name=cpp_kernel_name,
             op_overload=op_overload,
         )
-        self.name = V.graph.register_buffer(self)
+        self.name = _register_shared_buffer(self)
         V.graph.register_operation(self)
 
 
@@ -478,8 +493,9 @@ class SpyreArangeFallback(ir.ExternKernel):
     ``[length, 1]`` row coordinate.
 
     Shares ``SpyreConstantFallback``'s contract: the runtime returns a shared
-    tensor, so ``should_allocate()`` is False and the node declares no mutation
-    names, keeping inductor from routing an in-place write at it.
+    tensor, so ``should_allocate()`` is False, the node declares no mutation
+    names, and its buffer is never offered for reuse
+    (``_register_shared_buffer``).
     """
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
@@ -527,7 +543,7 @@ class SpyreArangeFallback(ir.ExternKernel):
             cpp_kernel_name="aoti_torch_arange",
             op_overload=op_overload,
         )
-        self.name = V.graph.register_buffer(self)
+        self.name = _register_shared_buffer(self)
         V.graph.register_operation(self)
 
 
