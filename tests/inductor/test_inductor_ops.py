@@ -13086,8 +13086,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, elements, test_elements)
 
-    @staticmethod
-    def _deterministic_algorithms():
+    def _deterministic_algorithms(self):
         """``torch.use_deterministic_algorithms(True)`` for a block, restored after."""
         import contextlib
 
