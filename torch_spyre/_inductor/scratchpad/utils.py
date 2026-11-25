@@ -416,7 +416,7 @@ def _is_tiled_advancing(op: Operation) -> bool:
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
         return False
-    # The loop fact (False without a loop_member) lives in loop_facts; the layout
+    # The loop fact (False for an op in no loop) lives in loop_facts; the layout
     # gate above is an LX question and stays here.
     return output_advances_anywhere(op)
 

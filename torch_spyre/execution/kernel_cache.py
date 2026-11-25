@@ -436,6 +436,16 @@ def compute_specs_hash(
                     )
                     content_parts.append(f"loop_count_sources:{sources}".encode())
                     logger.debug("  [hash] LoopSpec  sources=%s", sources)
+                # Whether the trip count is read from device memory, and from
+                # where, is baked into the bundle (the read and its address), not
+                # into any SDSC JSON hashed below. The value read is run-time data
+                # and stays out of the key.
+                if entry.count_from_buffer is not None:
+                    source = json.dumps(
+                        dataclasses.asdict(entry.count_from_buffer), sort_keys=True
+                    )
+                    content_parts.append(f"loop_count_from_buffer:{source}".encode())
+                    logger.debug("  [hash] LoopSpec  count_from_buffer=%s", source)
                 _collect(entry.body)
             elif isinstance(entry, OpSpec):
                 sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (

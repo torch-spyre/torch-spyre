@@ -122,7 +122,11 @@ from .dump_cost_model import dump_cost_model
 # ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
 from . import cost_model_pass as cost_model_pass_module
 from .cost_model_pass import CostReport, cost_model_pass
-from .split_multi_ops import split_multi_ops, validate_ops
+from .split_multi_ops import split_multi_ops
+from .element_arrangement import (
+    insert_ea_shuffle,
+    validate_ops,
+)
 
 
 logger = get_inductor_logger("passes")
@@ -614,18 +618,19 @@ class CustomPreSchedulingPasses:
             reorder_nonstick_dims,
             finalize_layouts,
             # insert_restickify's advance-transfer logic (see its own
-            # docstring) branches on whether old_name already has
-            # `loop_member` stamped, to decide whether the per-trip advance
-            # belongs on the restickify stage or stays on the consumer.
-            # splice_while_loops runs first in this list and stamps every
-            # for_each_tile level's LoopMember in one deferred final
-            # phase, so by the time insert_restickify runs, every tiled
-            # stage's loop_member is already in place. If this pass ever
-            # moved ahead of splice_while_loops' stamping, that check would
-            # silently take the "not yet tiled" branch and emit an empty
-            # loop_member for a stage that is actually tiled -- a
-            # wrong-answer, not a crash.
+            # docstring) branches on whether old_name is already in a loop
+            # (`is_looped`), to decide whether the per-trip advance belongs
+            # on the restickify stage or stays on the consumer.
+            # splice_while_loops runs first in this list and the pass loop
+            # builds its loops' nodes once it returns, so by the time
+            # insert_restickify runs, every tiled stage is in its loop. If
+            # this pass ever moved ahead of splice_while_loops, that check
+            # would silently take the "not yet tiled" branch and leave a
+            # stage that is actually tiled out of its loop -- a wrong
+            # answer, not a crash.
             insert_restickify,
+            # Insert shuffle nodes to apply or restore element arrangement.
+            insert_ea_shuffle,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             reorder_nonstick_dims_mutation,
