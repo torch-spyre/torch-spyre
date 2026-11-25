@@ -2075,6 +2075,12 @@ class DomainRangeTracer(DomainRangeSolver):
             for arg_name, pad_set in self.buffer_input[op.name].items():
                 overwrites[arg_name] = float(pick_element(pad_set))
 
+            if do_pad and len(set(overwrites.values())) > 1:
+                raise ValueError(
+                    f"Op {op.name} needs padding but its arguments were assigned "
+                    f"different padding values: {overwrites}"
+                )
+
         return PaddingDecision(output_padding, do_coord_mask, do_pad, overwrites)
 
     def handle_graph_input(self, op, padded):
