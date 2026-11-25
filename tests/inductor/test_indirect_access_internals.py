@@ -55,6 +55,8 @@ from indirect_access_common import (  # noqa: E402
     op_spec_has_indirect_output,
 )
 
+from utils_inductor import expects_raise  # noqa: E402
+
 from torch_spyre._C import DataFormats  # noqa: E402
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
@@ -942,10 +944,9 @@ class TestFoldSharedDimDeclines(IndirectAccessTestCase):
             return self._bufs[name]
 
     class _Op:
-        def __init__(self, data, reads, loop_info=None):
+        def __init__(self, data, reads):
             self.data = data
             self._reads = reads
-            self.loop_info = loop_info
 
         def get_read_writes(self):
             from types import SimpleNamespace
@@ -986,7 +987,6 @@ class TestFoldSharedDimDeclines(IndirectAccessTestCase):
         pos_buf=None,
         gathers=(("x", "pos"),),
         extra_reads=(),
-        loop_info=None,
     ):
         if value_index is None:
             value_index = 2048 * self.D0 + 512 * self.S + self.D1
@@ -1001,7 +1001,7 @@ class TestFoldSharedDimDeclines(IndirectAccessTestCase):
             "pos2": self._Buf([12]),
             "y": self._Buf([12, 4, 512], dtype=torch.float16),
         }
-        op = self._Op(self._pointwise(gathers), reads, loop_info)
+        op = self._Op(self._pointwise(gathers), reads)
         return self._Graph(bufs), op
 
     def test_baseline_folds(self):
@@ -1039,31 +1039,52 @@ class TestFoldSharedDimDeclines(IndirectAccessTestCase):
         graph, op = self._case(value_index=2048 * self.D0 + 64 * self.S + self.D1)
         self.assertIsNone(_plan_fold(graph, op))
 
-    def test_declines_op_in_loop(self):
-        """A shared-dim gather inside a for_each_tile body is left unchanged."""
+    @expects_raise
+    def test_refuses_op_in_loop(self):
+        """A matched gather inside a loop raises Unsupported instead of folding.
+
+        Left alone it would still read the wrong rows (#4840). The stub carries
+        the loop lowering's ``loop_member`` record, which ``enclosing_loops``
+        reads for an op no LoopNode holds yet, so this goes through the same
+        check a real looped op does.
+        """
         from unittest import mock
 
         from torch._inductor.ir import ComputedBuffer
         from torch_spyre._inductor import fold_shared_indirect_dims as mod
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.loop_facts import enclosing_loops
+        from torch_spyre._inductor.loop_node import LoopMember
 
-        graph, fake = self._case(loop_info=object())
-        # The pass only visits ComputedBuffers; give the fake that type.
+        graph, fake = self._case()
+        # The pass only visits ComputedBuffers; give the stub that type.
         op = object.__new__(ComputedBuffer)
         object.__setattr__(op, "data", fake.data)
         object.__setattr__(op, "get_read_writes", fake.get_read_writes)
-        object.__setattr__(op, "loop_info", fake.loop_info)
         object.__setattr__(op, "name", "buf0")
+        object.__setattr__(
+            op,
+            "loop_member",
+            LoopMember(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[0]]),
+        )
         graph.operations = [op]
-        inner_fn = op.data.inner_fn
+        self.assertTrue(enclosing_loops(op))
         self.assertIsNotNone(mod._plan_fold(graph, op))
-        self.assertTrue(mod._in_loop(op))
         with mock.patch.object(mod, "_lower_rows") as lower_rows:
-            mod.fold_shared_indirect_dims(graph)
+            with self.assertRaisesRegex(Unsupported, "inside a loop body"):
+                mod.fold_shared_indirect_dims(graph)
         lower_rows.assert_not_called()
-        self.assertIs(op.data.inner_fn, inner_fn)
-        # Identity, not ==: ComputedBuffer.__eq__ compares fields the stub lacks.
-        self.assertEqual(len(graph.operations), 1)
-        self.assertIs(graph.operations[0], op)
+
+    def test_not_in_loop_without_loop_member(self):
+        """The same op with no loop record is not treated as looped."""
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor import fold_shared_indirect_dims as mod
+
+        _, fake = self._case()
+        op = object.__new__(ComputedBuffer)
+        object.__setattr__(op, "data", fake.data)
+        object.__setattr__(op, "name", "buf0")
+        self.assertFalse(mod._in_loop(op))
 
 
 if __name__ == "__main__":

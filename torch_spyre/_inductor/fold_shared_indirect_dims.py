@@ -34,13 +34,17 @@ value dims are disjoint. Spyre cannot generate ``offsets`` on the device
 (no ``index_expr``), so ``arange`` lowers to its CPU fallback.
 
 Only Pointwise ops with exactly one indirect load are rewritten, and only one
-shared dim is folded; anything else is left unchanged. Ops inside a loop
-(a ``for_each_tile`` body) are left unchanged too: the new ``arange``/``add``
-ops carry no ``loop_info`` or ``dim_hints``, and the ``rows`` add reads ``idx``
-at a fixed address with no loop-variable term. In a body that would break the
-loop checker, or read the wrong rows on every trip after the first when ``idx``
-advances per trip. Supporting it would mean giving the new ops the consumer's
-loop metadata and a loop term on the ``idx`` read.
+shared dim is folded; anything else is left unchanged.
+
+A matched op inside a loop (``enclosing_loops`` is non-empty, e.g. a
+``for_each_tile`` body) raises ``Unsupported``. Left alone it would still read
+the wrong rows (the #4840 bug), so a loud error is better than a silent wrong
+answer. It is not folded because the new ``arange``/``add`` ops would not be loop
+members (no ``record_member``, no ``dim_hints``) and the ``rows`` add reads
+``idx`` at a fixed address with no loop-variable term: in a body that breaks the
+loop checker, or reads the wrong rows on every trip after the first when ``idx``
+advances per trip. Supporting it would mean making the new ops members of the
+consumer's loops and giving the ``idx`` read the loop variable.
 """
 
 import dataclasses
@@ -53,6 +57,7 @@ from torch._inductor.ir import ComputedBuffer, Operation, Pointwise
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
+from .errors import Unsupported
 from .logging_utils import get_inductor_logger
 from .loop_facts import enclosing_loops
 from .loop_node import move_before
@@ -280,8 +285,8 @@ class _FoldSharedDimHandler(WrapperHandler):
 
 
 def _in_loop(op: Operation) -> bool:
-    """True if ``op`` is inside a loop body (see module doc for why we skip)."""
-    return bool(enclosing_loops(op)) or getattr(op, "loop_info", None) is not None
+    """True if ``op`` is a member of a loop (see module doc for why we refuse)."""
+    return bool(enclosing_loops(op))
 
 
 def fold_shared_indirect_dims(graph: GraphLowering) -> None:
@@ -293,11 +298,11 @@ def fold_shared_indirect_dims(graph: GraphLowering) -> None:
         if plan is None:
             continue
         if _in_loop(op):
-            logger.debug(
-                "fold_shared_indirect_dims: %s is inside a loop; not folding",
-                op.get_name(),
+            raise Unsupported(
+                f"{op.get_name()}: an indirect load whose loop dim both reads the "
+                f"index {plan.index_name} and addresses {plan.value_name} inside a "
+                "loop body (#4840); it would read the wrong rows"
             )
-            continue
         lowered = _lower_rows(graph, op, plan)
         if lowered is None:
             logger.debug("fold_shared_indirect_dims: cannot lower rows for %s", op)
