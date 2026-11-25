@@ -153,7 +153,6 @@ insert_post_mutation_restickify
 insert_restickify_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-span_reduction                        # work-division: enforce 256 MB span
 cost_model_matmul_division            # work-division: matmul cost model (*)
 work_distribution                     # work-division: default distributor (*)
 _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
@@ -162,12 +161,15 @@ _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planni
 (*) Run by `_distribute_work`, which leaves them to the LX solve when it
 chooses the splits itself (see below).
 
-Three ordering constraints fix this slot:
+Every candidate split the planner considers must keep each op's per-core
+span under 256 MB. Those minimum splits, the
+[span floors](work_division_planning.md#span-floors), do not constrain the
+order: the planner computes them when it builds each op's split menu, in
+the candidate's own frame, so a coarse tiling that shrinks a span relaxes
+them.
 
-- **Span floors must be set first.** `span_reduction` always runs before
-  planning. It commits the minimum split that keeps each op's per-core
-  span under 256 MB, and every candidate split the planner considers must
-  meet it.
+Two ordering constraints fix this slot:
+
 - **Each op needs a committed split wherever the planner reads one.**
   Placement-only planning sizes per-core buffers from the symbol-keyed
   `iteration_space_ownership` that work division commits, and checks
@@ -316,7 +318,9 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
 1. **Input-boundary cloning.** When `clone_at_graph_boundaries()` is set,
    `_eligible_clone_inputs` walks graph inputs and inserts a `clone` for any
    HBM input that is read more than once *and* fits on LX. The clone output
-   becomes a fresh LX-eligible buffer.
+   becomes a fresh LX-eligible buffer. An input the graph writes in place is
+   never cloned: the write lands in HBM, so the clone would go stale for every
+   later read.
 2. **Buffer analysis.** `_generate_buffers` produces one
    `LifetimeBoundBuffer` per buffer, *including* the ones that may not
    reside. Nothing is filtered out; `ScratchpadAllocator._residency_reasons`
@@ -396,7 +400,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 | `unsized (no device layout)` | Without a device layout, the allocator cannot measure the LX footprint. | computable footprint | None | `TestEmptyLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
 | `empty tensor` | A zero-sized tensor needs no LX reservation. | nonempty output | None | `TestEmptyLxEligibility` |
 | `mutation target` | Offset writes cannot use one fixed LX base. A counted-loop carry is accepted only when the solver also chooses its update division. | no mutation target | Counted-loop carry: `_is_loop_carry_storage` (joint division choice) | `TestLoopCarryLxEligibility` |
-| `tiled (advancing)` | LX addresses cannot use affine.apply symbols. The write or read advances per tile; loop_info supplies the tile geometry. | fixed LX address | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
+| `tiled (advancing)` | LX addresses cannot use affine.apply symbols. The write or read advances per tile; the loop node supplies the tile geometry. | fixed LX address | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
 | `read by restickify` | A transposed or uncertified local read may cross cores. The joint solver checks each candidate division, so the committed-division barrier can reject a valid candidate (#4655). | fixed divisions agree or exact local-read proof | None | `test_buffer_residency_adapter_rejection_strings` |
 | `extern kernel user or live across extern kernel` | Extern kernels read HBM. PR #3683 added this guard; enable_lx_context_switching uses LxContextSwitchingPass to dump and restore LX around the call. | extern boundary protected | None | `test_buffer_residency_adapter_rejection_strings` |
 | `live across multi-output extern kernel` | Multi-output extern calls need HBM under either flag setting. LxContextSwitchingPass does not bracket them; the earlier extern guard handles the disabled case. | multi-output boundary protected | None | `test_buffer_residency_adapter_rejection_strings` |
@@ -418,7 +422,8 @@ detail, such as the restickify proof failure or the mismatched core division.
 The adapter tests check the returned strings; the table does not replace them.
 
 Graph inputs use `_input_residency_reason`. They also require boundary cloning,
-rewritable uses, complete reads and useful LX reuse.
+rewritable uses, complete reads and useful LX reuse, and must not be written in
+place.
 
 A narrow exception permits an untiled matmul to read a zero-offset prefix made
 of complete storage sticks. It requires one private, full-width producer and a
@@ -494,7 +499,8 @@ slot is a search heuristic, not an ownership proof or a performance guarantee.
 | Updated-input cache snapshot | `torch_spyre._inductor.scratchpad.lx_relayout._is_activation_source` | earlier direct cache mutation; immutable restickified snapshot; original cache load and dependencies preserved | `test_work_division_hint.py::test_lx_relayout_activation_policy_is_source_wide` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
 | Fewer-core complete partitions | `torch_spyre._inductor.scratchpad.lx_relayout.core_domain_rejection` | integral core ratio; complete disjoint partitions; larger domain uses every compute core; physical spans stay separate | `test_solver_relayout_candidates.py::test_consumer_rules_are_shared_with_the_committed_collector` | `test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction` |
 | Persistent external cache scatter | `torch_spyre._inductor.scratchpad.lx_relayout._persistent_scatter_consumer` | fresh immutable matmul source; one external indirect overwrite; no source alias or cache read; mutation order and lifetime preserved | `test_solver_relayout_candidates.py::test_persistent_scatter_requires_independent_immutable_source` | `test_solver_relayout_e2e.py::test_v_projection_cache_handoff_preserves_persistent_alias` |
-| Contained local LX read | `torch_spyre._inductor.scratchpad.lx_relayout.local_lx_emission_contract` | ownership flag ON; shared graph and compact-read geometry gate; same-core byte certificate; fresh final access; disjoint live allocations | `test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected`; `test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition` |
+| Post-loop sum of a loop carry | `torch_spyre._inductor.scratchpad.lx_relayout._relayout_consumer_kind_supported` | co-optimizing solve that decides relayouts; carry storage with an FX origin and no writer after its loop; a sum outside every loop; in-loop accesses keep the carry's own ownership; movement, capacity and price gates unchanged | `test_solver_relayout_candidates.py::test_a_sum_takes_a_relayout_only_from_a_loop_carry`; `test_solver_relayout_candidates.py::test_an_edge_needs_an_fx_origin_at_both_ends` | `test_solver_relayout_e2e.py::test_post_loop_sum_reads_a_relayout_of_a_grouped_carry` |
+| Contained local LX read | `torch_spyre._inductor.scratchpad.lx_relayout.local_lx_emission_contract` | ownership flag ON; shared graph and compact-read geometry gate; same-core byte certificate; fresh final access; disjoint live allocations | `test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected`; `test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition`; `test_solver_relayout_e2e.py::test_gate_up_halves_read_the_matmul_output_in_place` |
 | Full-parent copy for local subranges | `torch_spyre._inductor.scratchpad.lx_relayout.materialize_lx_relayouts` | complete parent copied once per destination group; every partial reader re-certified against the destination view; positive disjoint LX spans | `test_subrange_transfer.py::test_gate_up_siblings_have_distinct_copy_identity`; `test_solver_relayout_decision.py::test_copy_is_sized_by_the_destination_span_not_the_source_share` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition` |
 | Pointwise persistent-scatter materializer | `torch_spyre._inductor.scratchpad.lx_relayout._pointwise_scatter_materializer` | ownership flag ON; one certified compact parent subrange; complete scatter read; persistent-scatter storage, alias and ordering checks | `test_solver_relayout_candidates.py::test_pointwise_scatter_materializer_admission` | None |
 | Direct cache-snapshot subrange read | `torch_spyre._inductor.scratchpad.lx_relayout._local_lx_scatter_geometry` | single-writer complete immutable snapshot; one direct partial read; other reads are scatter indices; standard 128-byte sticks; zero inner origin and exact rectangle size; external mutation target and final same-core ownership checks preserved | `test_solver_relayout_candidates.py::test_direct_cache_snapshot_scatter_geometry` | None |
@@ -906,8 +912,8 @@ bugs that the hand-written cases miss.
 - [`work_division_planning.md`](work_division_planning.md) describes how
   work distribution decides per-op core splits that scratchpad planning
   then consumes.
-- [`coarse_tiling_loops.md`](coarse_tiling_loops.md) describes coarse
-  tiling, which reduces working sets so adjacent ops can fit on LX in
+- [`loop_nodes.md`](loop_nodes.md) describes the counted loops by which coarse
+  tiling reduces working sets so adjacent ops can fit on LX in
   the first place.
 - [`hbm_pool_planning.md`](hbm_pool_planning.md) describes the
   complementary device-memory pass, which packs every intermediate that

@@ -113,7 +113,7 @@ transformation for working-set reduction — it reshapes the computation so
 most tensors fit in the LX scratchpad — and the RFC captures the constraints
 that forced each choice in the loop IR design.
 
-See also: [Coarse-Tiling Loop IR](../compiler/coarse_tiling_loops.md)
+See also: [Counted Loops in the Spyre Compiler](../compiler/loop_nodes.md)
 
 ### RFC 1632 — Model Enablement Tracking
 

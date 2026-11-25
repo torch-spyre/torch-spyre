@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Expectation
+metadata: {name: produce-throughput, owner: example-team, description: "throughput must not fall more than 5% below the last 20 valid nightly runs of the same series"}
+spec:
+  selector: {benchmarks: [produce]}
+  metric: mq.throughput
+  baseline: {kind: rolling, window: 20, min_n: 10, purposes: [nightly, weekly], match: {environment: id}}
+  tolerance: {pct: 5}
+  noise: {sigmas: 2, source: baseline_mad}
+  severity: advisory

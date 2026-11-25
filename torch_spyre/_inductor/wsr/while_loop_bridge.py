@@ -74,7 +74,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
-from ..loop_info import LoopCarryRecord
+from ..loop_node import LoopCarryRecord
 
 if TYPE_CHECKING:
     from torch._inductor import ir
@@ -982,7 +982,7 @@ def _validated_loop_origin(graph: "GraphLowering", while_op: "ir.WhileLoop") -> 
     Called at the splice site, while the live ``ir.WhileLoop`` still exists
     (``splice_while_loop`` deletes it right after ``_rewire_accumulator_output``
     returns) and before its ``MultiOutput`` children are dropped.  The node is
-    retained on :class:`~torch_spyre._inductor.loop_info.LoopCarryRecord` so the
+    retained on :class:`~torch_spyre._inductor.loop_node.LoopCarryRecord` so the
     scratchpad allocator can anchor an output copy after the completed loop.
 
     Why ``origins[0]`` is the right node: Inductor's lowering enters
@@ -1644,5 +1644,15 @@ def splice_while_loop(
         for op in graph.operations
         if op is while_op or while_op not in (getattr(op, "inputs", None) or ())
     ]
+
+    # The while_op's MutationOutputs declare its body's writes to inputs, e.g.
+    # for_each_tile(out=...)'s destination. The spliced body op that does the
+    # write now declares it itself, through its MutationLayoutSHOULDREMOVE
+    # target, so drop the buffers that name the removed while_op as producer.
+    dropped = {id(m) for m in getattr(while_op, "mutation_outputs", None) or ()}
+    if dropped:
+        graph.buffers[:] = [b for b in graph.buffers if id(b) not in dropped]
+        for name in [n for n, b in graph.name_to_buffer.items() if id(b) in dropped]:
+            del graph.name_to_buffer[name]
 
     return body_ops

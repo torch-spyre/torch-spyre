@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata:
+  name: gpt2
+spec:
+  type: perf
+  level: layer
+  tier: sanity
+  system: hf-models-spyre-fp16
+  workload:
+    type: kernel/layer
+    model: "gpt2"
+    layer: full_model
+    flags: {run_mode: prefill_only}
+    load: {executor: iterations, iterations: 5}
+  matrix:
+    axes:
+      config:
+        - {token: full-model, patch: {workload: {layer: full_model}}}
+        - {token: one-block, patch: {workload: {layer: one_block}}}
+      mode:
+        - {token: prefill-only, patch: {workload: {flags: {run_mode: prefill_only}}}}
+        - {token: decode-only, patch: {workload: {flags: {run_mode: decode_only}}}}
+        - {token: generate, patch: {workload: {flags: {run_mode: generate}}}}

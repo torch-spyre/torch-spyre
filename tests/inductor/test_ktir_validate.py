@@ -40,7 +40,13 @@ import sympy
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES, STAGGERED_EAS
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from torch_spyre._inductor.op_spec import (
+    CountSource,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    UnimplementedOp,
+)
 
 # ---------------------------------------------------------------------------
 # Building a spec
@@ -695,6 +701,14 @@ class TestValidateRejections(unittest.TestCase):
     def test_symbolic_trip_count_rejected(self):
         nest = LoopSpec(count=sympy.Symbol("s0"), body=[make_op_spec()])
         self._rejects([nest], "trip count s0 is symbolic")
+
+    def test_device_read_trip_count_rejected(self):
+        nest = LoopSpec(
+            count=4,
+            body=[make_op_spec()],
+            count_from_buffer=CountSource(pool_offset=0, max_value=4),
+        )
+        self._rejects([nest], "read from device memory")
 
     def test_unsupported_dtype_rejected(self):
         self._rejects([make_op_spec(dtype=DataFormats.SENINT8)], "unsupported device")

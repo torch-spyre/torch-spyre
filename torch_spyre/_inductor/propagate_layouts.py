@@ -28,6 +28,7 @@ from torch._inductor.ir import (
     ExternKernel,
     FallbackKernel,
     FixedLayout,
+    IndexPutFallback,
     InputBuffer,
     Layout,
     MutableBox,
@@ -38,6 +39,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ScatterFallback,
     StorageBox,
     TensorBox,
     _CollectiveKernel,
@@ -45,6 +47,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
+from torch._inductor.utils import ceildiv
 from torch._inductor.virtualized import V
 
 from . import config
@@ -70,6 +73,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MASK_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
@@ -80,13 +84,18 @@ from .ir import (
     SpyreCollectiveKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
 )
+from .loop_node import remove_op
 from .pass_utils import (
+    collapse_valid_elements,
     compute_restickify_target_layout,
+    compute_size1_restickify_target,
     concretize_expr,
-    expand_sparse,
+    dense_relocation_serves_read,
     find_matmul_generated_var,
     find_reduction_var,
+    forward_valid_elements,
     get_matmul_m_size,
     get_matmul_n_size,
     identify_matmul_inputs,
@@ -94,12 +103,15 @@ from .pass_utils import (
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
-    is_keep_by_index,
+    is_index_masking_op,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    non_stick_reduction_vars,
+    output_is_indirectly_mutated,
     op_read_writes,
-    rescale_stl_for_dtype,
+    sparse_stl_from_host,
+    sparse_target_for_unservable_read,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -190,10 +202,17 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
             changed = True
     if not changed:
         return stl
+    # Cap each group's count at the product of its new extents.  A collapsed
+    # broadcast dim has size 1, so any key containing it is capped to 1.
+    new_ve = {
+        key: min(val, math.prod(device_size[d] for d in key))
+        for key, val in stl.valid_elements.items()
+    }
     return SpyreTensorLayout(
         device_size,
         stride_map,
         stl.device_dtype,
+        new_ve,
         stl.element_arrangement,
     )
 
@@ -307,7 +326,13 @@ def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[in
 
 
 def _make_output_stl(
-    out_coords, output_dep, c_size, c_stride, stick_dim, dtype
+    out_coords,
+    output_dep,
+    c_size,
+    c_stride,
+    stick_dim,
+    dtype,
+    ea=ElementArrangement.STANDARD,
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
@@ -315,7 +340,7 @@ def _make_output_stl(
     """
     stick_size = get_elem_in_stick(dtype)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
-    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
+    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order, ea)
     coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
@@ -429,100 +454,331 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
-def _convert_reads_whole_input(
+def _can_rescale_input_stl(
     in_layout: FixedLayout,
     output: FixedLayout,
     dep: MemoryDep,
     output_dep: MemoryDep,
+    stl: SpyreTensorLayout,
 ) -> bool:
-    """Whether a dtype conversion traverses its input exactly as it writes its output.
+    """Whether a conversion's output can take ``stl``, its input's layout, rescaled.
 
-    Only then may the conversion inherit the input buffer's
-    ``device_size``/``stride_map`` (rescaled for the new stick depth). When the
-    read is a *slice* of a wider buffer -- Gemma's ``q_norm``/``k_norm`` upcast
-    part of the fused QKV projection into a fresh, narrower per-head buffer --
-    the inherited row span belongs to the input buffer while the elements land
-    in a buffer with a different row stride. ``compute_coordinates`` then folds
-    that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
-    ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
-    normalization grammar (``a != 1``, a codegen-time hard error) or, worse, is
-    representable but addresses the wrong sticks (``a == 1``, silently wrong
-    results). Mirrors the identical-access test the general convert path uses,
-    minus the element-width condition -- rescaling the stick depth is exactly
-    what this path is for.
+    ``rescale_stl_for_dtype`` keeps every device dim of ``stl``, so the conversion
+    must traverse its input exactly as it writes its output, and ``stl`` must lay
+    out only what it reads. Two reads fail that and take the sliced path:
+
+    - A slice of a wider buffer, e.g. Gemma's ``q_norm``/``k_norm`` upcast of part
+      of the fused QKV projection. The inherited row span belongs to the input
+      buffer while the elements land in a narrower one. ``compute_coordinates``
+      folds that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
+      ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
+      normalization grammar (``a != 1``, a codegen-time hard error) or addresses
+      the wrong sticks (``a == 1``, silently wrong results). The size, index and
+      host-coordinate checks catch it, mirroring the identical-access test of the
+      general convert path minus the element-width condition.
+    - A view keeping a wider buffer's layout, which can pass all of those: eager
+      decode passes q as ``qkv[:, :256].view(1, 2, 128)``, whose device dim steps
+      both heads and sticks, at ``2*head + floor(elem/64)``. A device coordinate
+      over more than one host var catches it.
+
+    A layout with no device dim to count the stick's sticks takes the sliced path
+    too, since the rescale has no dim to resize: a ``[16, 4096]`` hidden state
+    with its 16 tokens on the stick reads at ``[d1, d0]``. Such a dim's coordinate
+    carries the stick var, or is zero for a stick dim no longer than one stick.
     """
+    device_coords = device_coordinates(stl, dep, None)
+    stick_vars = device_coords[-1].free_symbols if device_coords else set()
     return (
         list(in_layout.size) == list(output.size)
         and dep.index == output_dep.index
         and host_coordinates(in_layout, dep, None)
         == host_coordinates(output, output_dep, None)
+        and all(len(c.free_symbols) <= 1 for c in device_coords)
+        and (
+            not stick_vars
+            or any(
+                c.free_symbols & stick_vars or c == sympy.S.Zero
+                for c in device_coords[:-1]
+            )
+        )
     )
 
 
-def _qfp8ch_count_dim(stl: SpyreTensorLayout, coords: list[sympy.Expr]) -> int | None:
-    """Device dim counting the input's sticks; None if there is none to rescale.
-
-    A non-stick dim whose coordinate uses the stick variable is the count dim.
-    Otherwise the count is 1: the lone size-1, coordinate-0 dim. Raises
-    ``Unsupported`` when neither identifies one dim.
-    """
-    in_eps = stl.device_size[-1]
-    stick_syms = coords[-1].free_symbols
-    dims = range(len(stl.device_size) - 1)
-    uses_stick = [i for i in dims if coords[i].free_symbols & stick_syms]
-    if uses_stick:
-        if len(uses_stick) == 1 and stl.stride_map[uses_stick[0]] == in_eps:
-            return uses_stick[0]
-    else:
-        ones = [
-            i
-            for i in dims
-            if coords[i] == 0
-            and stl.device_size[i] == 1
-            and stl.stride_map[i] in (in_eps, -1)
-        ]
-        if len(ones) == 1:
-            return ones[0]
-        if not ones and not any(stl.stride_map[i] == in_eps for i in dims):
-            return None
-    raise Unsupported(
-        f"qfp8ch: no stick-count dim in device_size {list(stl.device_size)}, "
-        f"stride_map {list(stl.stride_map)}, coordinates {coords}"
-    )
-
-
-def _qfp8ch_stl(
-    stl: SpyreTensorLayout, out_dtype: torch.dtype, coords: list[sympy.Expr]
+def rescale_stl_for_dtype(
+    stl: SpyreTensorLayout,
+    out_dtype: torch.dtype,
+    ea: ElementArrangement,
+    host_layout: FixedLayout,
+    dep: MemoryDep,
 ) -> SpyreTensorLayout:
-    """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
+    """Rescale a device layout across a conversion that changes the elements per stick.
 
-    Propagates the input device layout, preserving any padding, and rescales
-    the stick depth the way ``rescale_stl_for_dtype`` does, except that the
-    num-sticks dim rounds UP: an fp16 tensor whose stick-indexing dim holds an
-    odd number of 64-element sticks ends in one partially filled 128-element
-    fp8 stick. That is a legitimate layout for this op -- the fp8->fp16
-    conversion that consumes it rebuilds a dense layout from the host size,
-    treating the partial stick exactly like any other unaligned stick dim --
-    so it must never floor to a size-0 dim (issue #3604).
+    Keeps every device dim of ``stl`` and resizes only the stick (the last device
+    dim) and the num-sticks dim, both found from ``dep``'s coordinates. ``dep``
+    must read the input exactly as the conversion writes its output; a slice of a
+    wider buffer would keep that buffer's ``stride_map``.
 
-    ``coords`` are the input's device coordinates; they pick the count dim.
+    The num-sticks dim's size and ``stride_map`` entry come from the input layout,
+    except in two cases the input does not record: a split into more sticks counts
+    from the host dim size, and a merge into a single stick takes the host dim
+    size as its entry. For example, with a contiguous stick dim::
+
+        conversion    host dim size  in sticks, entry    out sticks, entry
+        fp32 -> fp16  20             1, 20               1, 20  (kept)
+        fp32 -> fp16  50             2, 32               1, 50  (host dim size)
+        fp32 -> fp16  96             3, 32               2, 64
+        fp16 -> fp32  40             1, 40               2, 32
+        fp16 -> fp32  65             2, 64               3, 32  (not 4)
+
+    The layout holds only the sticks the live elements reach; the rest of the
+    stick capacity is ``insert_staggered_ea_padding``'s to add (issue #3999), since
+    growing it here would follow the value into every consumer of this STL.
+
+    Every device dim must read at most one host dim, as ``_can_rescale_input_stl``
+    ensures; a num-sticks dim folding other host dims is not bounded by its host
+    dim size.
+
+    Args:
+        stl: Input device layout to rescale.
+        out_dtype: Torch dtype of the conversion output.
+        ea: ElementArrangement to stamp on the returned layout.
+        host_layout: Host layout of the tensor ``stl`` describes.
+        dep: The conversion's access to that tensor.
     """
-    in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
+    out_device_size = [*stl.device_size[:-1], out_eps]
     out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    i = _qfp8ch_count_dim(stl, coords)
-    # A broadcast count dim (stride -1) keeps its stride.
-    if i is not None and stl.stride_map[i] == in_eps:
-        out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
-        out_stride_map[i] = out_eps
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ElementArrangement.QFP8CH,
+    device_coords = device_coordinates(stl, dep, None)
+    stick_coord = device_coords[-1] if device_coords else sympy.S.Zero
+    stick_vars = stick_coord.free_symbols
+    if not stick_vars:
+        # A stick holding one element (a size-1 or sparse stick dim) needs no more
+        # sticks at any number of elements per stick.
+        return SpyreTensorLayout(
+            out_device_size,
+            out_stride_map,
+            get_device_dtype(out_dtype),
+            forward_valid_elements(stl),
+            ea,
+        )
+
+    stick_host_dim = matching_dim(host_coordinates(host_layout, dep, None), stick_coord)
+    outer_coords = device_coords[:-1]
+    assert all(len(c.free_symbols) <= 1 for c in outer_coords), (stl, dep)
+    num_sticks_dim = next(
+        (d for d, c in enumerate(outer_coords) if c.free_symbols & stick_vars), None
     )
+    if num_sticks_dim is None:
+        # A stick dim no longer than one stick never wraps into an outer dim, so
+        # the outermost zero coordinate holds its count: ``[1, 64]`` reads at
+        # ``[0, 0, d0]``.
+        num_sticks_dim = next(
+            (d for d, c in enumerate(outer_coords) if c == sympy.S.Zero), None
+        )
+    if stick_host_dim is None or num_sticks_dim is None:
+        # ``_can_rescale_input_stl`` sends a read with no dim to count its sticks
+        # down the sliced path.
+        # TODO: a stick coordinate whose variable matches no host dim has not been
+        # seen; resizing the stick alone could drop elements.
+        raise Unsupported(
+            f"no num-sticks dim in {list(stl.device_size)} {list(stl.stride_map)} "
+            f"for {dep}"
+        )
+
+    in_sticks = stl.device_size[num_sticks_dim]
+    in_eps = stl.device_size[-1]
+    elem_step = stl.stride_map[-1]
+    host_dim_size = concretize_expr(host_layout.size[stick_host_dim])
+
+    if out_eps < in_eps:
+        # Splitting sticks, where the last input stick may be part-filled:
+        # 65 fp16 elements in 2 sticks -> 3 fp32 sticks, not 4.
+        out_sticks = ceildiv(host_dim_size, out_eps)
+    else:
+        # Whole input sticks merge (or keep their width): 3 fp32 sticks -> 2 fp16.
+        out_sticks = ceildiv(in_sticks * in_eps, out_eps)
+
+    if out_sticks > 1:
+        # The dim steps one output stick: 40 fp16 elements -> 2 fp32, entry 32.
+        stride_map_entry = out_eps * elem_step
+    elif in_sticks == 1:
+        # A single stick's entry never enters an address, so it is kept:
+        # 20 fp16 elements in 1 stick -> 1 fp32 stick, entry 20.
+        stride_map_entry = stl.stride_map[num_sticks_dim]
+    else:
+        # Sticks merged into one, whose entry is the host dim size, as
+        # ``dim_map_to_stride_map`` writes it: 50 fp32 elements -> entry 50.
+        stride_map_entry = host_dim_size * elem_step
+
+    out_device_size[num_sticks_dim] = out_sticks
+    out_stride_map[num_sticks_dim] = stride_map_entry
+    # Clamp each count to the rescaled capacity of its dims; unchanged otherwise.
+    out_valid = {
+        key: min(val, math.prod(out_device_size[d] for d in key))
+        for key, val in stl.valid_elements.items()
+    }
+    return SpyreTensorLayout(
+        out_device_size, out_stride_map, get_device_dtype(out_dtype), out_valid, ea
+    )
+
+
+def _typecast_layouts(
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    dep: MemoryDep,
+    in_layout: FixedLayout,
+    stl: SpyreTensorLayout,
+    op: "Operation | None" = None,
+) -> list[SpyreTensorLayout]:
+    """Output STLs of a typecast that changes the elements per stick.
+
+    One candidate per source layout of the input: the input as it stands and,
+    where it can be restickified, the input restickified onto each other dim.
+    These let a consumer ask for another stick dim, and are the only route for an
+    input whose stick starts at a slice offset. The optimizer inserts the
+    restickify on the input edge.
+
+    A read the input's layout cannot serve (a reshape that cuts the stick dim off
+    a stick boundary, e.g. ``[2, 8, 40]`` read as ``[2, 320]`` at fp16) is handled
+    as ``_default_pointwise_layout`` handles it (#6557): the input's stick is first
+    relocated densely onto a dim the read leaves alone, and the layouts below are
+    derived from that; failing that, the output takes the sparse layout.
+    ``compute_restickify_needed`` picks the same targets for the input edge.
+
+    A read that can take the source's layout (``_can_rescale_input_stl``)
+    rescales it (``rescale_stl_for_dtype``), keeping all its device dims. A slice
+    of a wider buffer cannot, since the source's ``stride_map`` steps through the
+    wider buffer: it builds the layout from the output's host size with the
+    source's stick dim instead, which may reorder the non-stick device dims. The
+    conversion works on whole sticks, so a slice skips a source whose stick it
+    starts mid-stick.
+
+    Either layout holds only the sticks the live elements reach;
+    ``insert_staggered_ea_padding`` adds the rest.
+    """
+    in_device_coords = try_device_coordinates(stl, dep, None)
+    relocated = None
+    if in_device_coords is None:
+        # As in _default_pointwise_layout: a dense relocation of the stick may
+        # serve the read, and the candidates below are then derived from it.
+        relocated = (
+            None
+            if output_is_indirectly_mutated(op)
+            else dense_relocation_serves_read(stl, in_layout, dep)
+        )
+        if relocated is not None:
+            stl = relocated
+            in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
+        if (
+            output.dtype != torch.float8_e4m3fn
+            and sparse_target_for_unservable_read(stl, in_layout, dep) is not None
+        ):
+            # As in _default_pointwise_layout: compute_restickify_needed moves the
+            # input to its sparse layout, and the output is sparse on its own host
+            # dims. A sparse stick holds one element at any width, so the cast
+            # needs no rescale. Not for QFP8CH, whose arrangement a sparse layout
+            # does not carry.
+            # TODO(#5872): offer this next to the normal candidates, not early.
+            return [sparse_stl_from_host(output, output.dtype)]
+        # This input layout cannot address the read, e.g. a row read of a layout
+        # whose stick runs along the rows; another candidate of the input may.
+        return []
+    in_stick_expr = in_device_coords[-1]
+    input_ea = stl.element_arrangement
+    ea_src_dtype = in_layout.dtype
+    if ea_src_dtype == torch.bool:
+        # The EA map is keyed by logical dtypes; a bool takes its backing format's.
+        ea_src_dtype = bool_layout_dtype(stl.device_dtype, "conversion source")
+    if output.dtype == torch.float8_e4m3fn:
+        out_ea = ElementArrangement.QFP8CH
+    else:
+        out_ea = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
+        # A stick dim with no host dim, or only a size-1 one (0-dim, (1,), (2, 1)),
+        # holds a single element at position 0, which every arrangement leaves in
+        # place. Staggering is a no-op there and EA in DCI cannot permute.
+        # Decide from the read's coordinates, not the input's stride_map: a
+        # round-trip conversion rewrites the stride_map entry (#5566).
+        if out_ea in STAGGERED_EAS and all(
+            concretize_expr(dep.ranges[v]) == 1 for v in in_stick_expr.free_symbols
+        ):
+            out_ea = ElementArrangement.STANDARD
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_coords = host_coordinates(output, output_dep, None)
+
+    sources = [stl]
+    # ReStickifyOpHBM supports only fp16 in the STANDARD arrangement, so the output
+    # of a conversion from fp16 cannot be restickified. Add candidates from the
+    # input's alternate layouts, so the optimizer restickifies the input just
+    # before the conversion instead. Not for a relocated input: the input edge is
+    # restickified to the relocation (compute_restickify_needed), so an output
+    # derived from any other stick dim could not be fed.
+    if (
+        relocated is None
+        and stl.device_dtype == DataFormats.SEN169_FP16
+        and input_ea == ElementArrangement.STANDARD
+    ):
+        in_coords = host_coordinates(in_layout, dep, None)
+        # A stick with no variable (a size-1 stick dim) has no host dim to move.
+        for target_stick_expr in in_coords if in_stick_expr.free_symbols else []:
+            target_vars = target_stick_expr.free_symbols
+            # Restickifying onto the input's own stick dim changes nothing.
+            if not target_vars or target_vars & in_stick_expr.free_symbols:
+                continue
+            target_stl = compute_restickify_target_layout(
+                stl,
+                in_layout,
+                target_stick_expr,
+                in_coords,
+                in_device_coords,
+                arg=PropArg(dep, in_layout, [stl]),
+            )
+            if target_stl is not None:
+                sources.append(target_stl)
+
+    layouts: list[SpyreTensorLayout] = []
+    for source_stl in sources:
+        candidate: SpyreTensorLayout | None
+        if _can_rescale_input_stl(in_layout, output, dep, output_dep, source_stl):
+            # Keeps every device dim of the source; only the elements per stick
+            # and the num-sticks count change.
+            # TODO(#6238): support slices in rescale_stl_for_dtype, so a sliced read
+            # keeps the source's device dims too. Alternatively drop this
+            # branch: the host-size layout below is correct for whole reads
+            # as well, only it may permute the non-stick device dims.
+            candidate = rescale_stl_for_dtype(
+                source_stl, output.dtype, out_ea, in_layout, dep
+            )
+        else:
+            # The source's stride_map steps through the wider buffer, so only
+            # its stick dim carries over; the non-stick device dims are rebuilt
+            # from the output's host size and may come out permuted.
+            # TODO(#6239): offer restickify candidates for a sliced read too;
+            # compute_restickify_target_layout cannot match its offset coordinates.
+            source_device_coords = try_device_coordinates(source_stl, dep, None)
+            if source_device_coords is None:
+                continue
+            source_stick_expr = source_device_coords[-1]
+            if not is_stick_expr_offset_free(
+                source_stick_expr, source_stl.elems_per_stick()
+            ):
+                continue
+            stick_dim = _pick_stick_dim(source_stick_expr, out_coords)
+            if source_stick_expr.free_symbols and stick_dim < 0:
+                continue
+            candidate = _make_output_stl(
+                out_coords,
+                output_dep,
+                c_size,
+                c_stride,
+                stick_dim,
+                output.dtype,
+                out_ea,
+            )
+        if candidate is not None and candidate not in layouts:
+            layouts.append(candidate)
+    return layouts
 
 
 def qfp8wt_dim_order(rank: int) -> list[int]:
@@ -577,6 +833,24 @@ def _qfp8wt_stl(
     )
 
 
+def _with_input_ea(
+    out_stl: SpyreTensorLayout, output_dep: MemoryDep, ea: ElementArrangement
+) -> SpyreTensorLayout:
+    """``out_stl`` tagged with the staggered ``ea`` when its stick has an order.
+
+    An output stick with no host dim (a broadcast stick), or only size-1 ones,
+    holds a lone element that no arrangement moves, and the D2H restore has no
+    stick dim to identify ("Unable to determine the stick dimension"), so it stays
+    STANDARD. Decided from the access coordinates, not ``stride_map[-1]``, as
+    ``_typecast_layouts`` does.
+    """
+    coords = try_device_coordinates(out_stl, output_dep, None)
+    stick_vars = coords[-1].free_symbols if coords else ()
+    if any(concretize_expr(output_dep.ranges[v]) > 1 for v in stick_vars):
+        return out_stl.with_element_arrangement(ea)
+    return out_stl
+
+
 def _reduction_layout_from_stl(
     op: Operation,
     output: FixedLayout,
@@ -600,16 +874,49 @@ def _reduction_layout_from_stl(
     )
     stick_size = get_elem_in_stick(out_dtype_for_layout)
 
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
     x_dev_coords = try_device_coordinates(stl, dep, None)
     if x_dev_coords is None:
+        # The stick moved to another real dim serves the read densely; derive the
+        # output from the read on that layout, as for any other input layout.
+        # Probed without indirect_sizes or op, as above; see the note on the same
+        # call in _default_pointwise_layout.  The reduced variables must stay off
+        # the stick for a prod (#4409): the widest dim the reshape leaves alone is
+        # often the reduced one, and the check below would then decline to
+        # preserve the layout while the input was still restickified onto it.
+        # This site probes without op (above), so the relocation cannot apply
+        # output_is_indirectly_mutated itself; it is applied here instead.
+        relocated = (
+            None
+            if output_is_indirectly_mutated(op)
+            else dense_relocation_serves_read(
+                stl,
+                in_layout,
+                dep,
+                forbidden_stick_syms=non_stick_reduction_vars(
+                    data.reduction_type, dep, output_dep
+                ),
+            )
+        )
+        if relocated is not None:
+            stl = relocated
+            x_dev_coords = try_device_coordinates(stl, dep, None)
+    if x_dev_coords is None:
+        if sparse_target_for_unservable_read(stl, in_layout, dep) is not None:
+            # As for a pointwise op below.
+            # TODO(#5872): return the sparse output as one candidate next to the
+            # normal ones, not early; compute_restickify_needed does not check
+            # that its sparse target is stick_compatible with the output.
+            return [sparse_stl_from_host(output, out_dtype_for_layout)]
         return []
     x_stick_expr = x_dev_coords[-1]
     reduction_var = next(
         iter(dep.index.free_symbols - output_dep.index.free_symbols), None
     )
 
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
+    out_coords = host_coordinates(output, output_dep, None)
 
     # Do not preserve the input layout for reduction ops listed in
     # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
@@ -619,17 +926,44 @@ def _reduction_layout_from_stl(
         data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
         and reduction_var in x_stick_expr.free_symbols
     ):
-        # Try to preserve input layout
-        out_stl = _output_stl_from_stick_expr(
-            x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-        )
-        if out_stl is not None:
-            return [out_stl]
+        # Try to preserve input layout. _compatible_output_stick_exprs starts
+        # with the preserved stick and, only for a size-1 (expanded) stick,
+        # appends one candidate per expanded output dim; reversed() puts those
+        # expanded-dim candidates first, since the back-end compiler cannot
+        # divide a reduction into a one-element-per-stick output of unaligned
+        # width across cores. For an ordinary (non-expanded) stick the list
+        # has one element, so reversed() has no effect.
+        output_stls = [
+            out_stl
+            for expr in reversed(
+                _compatible_output_stick_exprs(x_stick_expr, out_coords, dep)
+            )
+            for out_stl in [
+                _output_stl_from_stick_expr(
+                    expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+                )
+            ]
+            if out_stl is not None
+        ]
+        # Reducing a non-stick dim keeps each stick's element order, so a
+        # staggered EA on the input still describes the output. When the
+        # reduction consumes the stick dim the stagger is gone and the output
+        # stays STANDARD. See #5553.
+        if (
+            stl.element_arrangement in STAGGERED_EAS
+            and reduction_var is not None
+            and reduction_var not in x_stick_expr.free_symbols
+        ):
+            output_stls = [
+                _with_input_ea(out_stl, output_dep, stl.element_arrangement)
+                for out_stl in output_stls
+            ]
+        if output_stls:
+            return output_stls
 
     # Try alternative layouts when input layout is not supported.
     # Skip the dim already known to produce an unsupported stick.
     in_coords = host_coordinates(in_layout, dep, None)
-    out_coords = host_coordinates(output, output_dep, None)
     skip_in_dim = matching_dim(in_coords, x_stick_expr)
 
     # Prefer stick-aligned input dims; fall back to unaligned dims (padded
@@ -666,88 +1000,6 @@ def _reduction_layout_from_stl(
     return layouts
 
 
-def _convert_layout(
-    stl: SpyreTensorLayout,
-    dep: MemoryDep,
-    in_layout: FixedLayout,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    fmt: ElementArrangement,
-    input_ea: ElementArrangement,
-) -> list[SpyreTensorLayout]:
-    """Output STL candidates for a dtype-converting op (staggered or plain).
-
-    Two strategies:
-    1. Staggered conversions (RMSNorm up/down-cast and their restoration:
-       STANDARD<->DL16_TO_FP32 / FP32_TO_DL16) that traverse the whole input.
-       The staggered element ordering only exists on the physical device layout,
-       so propagate the input's device_size/stride_map and rescale just the stick
-       depth via rescale_stl_for_dtype; reconstructing from the logical host size
-       would lose the stick choice a downstream reduction needs. Inheriting is
-       only sound for an identical access -- see _convert_reads_whole_input; a
-       sliced read falls through to (2), which still stamps the staggered EA.
-       Also exposes alternative stick choices for STANDARD->staggered conversions
-       so downstream reductions can request a different stick.
-    2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input device
-       layout can be degenerate — qfp8ch rescales a size-1 num-sticks dim to 0
-       (1*64//128), leaving a size-0 dim — and rescale_stl_for_dtype would
-       faithfully propagate that garbage, changing the layout rank and downstream
-       graph partitioning. Rebuild a clean dense layout from the output host size
-       instead, as the general (non-EA) convert path does.
-    """
-    staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
-    if staggered and _convert_reads_whole_input(in_layout, output, dep, output_dep):
-        layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
-
-        # A conversion that creates a staggered EA must also expose
-        # outputs reachable by restickifying its STANDARD input first.
-        # Otherwise the conversion permanently inherits the input's
-        # stick and a downstream reduction-broadcast join has no way to
-        # request the normalized dimension as the stick. Gemma 4 hits
-        # this when an embedding output enters RMSNorm with its sequence
-        # dimension on the stick.
-        if fmt in STAGGERED_EAS and input_ea == ElementArrangement.STANDARD:
-            in_coords = host_coordinates(in_layout, dep, None)
-            source_device_coords = device_coordinates(stl, dep, None)
-            staggered_arg = PropArg(dep, in_layout, [stl])
-            if source_device_coords[-1].free_symbols:
-                for target_stick_expr in in_coords:
-                    if not target_stick_expr.free_symbols:
-                        continue
-                    target_stl = compute_restickify_target_layout(
-                        stl,
-                        in_layout,
-                        target_stick_expr,
-                        in_coords,
-                        source_device_coords,
-                        arg=staggered_arg,
-                    )
-                    if target_stl is None:
-                        continue
-                    candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
-                    if candidate not in layouts:
-                        layouts.append(candidate)
-
-        # Under the current EA map, an already-staggered input is the
-        # reverse staggered-to-STANDARD restoration. It needs no
-        # expansion: preserve the stick selected before the upcast.
-
-        return layouts
-
-    # Dense reconstruction from the output host size. When the input
-    # stick dim is unaligned, force a full input-stick depth so stick
-    # padding is reflected in the device layout (see #1756 example above).
-    in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
-    if in_layout.size and concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
-        c_size = c_size[:-1] + [in_elems_per_stick]
-        c_stride = c_stride[:-1] + [1]
-    return [
-        SpyreTensorLayout(c_size, c_stride, output.dtype, list(range(len(c_size))), fmt)
-    ]
-
-
 def _default_pointwise_layout(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
@@ -755,6 +1007,7 @@ def _default_pointwise_layout(
     output: FixedLayout,
     output_dep: MemoryDep,
     aten_op,
+    op: "Operation | None" = None,
 ) -> list[SpyreTensorLayout]:
     """Output STL candidates for the default single-arg pointwise case.
 
@@ -767,6 +1020,11 @@ def _default_pointwise_layout(
     out_device_dtype, out_dtype_for_layout = resolve_output_formats(
         output.dtype, stl.device_dtype
     )
+    in_dtype_for_layout = (
+        bool_layout_dtype(stl.device_dtype, "source")
+        if in_layout.dtype == torch.bool
+        else in_layout.dtype
+    )
 
     in_coords = host_coordinates(in_layout, dep, None)
     out_coords = host_coordinates(output, output_dep, None)
@@ -774,7 +1032,7 @@ def _default_pointwise_layout(
         in_coords == out_coords
         and in_layout.size == output.size
         and dep.index == output_dep.index
-        and same_device_size(in_layout.dtype, out_dtype_for_layout)
+        and same_device_size(in_dtype_for_layout, out_dtype_for_layout)
     )
     if aten_op is None and not is_identity_access:
         # An op with no origins (e.g. a synthetically-constructed
@@ -797,6 +1055,7 @@ def _default_pointwise_layout(
                 stl.device_size,
                 stl.stride_map,
                 out_device_dtype,
+                forward_valid_elements(stl),
                 stl.element_arrangement,
             )
         ]
@@ -805,6 +1064,33 @@ def _default_pointwise_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
+        # As in _reduction_layout: a dense relocation of the stick serves the
+        # read, so the normal candidates below are derived from it.
+        # No indirect_sizes or op here, matching the try_device_coordinates calls
+        # around it; compute_restickify_needed probes with both, so the two can
+        # pick different targets for a read with indirect symbols. It checks the
+        # target it picks against this output (stick_compatible) and reports the
+        # restickify infeasible when they disagree, so a mismatch costs a
+        # discarded candidate rather than a wrong layout.
+        # As at the reduction site: probed without op, so the gate is applied here.
+        relocated = (
+            None
+            if output_is_indirectly_mutated(op)
+            else dense_relocation_serves_read(stl, in_layout, dep)
+        )
+        if relocated is not None:
+            stl = relocated
+            in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
+        if sparse_target_for_unservable_read(stl, in_layout, dep) is not None:
+            # A read the input's layout cannot serve (flattening [8, 65] into
+            # [520] splits a stick): compute_restickify_needed moves the input to
+            # its sparse layout, and the output is sparse on its own host dims.
+            # TODO(#5872): return the sparse output as one candidate next to the
+            # normal ones, not early. A rule that also offers a dense output for
+            # this read would get a sparse target that cannot feed it, because
+            # compute_restickify_needed does not check stick_compatible.
+            return [sparse_stl_from_host(output, out_dtype_for_layout)]
         return []
     stick_expr = in_device_coords[-1]
     stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)
@@ -832,6 +1118,33 @@ def _default_pointwise_layout(
     )
 
 
+def _origin_target(data: Pointwise | Reduction):
+    """The target of the first origin of ``data``, skipping enclosing HOPs.
+
+    A buffer lowered inside a higher-order op's subgraph, such as a
+    ``while_loop`` body (``for_each_tile``) or a reused
+    ``nested_compile_region`` (``invoke_subgraph``), inherits the origins of the
+    enclosing lowering context, which come first: the HOP, its subgraph
+    ``get_attr`` nodes and other nodes of the graph holding the HOP. Origins in
+    a graph that holds a HOP are therefore skipped, leaving the subgraph's own
+    nodes; a buffer with no origin elsewhere keeps its first one.
+    (``origin_node`` is no substitute: some lowerings set it to their input's
+    node.)
+    """
+    if not data.origins:
+        return None
+    hop_graphs = {
+        n.graph
+        for n in data.origins
+        if isinstance(n.target, torch._ops.HigherOrderOperator)
+    }
+    node = next(
+        (n for n in data.origins if n.graph not in hop_graphs),
+        next(iter(data.origins)),
+    )
+    return node.target
+
+
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -850,63 +1163,76 @@ def _single_arg_op_layout(
 
     # Reductions are laid out by _reduction_layouts.
     assert isinstance(data, Pointwise)
-    aten_op = next(iter(data.origins)).target if data.origins else None
+    aten_op = _origin_target(data)
     match aten_op:
         case (
             prims.convert_element_type.default
             | aten.copy.default
             | torch.ops.spyre.to_dtype_d2d.default
+            | spyreop.qfp8ch.default
         ) if output.dtype != torch.bool and stl.elems_per_stick() != get_elem_in_stick(
             output.dtype
         ):
-            # Type conversion may require padding when input has padding due to stick
-            # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
-            # which becomes 64 FP32 elements when converted. We need to reflect this
-            # in the output host size so the constructor creates the correct device layout.
-            try:
-                in_stick_expr = device_coordinates(stl, dep, None)[-1]
-            except Unsupported:
-                # Staggered-EA candidate whose physical stick depth differs from
-                # elems_per_stick — not a valid input for this conversion path.
-                return []
-            if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
-                return []
-
-            input_ea = stl.element_arrangement
-
-            # For bool inputs, ea_map must resolve from the physical backing
-            # dtype (e.g. IEEE_FP32 for a fp32-backed bool) rather than the
-            # logical torch.bool, which is not in the EA map. Use the
-            # bool-equivalent dtype of the STL's device_dtype as the source.
-            ea_src_dtype = in_layout.dtype
-            if ea_src_dtype == torch.bool:
-                ea_src_dtype = bool_layout_dtype(stl.device_dtype, "conversion source")
-
-            fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
-            return _convert_layout(
-                stl, dep, in_layout, output, output_dep, fmt, input_ea
-            )
-
-        case spyreop.qfp8ch.default:
-            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
-            # Propagate the input device layout and rescale for the dtype change,
-            # preserving any padding present in the input STL. Not
-            # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
-            # ends in a partially filled fp8 stick, which that helper rejects.
-            coords = try_device_coordinates(stl, dep, None)
-            if coords is None:
-                return []
-            try:
-                return [_qfp8ch_stl(stl, output.dtype, coords)]
-            except Unsupported:
-                # Drop this candidate; the others stay available.
-                return []
+            return _typecast_layouts(output, output_dep, dep, in_layout, stl, op)
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
             return [_qfp8wt_stl(output, in_layout)]
 
-    return _default_pointwise_layout(stl, dep, in_layout, output, output_dep, aten_op)
+    return _default_pointwise_layout(
+        stl, dep, in_layout, output, output_dep, aten_op, op
+    )
+
+
+def _clone_absent_stick_input_target(
+    arg: PropArg,
+    stick_expr: sympy.Expr,
+    out_stl: SpyreTensorLayout,
+    output_dep: MemoryDep,
+) -> SpyreTensorLayout | None:
+    """Return the size-1-stick input STL for a clone that broadcasts into a new
+    stick, or None when the clone does not need split.
+
+    The split is required when the output stick symbol is absent from every
+    device coordinate of the input and the input stick is symbolic: RESTICKIFY_OP
+    cannot move the input stick off and fill the new one in one copy, and
+    padding has no input dim to pad (``_pad_restickify_input``).  The test
+    mirrors ``is_restickify_coords``: both sides are device coordinates, which
+    ``device_coordinates`` sets over the op's iteration.
+
+    Returns None, keeping ``AnyInNode``, when any candidate input
+    layout already has a constant stick (the clone is an identity broadcast
+    fill from it) or no candidate has a size-1 restickify target.
+    """
+    if not stick_expr.free_symbols:
+        return None
+    out_coords = try_device_coordinates(out_stl, output_dep, None)
+    if out_coords is None:
+        return None
+    out_stick_syms = out_coords[-1].free_symbols & output_dep.ranges.keys()
+    if not out_stick_syms:
+        return None
+    in_dep = arg.dep
+    feasible: list[tuple[SpyreTensorLayout, list[sympy.Expr]]] = []
+    for cand in arg.layouts:
+        coords = try_device_coordinates(cand, in_dep, None)
+        if coords is None:
+            continue
+        in_syms = set().union(*(c.free_symbols for c in coords))
+        if not coords[-1].free_symbols or not out_stick_syms.isdisjoint(in_syms):
+            return None
+        if is_stick_expr_offset_free(coords[-1], cand.elems_per_stick()):
+            feasible.append((cand, coords))
+    if not feasible:
+        return None
+    in_host_coords = host_coordinates(arg.layout, in_dep, None)
+    for cand, coords in feasible:
+        target = compute_restickify_target_layout(
+            cand, arg.layout, sympy.S.Zero, in_host_coords, coords, arg=arg
+        )
+        if target is not None:
+            return target
+    return None
 
 
 def _clone_layout(
@@ -921,6 +1247,13 @@ def _clone_layout(
     Case 1: Input has supported stick expression
       - No restickify insertion needed
       - Clone op becomes identity if input is already row-major, otherwise becomes restickify
+
+    Case 1b: Output stick is a broadcast dim the input does not index
+      (e.g., ``x.unsqueeze(1).expand(T, K).clone()``)
+      - RESTICKIFY_OP cannot both move the input stick off and fill the new
+        stick in one copy, and padding has no input dim to pad
+      - hence, restickify the input onto a size-1 stick before the clone
+      - clone op then becomes an identity broadcast fill upto interleaved value.
 
     Case 2: Input has unsupported stick expression (due to offset)
       - Insert restickify before clone to swap stick with non-stick dimension
@@ -953,6 +1286,15 @@ def _clone_layout(
     )
 
     if is_stick_expr_offset_free(stick_expr, stick_size):
+        required_in_stl = _clone_absent_stick_input_target(
+            args[0], stick_expr, out_stl, output_dep
+        )
+        if required_in_stl is not None:
+            # Case 1b: move the input stick onto a size-1 dim (target stick 0).
+            op.restick_cost_fn = FixedInOutNode.from_args(
+                args, out_stl, [required_in_stl], op, output_dep
+            )
+            return [out_stl]
         # Case 1: No restickify insertion needed.
         # Use AnyInNode to produce the fixed output layout.
         op.restick_cost_fn = AnyInNode.from_args()
@@ -1061,7 +1403,18 @@ def _find_layout_avoiding_var_on_stick(
     2. Else return the first layout that can be restickified to move avoid_var
        off the stick, onto a surviving coordinate.
     3. Else raise Unsupported.
+
+    A layout whose stick is a constant (a padded size-1 stick) trivially
+    excludes avoid_var, but it is only accepted when no host coordinate
+    survives avoid_var. Otherwise the kernel reads such an indices layout
+    wrongly, so a real stick on a surviving coordinate is used instead.
     """
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
+    surviving_vars = set()
+    for coord in arg_host_coords:
+        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
+            surviving_vars.update(coord.free_symbols)
+
     constant_stick = None
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep, None)
@@ -1071,18 +1424,17 @@ def _find_layout_avoiding_var_on_stick(
         if avoid_var not in stick_vars:
             if stick_vars:
                 return stl
-            constant_stick = stl
+            if not surviving_vars:
+                constant_stick = stl
 
     if constant_stick is not None:
         return constant_stick
 
-    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
-    surviving_vars = set()
-    for coord in arg_host_coords:
-        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
-            surviving_vars.update(coord.free_symbols)
-
     if not surviving_vars:
+        for stl in arg.layouts:
+            result = compute_size1_restickify_target(stl, arg.layout, arg.dep)
+            if result is not None:
+                return result
         raise Unsupported(
             f"{label}: no surviving coordinates after removing {avoid_var}"
         )
@@ -1214,7 +1566,12 @@ def _collapse_outer_stick_dims(
         del new_size[d]
         del new_stride[d]
         del new_coords[d]
-    return SpyreTensorLayout(new_size, new_stride, stl.device_dtype), new_coords, keep
+    new_ve = collapse_valid_elements(stl, outer_dims, keep)
+    return (
+        SpyreTensorLayout(new_size, new_stride, stl.device_dtype, new_ve),
+        new_coords,
+        keep,
+    )
 
 
 def _rebuild_stl_for_matmul(
@@ -1601,13 +1958,29 @@ def _matmul_layouts(
         x_req_stl = generate_stl_with_required_stick(
             x, stick_var, data.reduction_type, "x"
         )
-        y_dim_order = list(range(len(y.layout.size))) + [-1]
-        y_req_stl = SpyreTensorLayout(
-            [concretize_expr(s) for s in y.layout.size],
-            [concretize_expr(s) for s in y.layout.stride],
-            y.layout.dtype,
-            y_dim_order,
+        # If y already carries a QFP8WT EA (e.g. from a KV-cache gather), pass
+        # it through directly.  The hardware's batchmatmulfp8 op understands the
+        # 2D-stick weight layout regardless of N size; building a STANDARD
+        # sparse-stick STL here would produce a dense→sparse scatter
+        # incompatibility in the beam search.
+        _y_qfp8wt = next(
+            (
+                stl
+                for stl in y.layouts
+                if stl.element_arrangement == ElementArrangement.QFP8WT
+            ),
+            None,
         )
+        if _y_qfp8wt is not None:
+            y_req_stl = _y_qfp8wt
+        else:
+            y_dim_order = list(range(len(y.layout.size))) + [-1]
+            y_req_stl = SpyreTensorLayout(
+                [concretize_expr(s) for s in y.layout.size],
+                [concretize_expr(s) for s in y.layout.stride],
+                y.layout.dtype,
+                y_dim_order,
+            )
         # Output stick is on the last host dim (N=1 collapses N to a scalar position).
         out_dims = len(output.size)
         out_stick_dim = out_dims - 1
@@ -1770,6 +2143,29 @@ def _broadcast_split(
     return broadcast, non_broadcast
 
 
+def _operand_ea(arg: PropArg) -> ElementArrangement:
+    """The arrangement an operand's candidates hold their elements in.
+
+    Candidates of one buffer may differ in arrangement: a conversion tags a
+    candidate whose stick holds one element STANDARD (``_typecast_layouts``),
+    while its full-stick candidates keep the staggered arrangement. A
+    one-element stick reads the same in every arrangement, so the full-stick
+    candidates decide; an operand with only one-element sticks takes its first
+    candidate's.
+    """
+    _, full = _broadcast_split(arg)
+    full_eas = {stl.element_arrangement for stl in full}
+    if len(full_eas) > 1:
+        # TODO: split the operand's candidates by arrangement and resolve each.
+        raise Unsupported(
+            f"pointwise operand {arg.dep.name} has full-stick candidates in "
+            f"several arrangements: {full_eas}"
+        )
+    if full_eas:
+        return full_eas.pop()
+    return arg.layouts[0].element_arrangement
+
+
 def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     """Resolve the output ElementArrangement for a multi-arg pointwise op.
 
@@ -1786,7 +2182,10 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
           3.1 every STANDARD operand can broadcast   -> staggered output
           3.2 every staggered operand can broadcast  -> STANDARD output
           3.3 otherwise (a STANDARD and a staggered full operand coexist)
-                                                     -> unsupported (raise)
+                                                     -> STANDARD output;
+                                                        insert_ea_shuffle
+                                                        shuffles the staggered
+                                                        operands to STANDARD
     In the overlap, prefer the direction whose broadcast condition holds for
     every candidate of the opposite-EA inputs. That choice remains valid no
     matter which producer layouts the optimizer can actually reach. If both
@@ -1798,10 +2197,8 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     layernormnorm / layernormscale carrying EXX2 -- have dedicated layout
     handlers and never reach this path.
     """
-    input_eas: set[ElementArrangement] = set()
-    for arg in ea_args:
-        if arg.layouts:
-            input_eas.add(arg.layouts[0].element_arrangement)
+    operand_eas = {id(arg): _operand_ea(arg) for arg in ea_args if arg.layouts}
+    input_eas = set(operand_eas.values())
 
     staggered_inputs = input_eas & STAGGERED_EAS
 
@@ -1834,13 +2231,12 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     std_split = [
         (arg, *_broadcast_split(arg))
         for arg in ea_args
-        if arg.layouts
-        and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD
+        if arg.layouts and operand_eas[id(arg)] == ElementArrangement.STANDARD
     ]
     stag_split = [
         (arg, *_broadcast_split(arg))
         for arg in ea_args
-        if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
+        if arg.layouts and operand_eas[id(arg)] == staggered_ea
     ]
 
     std_can_broadcast = all(broadcast for _, broadcast, _ in std_split)
@@ -1881,26 +2277,10 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
         return ElementArrangement.STANDARD
 
     # Case 3.3: a STANDARD operand and a staggered operand are both
-    # non-broadcast full tensors — a genuine mixed-order op we cannot
-    # represent yet (future: insert an explicit EA conversion at extra
-    # cost). Report the offending STANDARD operand (there is always one
-    # here, since 3.1 failed).
-    arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
-    stl = arg.layouts[0]
-    c_stride = [concretize_expr(s) for s in arg.layout.stride]
-    mapped = next(
-        (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
-        None,
-    )
-    mapped_size = (
-        concretize_expr(arg.layout.size[mapped]) if mapped is not None else "unknown"
-    )
-    raise Unsupported(
-        f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
-        f"must broadcast (device stick dimension size 1) to be compatible "
-        f"with a staggered EA, and no staggered operand is broadcastable "
-        f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
-    )
+    # non-broadcast full tensors. The output is STANDARD, and
+    # insert_ea_shuffle shuffles the staggered operands to it.
+    assert stag_split, "case 3.3 needs a staggered operand"
+    return ElementArrangement.STANDARD
 
 
 def _is_supported_pointwise_layout(
@@ -1981,9 +2361,10 @@ def _multi_arg_pointwise_layouts(
 
     ea_args = []
     for arg in args:
-        lane0 = _lane0_candidates(arg) if arg.dep.name in ind_names else []
-        if lane0:
-            arg.layouts[:] = lane0
+        if arg.dep.name in ind_names:
+            lane0 = _lane0_candidates(arg)
+            if lane0:
+                arg.layouts[:] = lane0
         else:
             ea_args.append(arg)
 
@@ -2067,6 +2448,7 @@ def _multi_arg_pointwise_layouts(
                 template_stl.device_size,
                 template_stl.stride_map,
                 out_device_dtype,
+                forward_valid_elements(template_stl),
                 output_ea,
             )
         )
@@ -2137,6 +2519,7 @@ def _multi_arg_pointwise_layouts(
             src_stl.device_size,
             src_stl.stride_map,
             out_device_dtype,
+            forward_valid_elements(src_stl),
         )
         if (
             math.prod([s for s in candidate.device_size if s > 0])
@@ -2155,6 +2538,18 @@ def _multi_arg_pointwise_layouts(
             r for r in results if (tuple(r.device_size), tuple(r.stride_map)) != key
         ]
         results.insert(0, candidate)
+
+    if output_ea in STAGGERED_EAS:
+        # A candidate whose stick holds one element is the same in every
+        # arrangement, so it stays STANDARD, as a conversion's output does.
+        results = [
+            _with_input_ea(
+                r.with_element_arrangement(ElementArrangement.STANDARD),
+                output_dep,
+                output_ea,
+            )
+            for r in results
+        ]
 
     if not results:
         # Reaches here when no stick-compatible output layout survives — e.g. in
@@ -2293,35 +2688,13 @@ def _topk_layouts(
     return results
 
 
-def _compact_layout(
+def _index_masking_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact: output is the default dense STL."""
-
-    if len(args) != 1:
-        raise Unsupported(f"({op.get_name()}) requires exactly one input")
-
-    in_arg = args[0]
-    out_layouts = []
-
-    for in_stl in in_arg.layouts:
-        _, out_stl = expand_sparse(in_stl, output)
-        out_layouts.append(out_stl)
-
-    op.restick_cost_fn = AnyInNode.from_args()
-    return out_layouts
-
-
-def _keep_by_index_layouts(
-    op: Operation,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    args: list[PropArg],
-) -> list[SpyreTensorLayout]:
-    """Layout propagation for keep_by_index.
+    """Layout propagation for keep_by_index and mask_by_index.
 
     Output shape matches values input (arg0). Search dimension cannot be the
     stick for arg0 or output. Indices (arg1) k dimension cannot be the stick.
@@ -2332,14 +2705,19 @@ def _keep_by_index_layouts(
       3. Find required layout for indices where k dimension is NOT on stick
       4. Compute output STL with stick matching values' output stick position
     """
-    _check_supported_input_sticks(args, "keep_by_index")
+    op_name = (
+        "mask_by_index"
+        if op.data.reduction_type == MASK_BY_INDEX_OP
+        else "keep_by_index"
+    )
+    _check_supported_input_sticks(args, op_name)
     values = args[0]
     indices = args[1]
     out_coords = host_coordinates(output, output_dep, None)
     values_coords = host_coordinates(values.layout, values.dep, None)
 
     # Find search_var: the loop variable in values not present in indices
-    # (unlike reductions, keep_by_index preserves all dimensions)
+    # (unlike reductions, keep/mask_by_index preserve all dimensions)
     indices_coords = host_coordinates(indices.layout, indices.dep, None)
     search_var = None
     for v_coord in values_coords:
@@ -2352,11 +2730,9 @@ def _keep_by_index_layouts(
             break
 
     if search_var is None:
-        raise Unsupported("keep_by_index: could not identify search dimension")
+        raise Unsupported(f"{op_name}: could not identify search dimension")
 
-    values_req_stl = _find_layout_avoiding_var_on_stick(
-        values, search_var, "keep_by_index"
-    )
+    values_req_stl = _find_layout_avoiding_var_on_stick(values, search_var, op_name)
 
     # Find reduction_var: loop variable in indices not in values (the k dimension)
     reduction_var = None
@@ -2369,10 +2745,10 @@ def _keep_by_index_layouts(
             break
 
     if reduction_var is None:
-        raise Unsupported("keep_by_index: could not identify k dimension")
+        raise Unsupported(f"{op_name}: could not identify k dimension")
 
     indices_req_stl = _find_layout_avoiding_var_on_stick(
-        indices, reduction_var, "keep_by_index"
+        indices, reduction_var, op_name
     )
 
     # Compute output STL: stick position matches values' required layout
@@ -2445,13 +2821,13 @@ def compute_layouts(
     if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
 
-    if is_keep_by_index(op):
-        return _keep_by_index_layouts(op, output, output_dep, args)
+    if is_index_masking_op(op):
+        return _index_masking_layouts(op, output, output_dep, args)
 
     if isinstance(data, Reduction):
         return _reduction_layouts(op, output, output_dep, args)
 
-    aten_op = next(iter(data.origins)).target if data.origins else None
+    aten_op = _origin_target(data)
 
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
@@ -2713,6 +3089,18 @@ def _align_single_source_producer(
         return
     if not isinstance(producer.data, Pointwise):
         return
+    # Do not overwrite a producer whose layout already carries a non-STANDARD
+    # element arrangement (e.g. QFP8WT 2D-stick from qfp8wt).  The alt_stl for
+    # the mutation target is always STANDARD; forcing it onto the producer strips
+    # the arrangement and causes the codegen to misread the HBM layout.  The
+    # caller then gives the target the same QFP8WT arrangement (see
+    # source_is_qfp8wt there), so producer and target still agree.
+    if any(
+        getattr(stl, "element_arrangement", ElementArrangement.STANDARD)
+        != ElementArrangement.STANDARD
+        for stl in getattr(producer, "layouts", [])
+    ):
+        return
     producer.layouts = [alt_stl]
 
 
@@ -2895,7 +3283,7 @@ def _check_whole_stagger_units(
     output_dep = next(iter(op_read_writes(writer).writes))
     coord = host_coordinates(target_layout, output_dep, None)[stick_dim]
     syms = coord.free_symbols
-    offset = coord.subs({s: 0 for s in syms})
+    offset = coord.xreplace({s: sympy.S.Zero for s in syms})
     extent: int | None
     if not syms:
         extent = 1
@@ -3093,7 +3481,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
     for op in removed_ops:
         for write in op_read_writes(op).writes:
             V.graph.removed_buffers.add(write.name)
-        operations.remove(op)
+        remove_op(operations, op)
 
 
 def _eager_view_input_layout(
@@ -3536,6 +3924,7 @@ def propagate_spyre_tensor_layouts(
                 rw = op_read_writes(op)
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
+                caller_target_stl = target_stl
 
                 # An unsupported write stick expression (an offset like v+32, or
                 # an offset-free sub-stick write) needs the stick dim relocated
@@ -3581,6 +3970,53 @@ def propagate_spyre_tensor_layouts(
                         )
                     op._restickify_plan = (target_name, target_stl, alt_stl)
                     target_stl = alt_stl
+
+                # When the scatter source carries QFP8WT EA (i.e. the value
+                # being written was produced by quantize_weight_fp8_with_scale),
+                # the destination must be QFP8WT too so that:
+                #   1. reorder_nonstick_dims sees QFP8WT on k_cache and the
+                #      deferred IA-rotate entry records QFP8WT EA.
+                #   2. _ia_rotate_stl (with EA preservation) propagates QFP8WT
+                #      into the required_stl of the _DeferredReorder.
+                #   3. reorder_nonstick_dims_mutation rewrites the target's layout
+                #      in place to that required_stl, so the scatter writes in
+                #      2D-stick addressing with no copy-in / copy-back.
+                # A graph input must already be QFP8WT: the caller's tensor keeps
+                # the layout it was allocated with, so relabelling a STANDARD
+                # input here would leave its device_tensor_layout() wrong for
+                # every later reader.  Internal buffers are promoted.
+                # Only an indirect scatter is a QFP8WT scatter.  A plain copy
+                # (e.g. the clone of a QFP8WT weight) keeps its own layouts.
+                source_is_qfp8wt = output_dep.is_indirect() and any(
+                    any(
+                        stl.element_arrangement == ElementArrangement.QFP8WT
+                        for stl in a.layouts
+                    )
+                    for a in args
+                    if a.dep.name != target_name
+                )
+                if (
+                    source_is_qfp8wt
+                    and graph_input is not None
+                    and caller_target_stl.element_arrangement
+                    != ElementArrangement.QFP8WT
+                ):
+                    raise Unsupported(
+                        f"QFP8WT scatter into graph input {target_name} requires "
+                        f"a QFP8WT destination; allocate it with "
+                        f"torch_spyre.model_utils.zeros_qfp8wt "
+                        f"(got {caller_target_stl.element_arrangement})"
+                    )
+                if source_is_qfp8wt:
+                    qfp8wt_stl = target_stl.with_element_arrangement(
+                        ElementArrangement.QFP8WT
+                    )
+                    if graph_input is not None:
+                        graph_input.layouts = [qfp8wt_stl]
+                    elif target_buf is not None:
+                        target_buf.layouts = [qfp8wt_stl]
+                    target_stl = qfp8wt_stl
+
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
@@ -3670,6 +4106,20 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
 
+        elif isinstance(op, (IndexPutFallback, ScatterFallback)):
+            # Upstream routes some index_put and scatter forms to a mutating
+            # fallback, which has no Spyre kernel. Reject here, not at run time.
+            # TODO(issue#692, issue#4361): drop this once they lower on device.
+            raise Unsupported(
+                f"{op.python_kernel_name}: upstream lowers this form to a "
+                f"mutating fallback, which has no Spyre kernel"
+            )
+        elif isinstance(op, SpyreArangeFallback):
+            # A coordinate's device layout is fixed at construction, so it offers
+            # no alternatives to propagate; committing it here lets consumers read
+            # the stick constraint like they would from a graph input.
+            op.layouts = [op.get_layout().device_layout]
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

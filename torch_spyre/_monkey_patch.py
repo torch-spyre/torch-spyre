@@ -111,35 +111,18 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
             raise ValueError(
                 f"dynamic={{{dim}: ...}}: {name}={value!r} must be a positive int"
             )
-    if dim_min > dim_max:
-        raise ValueError(f"dynamic={{{dim}: ...}}: min={dim_min} exceeds max={dim_max}")
-    if dim_max % granularity != 0:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: max={dim_max} is not a multiple of "
-            f"granularity={granularity}"
-        )
-
     # Local import: this file must stay importable before torch_spyre's
     # own submodules are guaranteed ready (see _UNSET above), and reading
     # the Inductor layer's config from the eager transfer path is itself
-    # a deliberate dependency edge -- a single source of truth for
-    # max_buckets and min_reserved_dim_size beats duplicated constants that
-    # can drift from it.
+    # a deliberate dependency edge -- one validator shared with the
+    # compiler's derived output contracts (reserved_dims_contract.py) beats
+    # a duplicated, independently maintained copy of the same rules.
     from torch_spyre._inductor import config as inductor_config
 
-    if dim_min < inductor_config.min_reserved_dim_size:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: min={dim_min} is below the minimum "
-            f"supported reservation floor ({inductor_config.min_reserved_dim_size})"
-        )
-
-    num_buckets = dim_max // granularity
-    if num_buckets > inductor_config.max_buckets:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: max={dim_max} / granularity={granularity} = "
-            f"{num_buckets} buckets, exceeding the cap of "
-            f"{inductor_config.max_buckets} (config.max_buckets)"
-        )
+    for violation in inductor_config.reservation_violations(
+        dim_min, dim_max, granularity
+    ):
+        raise ValueError(f"dynamic={{{dim}: ...}}: {violation}")
 
     if not (0 <= dim < len(size)):
         raise ValueError(
@@ -161,23 +144,17 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
 
 
 def _parse_dynamic_to_args(self, args, kwargs):
-    """Validate a ``.to(..., dynamic=...)`` call and return its target dtype.
+    """Validate a ``.to(..., dynamic=...)`` call; return (dtype, non_blocking).
 
     dynamic= only makes sense for the initial host-to-device copy, so raise
     unless this is an eager CPU -> "spyre" transfer. The returned dtype is
     None when the caller didn't ask for a conversion. Parsed with torch's own
-    ``.to()`` parser so dtype is honoured whether it is passed positionally or
-    by keyword. A non-default memory_format is rejected; non_blocking is
-    accepted (the transfer is always synchronous).
+    ``.to()`` parser so dtype and non_blocking are honoured whether they are
+    passed positionally or by keyword. A non-default memory_format is rejected.
     """
     import torch
 
-    # non_blocking is a hint: the transfer below is always synchronous, which
-    # is a valid way to honour non_blocking=True, so it is accepted and
-    # deliberately not forwarded.
-    device, dtype, _non_blocking, memory_format = torch._C._nn._parse_to(
-        *args, **kwargs
-    )
+    device, dtype, non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
     message = (
         'dynamic= is only supported for CPU -> "spyre" transfers, e.g. '
         f"{_DYNAMIC_USAGE_HINT}"
@@ -193,37 +170,50 @@ def _parse_dynamic_to_args(self, args, kwargs):
             f"dynamic= does not support memory_format={memory_format}; "
             "only the default memory format is supported"
         )
-    return dtype
+    return dtype, non_blocking
 
 
-def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
-    """Allocate at the ceiling, copy the real data in, mark the dim dynamic."""
+def _layout_to_non_blocking(args, kwargs) -> bool:
+    """``non_blocking`` of a ``.to(..., device_layout=...)`` call.
+
+    Parsed with torch's own ``.to()`` parser, as on the ``dynamic=`` path. That
+    parser rejects ``copy``, which a host-to-device transfer satisfies either
+    way, so a ``copy`` keyword is dropped first.
+    """
     import torch
 
-    # This path calls spyre_empty_reserved directly via pybind11, bypassing
-    # the ATen dispatcher path that ordinarily self-inits the runtime (via
-    # the H2D stream pool inside spyre_copy_from -> getCurrentStream). On a
-    # fresh process this can be the very first device op, so the runtime
-    # must be brought up explicitly here first -- same idiom as
-    # manual_seed/CCL-backend/profiler init elsewhere in this package.
+    kwargs = {key: value for key, value in kwargs.items() if key != "copy"}
+    return torch._C._nn._parse_to(*args, **kwargs)[2]
+
+
+def _reserve_and_copy(
+    src, spec: _DynamicSpec, allocate, non_blocking: bool = False
+) -> "torch.Tensor":
+    """Allocate at the ceiling, copy the real data in, mark the dim dynamic.
+
+    The shared body of the two reserved transfers. ``allocate(size, stride,
+    dtype)`` is the native allocation: ``spyre_empty_reserved`` with the layout
+    derived from the shape, or ``spyre_empty_reserved_with_layout`` with the
+    layout given. Everything else is the same for both, so it lives here once.
+    """
+    import torch
+
+    # This path calls the allocator directly via pybind11, bypassing the ATen
+    # dispatcher path that ordinarily self-inits the runtime (via the H2D
+    # stream pool inside spyre_copy_from -> getCurrentStream). On a fresh
+    # process this can be the very first device op, so the runtime must be
+    # brought up explicitly here first -- same idiom as manual_seed/CCL-backend/
+    # profiler init elsewhere in this package.
     if not torch.spyre.is_initialized():
         torch.spyre._impl._lazy_init()
 
     # Local import, same lazy-import convention as the rest of this file
     # (see _UNSET above): torch_spyre._C is a native extension module and
     # this file must stay importable before it's guaranteed ready.
-    from torch_spyre._C import copy_tensor, spyre_empty_reserved
+    from torch_spyre._C import copy_tensor
 
-    dst = spyre_empty_reserved(
-        src.size(),
-        src.stride(),
-        src.dtype,
-        spec.dim,
-        spec.min,
-        spec.max,
-        spec.granularity,
-    )
-    copy_tensor(src, dst, non_blocking=False)
+    dst = allocate(src.size(), src.stride(), src.dtype)
+    copy_tensor(src, dst, non_blocking=non_blocking)
 
     # mark_dynamic must run eagerly, before any compile, so Dynamo treats
     # `dim` as symbolic from the first trace.
@@ -239,6 +229,49 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     # inside the trace are still written by the traced function.
     torch._dynamo.mark_dynamic(dst, spec.dim)
     return dst
+
+
+def _transfer_reserved(
+    src, spec: _DynamicSpec, non_blocking: bool = False
+) -> "torch.Tensor":
+    """Reserve at the ceiling with the layout derived from the shape."""
+    from torch_spyre._C import spyre_empty_reserved
+
+    def allocate(size, stride, dtype):
+        return spyre_empty_reserved(
+            size, stride, dtype, spec.dim, spec.min, spec.max, spec.granularity
+        )
+
+    return _reserve_and_copy(src, spec, allocate, non_blocking)
+
+
+def _transfer_reserved_with_layout(
+    src, spec: _DynamicSpec, device_layout, non_blocking: bool = False
+):
+    """``_transfer_reserved`` with the device layout given instead of derived.
+
+    The layout describes the buffer at ``max``, so the reserved host dimension
+    must occupy exactly one device dimension of it, whole (the one whose
+    stride-map entry is the host stride of the reserved dimension), not the
+    stick-elements dimension, with extent ``max``. The native allocation
+    checks that before anything is allocated and raises a ``RuntimeError``
+    naming the rule it broke.
+    """
+    from torch_spyre._C import spyre_empty_reserved_with_layout
+
+    def allocate(size, stride, dtype):
+        return spyre_empty_reserved_with_layout(
+            size,
+            stride,
+            dtype,
+            device_layout,
+            spec.dim,
+            spec.min,
+            spec.max,
+            spec.granularity,
+        )
+
+    return _reserve_and_copy(src, spec, allocate, non_blocking)
 
 
 def _sharding_key(tensor) -> tuple | None:
@@ -263,62 +296,6 @@ def _sharding_key(tensor) -> tuple | None:
         return None
     info = _C._spyre_sharding_info(tensor)
     return (info["shard_dim"], info["num_shards"], info["shard_device_bytes"])
-
-
-def _add_ea(src_tensor, res_tensor) -> None:
-    """Update the EA tag after an eager transfer handled by ``orig_to``.
-
-    Same-device dtype-changing casts return through ``to_dtype_d2d`` before
-    this helper is reached; their EA is propagated by the compiled graph.
-    """
-    if res_tensor.dtype == src_tensor.dtype:
-        return
-
-    import torch
-    from torch_spyre._inductor.dtype_ops import DtypeOpTable
-    from torch_spyre._inductor.constants import STAGGERED_EAS
-    from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
-
-    # Skip FakeTensor tracing contexts during torch.compile
-    if (
-        torch.compiler.is_compiling()
-        or isinstance(src_tensor, torch._subclasses.FakeTensor)
-        or isinstance(res_tensor, torch._subclasses.FakeTensor)
-    ):
-        return
-
-    from torch_spyre._C import (
-        get_spyre_tensor_layout,
-        set_spyre_tensor_layout,
-    )
-
-    # TODO EA torch.bool as it can be fp16 or fp32
-
-    try:
-        src_layout = get_spyre_tensor_layout(src_tensor)
-    except RuntimeError:
-        return
-
-    if src_layout is None:
-        return
-
-    input_ea = src_layout.element_arrangement
-    fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
-
-    try:
-        res_layout = get_spyre_tensor_layout(res_tensor)
-    except RuntimeError:
-        return
-
-    if res_layout is None:
-        return
-
-    stl = res_layout.with_element_arrangement(fmt)
-    is_staggered_ea = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
-    if src_tensor.dtype != torch.float32 and is_staggered_ea:
-        stl = rescale_stl_for_dtype(src_layout, res_tensor.dtype, fmt)
-
-    set_spyre_tensor_layout(res_tensor, stl)
 
 
 def _patch_tensor_for_spyre():
@@ -370,17 +347,18 @@ def _patch_tensor_for_spyre():
 
     def spyre_to(self, *args, device_layout=None, dynamic=None, **kwargs):
         if dynamic is not None:
-            if device_layout is not None:
-                raise ValueError(
-                    "dynamic= cannot be combined with device_layout=: a "
-                    "reserved tensor's layout is derived from its max size"
-                )
-            dtype = _parse_dynamic_to_args(self, args, kwargs)
+            dtype, non_blocking = _parse_dynamic_to_args(self, args, kwargs)
             spec = _parse_dynamic_spec(dynamic, self.size())
             # Convert on the host first: the reserved buffer is allocated
             # and filled at the dtype the caller asked for.
             src = self if dtype is None or dtype == self.dtype else orig_to(self, dtype)
-            return _transfer_reserved(src, spec)
+            if device_layout is not None:
+                # The caller's layout describes the buffer at the declared
+                # max; it is checked against the declaration, not derived.
+                return _transfer_reserved_with_layout(
+                    src, spec, device_layout, non_blocking
+                )
+            return _transfer_reserved(src, spec, non_blocking)
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
             # the operation device-local so Inductor sees and lowers the dtype
@@ -428,10 +406,7 @@ def _patch_tensor_for_spyre():
                 # function entry), so this dtype-only op drops no layout request.
                 return torch.ops.spyre.to_dtype_d2d(self, _dtype, self.storage_offset())
 
-            res = orig_to(self, *args, **kwargs)
-            if res.device.type == DEVICE_NAME:
-                _add_ea(self, res)
-            return res
+            return orig_to(self, *args, **kwargs)
         else:
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")
@@ -482,7 +457,9 @@ def _patch_tensor_for_spyre():
             if self.device.type == "cpu":
                 from torch_spyre._C import copy_tensor
 
-                copy_tensor(self, dst, non_blocking=False)
+                copy_tensor(
+                    self, dst, non_blocking=_layout_to_non_blocking(args, kwargs)
+                )
                 return dst
             else:  # device to device copy
                 # If device_layout is the same as self and copy is not True, return self
@@ -616,6 +593,8 @@ def _patch_tensor_for_spyre():
         expected_offset = value.storage_offset()
         # Sharded storage compiles to a different (non-unified) kernel.
         expected_sharding = _sharding_key(value)
+        # The declared (min, max, granularity): the layout only reflects max.
+        expected_reserved = _reserved_dims_key(value)
 
         # add lambda guard on tensor's child manager
         # same node as TENSOR_MATCH!
@@ -627,10 +606,11 @@ def _patch_tensor_for_spyre():
                     x.device_tensor_layout() == expected_layout
                     and x.storage_offset() == expected_offset
                     and _sharding_key(x) == expected_sharding
+                    and _reserved_dims_key(x) == expected_reserved
                 )
             ),
             [
-                f"SpyreTensorLayout({guard.name}) == {expected_layout} and storage_offset == {expected_offset} and sharding == {expected_sharding}"
+                f"SpyreTensorLayout({guard.name}) == {expected_layout} and storage_offset == {expected_offset} and sharding == {expected_sharding} and reserved_dims == {expected_reserved}"
             ],
             guard.user_stack,
         )
@@ -678,12 +658,17 @@ def _patch_tensor_for_spyre():
                 layout,
                 offset,
                 _sharding_key(value),
+                _reserved_dims_key(value),
             )
 
         def _spyre_tensor_reuse_eval(value, metadata):
-            base_metadata, expected_layout, expected_offset, expected_sharding = (
-                metadata
-            )
+            (
+                base_metadata,
+                expected_layout,
+                expected_offset,
+                expected_sharding,
+                expected_reserved,
+            ) = metadata
             if not isinstance(value, torch.Tensor):
                 return False
             if extract_tensor_metadata(value) != base_metadata:
@@ -695,6 +680,7 @@ def _patch_tensor_for_spyre():
                 value.device_tensor_layout() == expected_layout
                 and value.storage_offset() == expected_offset
                 and _sharding_key(value) == expected_sharding
+                and _reserved_dims_key(value) == expected_reserved
             )
 
         _spyre_reuse_spec = GuardCheckSpec(
@@ -727,6 +713,12 @@ def _patch_tensor_for_spyre():
     # from one fused QKV projection and captured whole by an outer for_each_tile.
     # ──────────────────────────────────────────────────────────────────────────
     _patch_scan_input_aliasing()
+    # ──────── while_loop writes to additional inputs (pytorch#195393) ────────
+    # Keeps a loop whose only effect is writing a captured tensor, such as
+    # for_each_tile(out=...)'s destination, and orders later reads after it.
+    # Remove in torch 2.15: https://github.com/pytorch/pytorch/pull/195393
+    # ──────────────────────────────────────────────────────────────────────────
+    _patch_while_loop_additional_input_mutation()
 
     # ── Safetensors Spyre-aware loading (monkey-patch) ──────────────────────
     # Monkey-patches the three public Python entry points to support
@@ -852,6 +844,12 @@ def _patch_scan_input_aliasing() -> bool:
     aliasing for ``scan``; Dynamo's still rejects it when an aliased input requires
     grad, and input-output and output-output aliasing stay rejected.
 
+    torch 2.14 lets ``scan`` mutate captured inputs under ``no_grad``, so aliased
+    inputs are no longer read-only by construction. Dynamo's check therefore also
+    keeps rejecting an aliased pair when either input is mutated: functionalization
+    treats the two as independent, and a write through one would not be seen
+    through the other (upstream rejects the same case since pytorch/pytorch#199688).
+
     Carries need no extra check: neither stock Inductor nor torch-spyre's loop
     lowering (``_carry_real_input_is_private``) writes a carry's storage in place
     while anything else can read it.
@@ -901,6 +899,13 @@ def _patch_scan_input_aliasing() -> bool:
             return original_has_aliasing(self)
         storages = hop_vars.get_tensor_storages
         example = hop_utils._collect_fake_inputs
+        # A mutated input is only safe if nothing else views its storage:
+        # functionalization treats subgraph inputs as independent, so a write
+        # through one view would not be seen through another. torch 2.14 lets
+        # scan mutate captured inputs under no_grad, so such a pair must still be
+        # rejected (as upstream does since pytorch/pytorch#199688).
+        mutated_idx = set(self.has_input_mutation().mutated_input_indices)
+        mutated = {n for i, n in enumerate(self.graph.nodes) if i in mutated_idx}
 
         input_storages = {}
         for node in self.graph.nodes:
@@ -912,6 +917,13 @@ def _patch_scan_input_aliasing() -> bool:
             for storage in storages(value):
                 if storage in input_storages:
                     first = input_storages[storage]
+                    if first in mutated or node in mutated:
+                        msg = (
+                            "Input-to-input aliasing with input mutation detected "
+                            f"at nodes {first} and {node}: a write through one "
+                            "would not be seen through the other"
+                        )
+                        return output_graph.AliasingInfo(True, msg)
                     if not (value.requires_grad or example([first])[0].requires_grad):
                         continue
                     msg = (
@@ -987,6 +999,74 @@ def _patch_scan_input_aliasing() -> bool:
     tracer_cls.has_aliasing = has_aliasing
     hop_vars.check_aliasing_and_input_mutation = check_aliasing_and_input_mutation
     hop_utils._check_alias_and_mutation = _check_alias_and_mutation
+    return True
+
+
+def _patch_while_loop_additional_input_mutation() -> bool:
+    """Declare a while_loop's writes to its additional inputs (pytorch/pytorch#195393).
+
+    torch 2.14's ``WhileLoop.create`` gives a ``MutationOutput`` only to a carried
+    input the body writes. An additional input the body writes, such as the
+    destination ``for_each_tile(out=...)`` passes through ``scan``'s input
+    mutation, gets none. The scheduler then drops a loop whose outputs are unused,
+    and does not order later reads of that input after the loop. Both silently
+    give wrong results. This registers a ``MutationOutput`` for every additional
+    input the body mutates, as torch 2.15 does.
+
+    Only on torch 2.14: 2.13's scan cannot mutate its inputs, and 2.15 has the fix.
+    Returns whether the patch is active. Idempotent.
+
+    TODO: remove in torch 2.15, which ships the upstream fix,
+    https://github.com/pytorch/pytorch/pull/195393. TestWhileLoopMutationBackportProbe
+    in tests/inductor/test_for_each_tile.py XPASSes then.
+    """
+    import functools
+
+    import torch
+
+    release = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
+    if release != (2, 14):
+        return False
+
+    from torch._higher_order_ops.utils import check_input_alias_and_mutation
+    from torch._inductor import ir
+    from torch._inductor.virtualized import V
+
+    if getattr(ir.WhileLoop.create, "_spyre_additional_mutation_patched", False):
+        return True
+    original_create = ir.WhileLoop.create.__func__
+
+    @functools.wraps(original_create)
+    def create(cls, cond_fn, body_fn, carried_inputs, additional_inputs, *args, **kw):
+        first_new_op = len(V.graph.operations)
+        outputs = original_create(
+            cls, cond_fn, body_fn, carried_inputs, additional_inputs, *args, **kw
+        )
+        loops = [
+            op
+            for op in V.graph.operations[first_new_op:]
+            if isinstance(op, ir.WhileLoop)
+        ]
+        if len(loops) != 1:
+            raise AssertionError(
+                f"expected WhileLoop.create to register one WhileLoop, got {loops}"
+            )
+        (loop,) = loops
+        if not loop.additional_inputs:
+            return outputs
+        fx_node = V.graph.current_node
+        fake_inputs = [x.meta["val"] for x in (*fx_node.args[-2], *fx_node.args[-1])]
+        mutated = check_input_alias_and_mutation(body_fn.graph.module, fake_inputs)[3]
+        num_carried = len(loop.carried_inputs)
+        for idx in sorted(set(mutated)):
+            # 2.14 already registers a mutated carry.
+            if idx >= num_carried:
+                inp = loop.additional_inputs[idx - num_carried]
+                loop.mutation_outputs.append(ir.MutationOutput(inp.layout, inp, loop))
+        return outputs
+
+    create._spyre_additional_mutation_patched = True  # type: ignore[attr-defined]
+    ir.WhileLoop.create = classmethod(create)
     return True
 
 
@@ -1565,9 +1645,30 @@ def _patch_safetensors_for_spyre() -> None:
         _st_torch.load_model = _spyre_load_model
 
 
+def _reserved_dims_key(tensor):
+    """An ordered, hashable form of a tensor's ``dynamic=`` reservation, or None.
+
+    A declared dim's (min, max, granularity) is baked into whatever is compiled
+    from the tensor (the stamp on its outputs, the kernels built from it), but
+    the layout the cache and the guards already compare reflects only ``max``
+    and the fake input carries only a symbol. Anything that decides whether a
+    compiled result can be reused for this tensor has to compare this too.
+    """
+    from torch_spyre._C import get_reserved_dims
+
+    reserved = get_reserved_dims(tensor)
+    if not reserved:
+        return None
+    return tuple(
+        (dim, spec["min"], spec["max"], spec["granularity"])
+        for dim, spec in sorted(reserved.items())
+    )
+
+
 def _patch_fx_graph_hash():
     """
-    Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key.
+    Extends FxGraphHashDetails to include SpyreTensorLayout and each input's
+    ``dynamic=`` reservation in the cache key.
     """
     import torch
     from torch._inductor.codecache import FxGraphHashDetails
@@ -1594,6 +1695,7 @@ def _patch_fx_graph_hash():
         spyre_layouts = []
         spyre_offsets = []
         spyre_shardings = []
+        spyre_reserved_dims = []
         # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
         inputs_to_use = (
             real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
@@ -1606,16 +1708,21 @@ def _patch_fx_graph_hash():
                 spyre_layouts.append(layout)
                 spyre_offsets.append(offset)
                 spyre_shardings.append(_sharding_key(inp))
+                spyre_reserved_dims.append(_reserved_dims_key(inp))
             else:
                 spyre_layouts.append(None)
                 spyre_offsets.append(None)
                 spyre_shardings.append(None)
+                spyre_reserved_dims.append(None)
 
         # Both fields are pickled into cache key to prevent reuse across offsets (#3770)
         self.spyre_layouts = spyre_layouts
         self.spyre_offsets = spyre_offsets
         # Sharded inputs compile to non-unified kernels (sharded_hbm.py).
         self.spyre_shardings = spyre_shardings
+        # Two declarations that differ only in min or granularity have the same
+        # layout, so without this they share one entry.
+        self.spyre_reserved_dims = spyre_reserved_dims
 
     FxGraphHashDetails.__init__ = _spyre_init
     FxGraphHashDetails._spyre_hash_patched = True

@@ -24,6 +24,11 @@ from torch_spyre.ops.fallbacks import warn_fallback
 
 from .constants import FP8_E4M3FN_MAX
 from .errors import Unsupported
+from .linear_attention import (
+    DEFAULT_CHUNK_SIZE,
+    check_linear_attention,
+    reference_linear_attention,
+)
 from .scratchpad.lx_context_switching import mark_lx_safe
 
 aten = torch.ops.aten
@@ -221,6 +226,58 @@ def keep_by_index_cpu(
         mask = mask | (coords == idx_k)
 
     return torch.where(mask, values, torch.full_like(values, fill_value))
+
+
+@torch.library.custom_op("spyre::mask_by_index", mutates_args=(), device_types="spyre")
+def mask_by_index(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    pass
+
+
+@mask_by_index.register_fake
+def _(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    return values.new_empty(values.size())
+
+
+@torch.library.register_kernel("spyre::mask_by_index", ["cpu"])
+def mask_by_index_cpu(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    # Normalize dim to handle negative indices
+    dim = dim % values.ndim
+    indices_long = indices.to(torch.long)
+
+    # Create mask: for each position in output, check if value[dim] matches any index
+    mask = torch.zeros_like(values, dtype=torch.bool)
+
+    # For each k in the indices dimension, check which values match
+    for k in range(indices.shape[dim]):
+        idx_k = indices_long.select(dim, k)  # values.shape with dim removed
+        idx_k = idx_k.unsqueeze(dim)  # add back dimension
+
+        # Create coordinate tensor reshaped for broadcasting
+        shape = [1] * values.ndim
+        shape[dim] = values.shape[dim]
+        coords = torch.arange(
+            values.shape[dim], device=values.device, dtype=torch.long
+        ).view(shape)
+
+        # Mark where values[dim] == indices[k, ...]
+        mask = mask | (coords == idx_k)
+
+    return torch.where(mask, torch.full_like(values, fill_value), values)
 
 
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
@@ -830,6 +887,37 @@ def _constant(
     return fill_value
 
 
+@torch.library.custom_op("spyre::arange", mutates_args=(), device_types="spyre")
+def spyre_arange(
+    length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    column: bool = False,
+    owned: bool = False,
+) -> torch.Tensor:
+    # Marks a cacheable coordinate in the FX graph: the [0, length) ramp, or its
+    # [length, 1] column form when column is set.  Lowering turns this into a
+    # SpyreArangeFallback, whose codegen emits the memoized runtime call.  owned
+    # asks for a private copy rather than the shared cached buffer.  The op has
+    # no eager kernel: an eager torch.arange compiles its decomposition, and only
+    # a frame Dynamo gives up on (past its recompile limit) would reach this.
+    raise RuntimeError(
+        "spyre::arange runs only inside a compiled graph; it has no eager kernel"
+    )
+
+
+@spyre_arange.register_fake
+def _arange(
+    length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    column: bool = False,
+    owned: bool = False,
+) -> torch.Tensor:
+    size = (length, 1) if column else (length,)
+    return torch.empty(size, dtype=dtype, device=device)
+
+
 @torch.library.custom_op("spyre::to_dtype_cpu", mutates_args=(), device_types="spyre")
 def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     warn_fallback(f"conversion from {input.dtype} to {dtype}")
@@ -868,17 +956,16 @@ def _(input: torch.Tensor) -> torch.Tensor:
 
 
 # Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
-# four-step pipeline; the only difference is the final format-conversion kernel:
-#   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)
-#   2. Scale the input:       x_scaled = x * inv_scale  (POINTWISE)
-#   3. Clamp to FP8 E4M3:    x_clamped = clamp(x_scaled, -448, 448)  (POINTWISE)
-#   4. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
+# pipeline; the only difference is the final format-conversion kernel:
+#   1. Compute inverse scale: safe_recip = where(scale == 0, 1.0, 1 / scale)
+#   2. Scale and clamp:       x_clamped = clamp(x * safe_recip, -448, 448)
+#   3. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
 #
-# The reciprocal in step 1 is emitted as a separate hardware op. For scalar or
-# broadcast scales the compiler does not currently fuse it into a single multiply,
-# so there is one sfp-unit op for 1/scale and one for x * inv_scale.  Callers with
-# a hot-path constraint can pre-compute inv_scale and pass it directly to the
-# underlying spyre.qfp8ch / spyre.qfp8wt decomposition ops instead.
+# Step 1 guards against reciprocal(0.0) evaluating to NaN on Spyre hardware so
+# that scaled inputs remain finite and dequantize with scale=0 evaluates to 0.0
+# (see #3037). For callers with hot-path constraints, inv_scale can be
+# pre-computed and passed directly to the underlying spyre.qfp8ch / spyre.qfp8wt
+# decomposition ops.
 
 
 @torch.library.custom_op(
@@ -1044,7 +1131,7 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 @torch.library.custom_op("spyre::scaled_mm", mutates_args=(), device_types="spyre")
 def scaled_mm(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
     Raw FP8 matrix multiplication, with no scaling or bias applied.
@@ -1062,7 +1149,7 @@ def scaled_mm(
 
 @scaled_mm.register_fake
 def _(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     if mat1.ndim != 2 or mat2.ndim != 2:
         raise ValueError(
@@ -1076,7 +1163,7 @@ def _(
 
 @torch.library.custom_op("spyre::bmm_fp8", mutates_args=(), device_types="spyre")
 def bmm_fp8(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
     Raw FP8 batched matrix multiplication, with no scaling applied.
@@ -1095,7 +1182,7 @@ def bmm_fp8(
 
 @bmm_fp8.register_fake
 def _(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
     output_shape = [*mat1.shape[:-2], mat1.shape[-2], mat2.shape[-1]]
@@ -1108,7 +1195,7 @@ def scaled_bmm(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
@@ -1138,7 +1225,7 @@ def _(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
@@ -1194,62 +1281,6 @@ def _(
     device: torch.device,
 ) -> torch.Tensor:
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
-
-
-@torch.library.custom_op("spyre::triu_cpu", mutates_args=())
-def triu_cpu(input: torch.Tensor, diagonal: int) -> torch.Tensor:
-    """
-    CPU fallback for torch.triu on dtypes with no Spyre elementwise support.
-
-    The mask-multiply decomposition needs an elementwise mul, which the device
-    rejects for the narrow integral formats (uint8 -> SENUINT32, int8 ->
-    SENINT8, int32 -> IEEE_INT32); torch.where is rejected for the same
-    formats, so there is no on-device masking path at all.  Mirrors
-    max_dim_int64_fallback: the Spyre kernel is registered in fallbacks.py, and
-    this CompositeExplicitAutograd body computes the real result so calls with
-    non-Spyre inputs (e.g. compare_with_cpu paths) still work.
-    """
-    return torch.triu(input, diagonal)
-
-
-@triu_cpu.register_fake
-def _(input: torch.Tensor, diagonal: int) -> torch.Tensor:
-    return torch.empty_like(input)
-
-
-@torch.library.custom_op("spyre::triu_mask", mutates_args=())
-def triu_mask(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Build an upper triangular mask on CPU and transfer to the target device.
-
-    Shape: [H, W] in the input's dtype
-
-    Built entirely on CPU so the construction is opaque to torch.compile —
-    assert_functional_graph is satisfied and the compiled graph only sees the
-    resulting device tensor.  No device_types restriction is set because there
-    are no tensor arguments to dispatch on; the device is an explicit parameter.
-    """
-    cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
-    rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
-    mask = ((cols - rows) >= diagonal).to(dtype=dtype)  # [H, W]
-    return mask.to(device=device)
-
-
-@triu_mask.register_fake
-def _(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.empty(h, w, dtype=dtype, device=device)
 
 
 @torch.library.custom_op(
@@ -1380,64 +1411,95 @@ def _(
 
 
 @torch.library.custom_op(
-    "spyre::stagger_to_standard_ea", mutates_args=(), device_types="spyre"
+    "spyre::linear_attention", mutates_args=(), device_types="spyre"
 )
-def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
-    """Restore standard Element Arrangement (EA) from staggered EA.
-
-    The fp32todl16 conversion reorders elements when converting fp32 to fp16,
-    producing staggered EA in the output.  This op applies mm(x, P.t()) to
-    permute the last dimension back to standard EA so downstream ops see a
-    normal fp16 tensor.
-
-    The permutation matrix P encodes the hardware fp32→fp16 stagger pattern.
-    Each fp16 stick (64 elements) staggers independently:
-        stick_base = (phys // 64) * 64
-        local_phys = phys % 64
-        k, w = local_phys // 8, local_phys % 8
-        local_logical = k*4 + w            if w < 4
-                      = k*4 + (w-4) + 32   otherwise   (32 = fp16_stick // 2)
-        logical = stick_base + local_logical
-
-    ``half`` is always 32 (half of one fp16 stick), independent of N.
-    N = x.shape[-1] must be a multiple of 64.
-
-    P is built on CPU and transferred to the device.  It is determined solely
-    by N, so it is constant for a given tensor width and can be reused across
-    ops (lt, eq, etc.) that produce the same stagger pattern.
-
-    Input:  fp16 tensor with staggered EA, any shape [..., N]
-    Output: fp16 tensor with standard EA, same shape [..., N]
+def linear_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    n = x.shape[-1]
-    device = x.device
+    Linear attention entry point: ``(output, final_state)``.
 
-    # Build N×N permutation matrix on CPU, transfer to device.
-    # Each fp16 stick (64 elements) staggers independently with half=32.
-    FP16_STICK = 64
-    half = FP16_STICK // 2  # 32 — fixed, independent of n
-    P = torch.zeros(n, n, dtype=x.dtype, device="cpu")
-    for phys_j in range(n):
-        stick_base = (phys_j // FP16_STICK) * FP16_STICK
-        local_phys = phys_j % FP16_STICK
-        k, w = local_phys // 8, local_phys % 8
-        local_logical = k * 4 + w if w < 4 else k * 4 + (w - 4) + half
-        P[stick_base + local_logical, phys_j] = 1.0
-    P = P.to(device=device)
+    ``query`` and ``key`` are ``[B, H, L, Dk]`` and ``value`` is
+    ``[B, H, L, Dv]``. Any feature map (for example ``elu(x) + 1``) is applied
+    by the caller; this op computes the kernelized attention itself. Causally
+    it is the recurrence ``S_t = S_{t-1} + k_t^T v_t``, ``o_t = scale * q_t S_t``
+    (the current token is included), so ``output`` is ``[B, H, L, Dv]`` and
+    ``final_state`` is the ``[B, H, Dk, Dv]`` state after the last token. With
+    ``is_causal=False`` every row reads the state summed over the whole
+    sequence.
 
-    # Flatten all dims except the last into a single batch dim for mm,
-    # then restore the original shape.  This works for any rank >= 1:
-    # the stagger pattern only affects the last (stick) dimension, so
-    # flattening leading dims produces the correct row ordering for mm.
-    orig_shape = list(x.shape)
-    m = x.numel() // n
-    result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
-    return result
+    ``initial_state`` (``[B, H, Dk, Dv]``, same dtype as ``query``) seeds the
+    recurrence. Feeding one call's ``final_state`` into the next is how chunked
+    prefill and token-by-token decode continue a sequence: the state is a fixed
+    size, unlike a KV cache. ``scale`` defaults to ``Dk ** -0.5``.
+
+    ``chunk_size`` (a multiple of 64, at most 512) is static configuration: the
+    sequence is padded at the end to a multiple of it and processed one chunk
+    per step with plain matmuls. A larger chunk means fewer steps but a larger
+    ``[chunk_size, chunk_size]`` score tile.
+
+    Phase 1 limits, enforced by ``check_linear_attention``: query, key and
+    value share one shape apart from ``Dv``; no grouped-query form; no gating or
+    decay. The chunk loop is a ``for_each_tile`` loop, so the number of chunks
+    is not capped. Each chunk's matmuls accumulate in FP32, but the carried
+    state is stored in the 16-bit device format between chunks, so its relative
+    error grows slowly with the number of chunks.
+
+    On a Spyre device this MUST be called under torch.compile(backend="inductor");
+    the real implementation is the decomposition in decompositions.py, and an
+    eager call on a Spyre device raises ``Unsupported`` rather than returning
+    nothing. On CPU it runs the fp32 reference recurrence, which is the accuracy
+    yardstick for the device path.
+    """
+    raise Unsupported("spyre::linear_attention must be called under torch.compile")
 
 
-@stagger_to_standard_ea.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x)
+@linear_attention.register_fake
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    reason = check_linear_attention(query, key, value, initial_state, chunk_size, scale)
+    if reason is not None:
+        raise Unsupported(f"linear_attention: {reason}")
+
+    batch, heads, seqlen, key_dim = query.shape
+    value_dim = value.size(-1)
+    output = query.new_empty((batch, heads, seqlen, value_dim))
+    final_state = query.new_empty((batch, heads, key_dim, value_dim))
+    return output, final_state
+
+
+@torch.library.register_kernel("spyre::linear_attention", ["cpu"])
+def linear_attention_cpu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Validate exactly as the device path does, so the CPU reference accepts
+    # and rejects the same calls and a test cannot pass on CPU for a shape the
+    # device refuses.
+    reason = check_linear_attention(query, key, value, initial_state, chunk_size, scale)
+    if reason is not None:
+        raise Unsupported(f"linear_attention: {reason}")
+    return reference_linear_attention(
+        query, key, value, initial_state, scale, is_causal
+    )
 
 
 @torch.library.custom_op(
@@ -1540,7 +1602,6 @@ mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
 mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
-mark_lx_safe(torch.ops.spyre.triu_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
 # them to fallback_ops -- _is_cpu_only_fallback (lx_context_switching.py)
