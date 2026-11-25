@@ -107,6 +107,7 @@ from for_each_tile_fixtures import (
     embedding_restickify_inputs,
     embedding_restickify_table_fn,
     fill_add_tiled_fn,
+    index_copy_into_cloned_tile_fn,
     kv_cache_write_tiled_fn,
     matmul_x_yt_nested_fn,
     matmul_x_yt_tile_m_fn,
@@ -528,6 +529,61 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         )
         torch.testing.assert_close(
             actual_value.cpu().float(), expected_value.float(), atol=0, rtol=0
+        )
+
+    def test_index_copy_into_cloned_tile_matches_eager(self):
+        """Regression test for issue #6412.
+
+        `index_copy_into_cloned_tile_fn`'s body has NO user carry (plain
+        `out_dim=0` map mode): the per-trip tile's own output (`blk`) is
+        stacked into the final result through `scan`'s native `ys`
+        mechanism, not a carry the user ever sees. See that fixture's
+        docstring for the full mechanism: `blk` is cache's own
+        `tile_dim_marker`, mutated in place by `index_copy_`'s `Scatter`
+        write, and `_consume_tile_dim_markers` used to inline that
+        marker's pre-mutation body into the op that stacks it -- silently
+        discarding the scatter with no error at all, rather than crashing.
+        Before the fix, this assertion failed with roughly 1/64 of all
+        elements wrong (every position of the scattered row, across every
+        tile row): some stale at the old `cache` value, the rest corrupted
+        by a mismatched row's value.
+
+        `cache` is pre-filled with an out-of-range negative sentinel so a
+        silently-skipped write (as opposed to a crash) is caught. `value`'s
+        rows are `row / ROWS` -- unique per row, dyadic (ROWS is a power of
+        two), small in magnitude, and reach the device through no
+        arithmetic at all, so (as in
+        `test_scatter_carry_preserves_old_value_read_after_update` and
+        `test_kv_cache_write_tiled_matches_eager_index_copy` above) the
+        comparison needs no tolerance whatsoever.
+        """
+        rows, scatter_dim, stick_dim, tile_size, slot_pos = 16, 64, 64, 8, 5
+
+        cache = torch.full((rows, scatter_dim, stick_dim), -1.0, dtype=torch.float16)
+        value = (
+            (torch.arange(rows, dtype=torch.float16) / rows)
+            .view(-1, 1)
+            .expand(-1, stick_dim)
+            .contiguous()
+        )
+        slot = torch.tensor([slot_pos], dtype=torch.int64)
+
+        expected = cache.clone()
+        expected[:, slot_pos, :] = value
+
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            index_copy_into_cloned_tile_fn, fullgraph=True, dynamic=False
+        )
+        with torch.inference_mode():
+            actual = compiled(
+                cache.to(DEVICE_NAME),
+                value.to(DEVICE_NAME),
+                slot.to(DEVICE_NAME),
+                tile_size=tile_size,
+            )
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(), atol=0, rtol=0
         )
 
     def test_computed_where_condition_in_broadcast_tile(self):
