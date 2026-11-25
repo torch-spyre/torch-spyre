@@ -69,6 +69,7 @@ def for_each_tile(
     tile_size: int,
     init=None,
     out_dim=None,
+    out=None,
     reverse: bool = False,
 ):
     """Run `body` once per tile over a co-indexed tiling of `operands`.
@@ -95,7 +96,11 @@ def for_each_tile(
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
             of each returned output leaf. Tiles may be a tensor or a pytree of
-            tensors. ``None`` means the body emits no tile.
+            tensors. ``None`` means the body emits no tile. With ``out``,
+            ``Gather(axis, index)``: step ``i``'s tile is written at the rows
+            ``index[i]`` names along ``axis``.
+        out: the caller's destination for the output tiles, written in place and
+            returned; see "Writing into a caller-owned output" below.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -226,6 +231,56 @@ A tiling that covers the window exactly with an odd number of blocks is
 skipped, because the K/V loop then slices the cache view directly and its
 strides are not divisible by the tile count.
 
+### Writing into a caller-owned output (`out=`)
+
+With `out=`, the caller passes the tensor the output tiles must end up in, and
+every step scatters its tile into it in place. No stacked per-step output is
+materialized. The call returns `out` itself.
+
+```python
+with torch.inference_mode():
+    # KV-cache write: step i scatters its rows into kv_pool[slots[i]].
+    for_each_tile(
+        body, (values,), dims=0, tile_size=1, out_dim=Gather(0, slots), out=kv_pool
+    )
+```
+
+- `out_dim=Gather(axis, index)`: step `i`'s tile lands at the rows `index[i]`
+  names along `axis`. `index` is `[trips]` (one row per step) or
+  `[trips, rows]` (`rows` rows per step). A row named more than once is
+  written once per mention, in no defined order, so it is well defined only
+  when every such write carries the same value, as for pad lanes clamped to
+  the last real row. `index` may also be an operand sliced one row per step
+  (`dims=0`, `tile_size=1`); the loop then reads it once. On Spyre the
+  per-trip index row follows the index-table rules above: use
+  `[trips, rows]` with `rows` a multiple of 32.
+- `out` leaves match the body's output tiles in flattened order, with the same
+  dtype and the tile's shape on every other axis.
+- An `int` `out_dim` is not supported with `out=` yet and raises
+  `NotImplementedError`; leave `out=None` to get the output returned.
+
+The destination is written through `scan`'s input mutation: it reaches the loop
+as an additional input that the body updates with `index_copy_`, and the splice
+binds that write to the caller's buffer. Hence:
+
+- Grad mode must be disabled (`torch.no_grad()` or `torch.inference_mode()`).
+- An `out` leaf must not share storage with an operand or with another `out`
+  leaf. A shared storage with an operand the loop reads whole is rejected at
+  trace time.
+- `out=` is rejected in a decomposition (see below). There the scan is emitted
+  below functionalization, so the write would be an undeclared side effect.
+  A decomposition returns its result, or carries the destination and updates it
+  with a functional `index_copy`.
+
+On Spyre, keep the destination in a layout with the indexed dimension
+outermost, such as the "indirect access" layout `torch_spyre.model_utils` gives
+an embedding table. Otherwise `reorder_nonstick_dims_mutation` copies the whole
+destination in and out around every trip's write (see
+[Indirect Access](indirect_access.md)). A compiled Spyre kernel does not check
+index values: a row outside the destination, or outside an input `Gather`'s
+pool, is written or read out of bounds. An eager call checks every `Gather`
+index on the host and raises `IndexError`.
+
 ### Body contract when tracing a decomposition
 
 When reached under make_fx and outside Dynamo, `for_each_tile` emits `scan_op`
@@ -297,7 +352,7 @@ tracks actual graph storage, rather than relying on a variable's name.
 ## Example: tiling `y = a + b; z = y * c`
 
 The example below tiles the same computation used throughout this document's
-companion, [`coarse_tiling_loops.md`](coarse_tiling_loops.md), with
+companion, [`loop_nodes.md`](loop_nodes.md), with
 `for_each_tile`. `a`, `b`, `c` are `[1024, 4096]` tensors; the loop tiles
 dimension 0 into 8 steps of 128 rows each:
 
@@ -327,13 +382,12 @@ is ignored), and returns each step's `[128, 4096]` result tile, which
 `out_dim=0` lays into the corresponding `narrow(0, i*128, 128)` slice of the
 returned `[1024, 4096]` output.
 
-This is the same tiling shape as the
-[Small Example](coarse_tiling_loops.md#small-example) in the companion
-document (a single loop, `y = a + b` then `z = y * c`) and it lowers to the
-same downstream mechanism (`loop_info: CoarseTileInfo`, a `CountedLoopSchedulerNode`,
-a `LoopSpec`). `docs/tools/capture_for_each_tile_ir.py` regenerates the real,
-captured IR/OpSpec/`bundle.mlir` for this exact example, which the
-[implementation reference](coarse_tiling_loops.md) quotes at length.
+This is the same example as the
+[worked example](loop_nodes.md#worked-example) in the companion document. It
+lowers to one `LoopNode`, which becomes a `LoopSchedulerNode` and a `LoopSpec`.
+`docs/tools/capture_for_each_tile_ir.py` regenerates the real, captured
+IR/OpSpec/`bundle.mlir` for this exact example, which the
+[implementation reference](loop_nodes.md) quotes at length.
 
 ## Composing and nesting
 
@@ -360,14 +414,11 @@ def fn(a, b, c):
     return z
 ```
 
-The compiler's lowering pipeline (see [Layer 1's Prove → Splice → Identify →
-Stamp
-sequence](coarse_tiling_loops.md#prove-splice-identify-stamp-how-a-for_each_tile-call-becomes-loop_info))
+The compiler's lowering (see [Where loops come from](loop_nodes.md#where-loops-come-from))
 runs to a fixed point over nested `for_each_tile`/`while_loop` structures, so
-this composition is handled uniformly rather than as a special case. See
-that section for how a two-level nest like this ends up with a two-entry
-`loop_group_id` on the innermost ops, analogous to the Small Example's
-`(0, 0)`.
+this composition is handled uniformly rather than as a special case. A
+two-level nest like this becomes two nested `LoopNode`s: the inner node is in the
+outer node's body, and the innermost ops have two levels in `enclosing_loops`.
 
 ## Implementation
 
@@ -382,22 +433,20 @@ Inductor as an `ir.WhileLoop` (`scan`'s own lowering), not as a distinct
 The Spyre backend's job is then to recognize which `ir.WhileLoop`s are
 provably bounded, tile-shaped loops (as opposed to genuinely
 data-dependent `while_loop`s, which stay as `ir.WhileLoop`) and rewrite them
-into a `loop_info`-carrying representation. The mechanics of that
+into a `LoopNode`. The mechanics of that
 recognition and rewrite (`try_prove_for_each_tile`, `splice_while_loops`,
 `_stamp_direct_loop_info`, and the surrounding carry machinery in
 `while_loop_bridge.py`) are described in detail in
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1-pre-scheduling-ir-pass),
-which covers everything past "a run of ops carries a `loop_info:
-CoarseTileInfo`": the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
-and the `LoopSpec` codegen tree (Layer 3).
+[`loop_nodes.md`](loop_nodes.md#where-loops-come-from), which also covers
+everything past the build of the node: how passes read and edit it, the
+scheduler's `LoopSchedulerNode`, and the `LoopSpec` codegen tree.
 
 `splice_while_loops` runs in `CustomPreSchedulingPasses`, before dead-code
 elimination, since it must resolve every `for_each_tile`-shaped
-`ir.WhileLoop` down to a `loop_info`-carrying group before later passes see
-a flat op list. Work-division and scratchpad planning run after, consuming
+`ir.WhileLoop` down to a `LoopNode` before later passes see the graph. Work-division and scratchpad planning run after, consuming
 the resulting tiled iteration spaces. See
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#groups-derivation-and-placement-in-custompreschedulingpasses)
-for the full pass ordering.
+[`loop_nodes.md`](loop_nodes.md#invariants-and-failure-modes)
+for the pass ordering.
 
 ### Transformation
 
@@ -422,10 +471,9 @@ and spills to HBM. With WSR, each tile of `y` lives in LX scratchpad for the
 duration of one iteration and is consumed immediately by the next op.
 :::
 
-The full mechanics (how loop identity is carried through Inductor's
-flat-list pipeline, how the loop perimeter prevents cross-group fusion, how
-buffers crossing the loop boundary are classified) are documented in
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md).
+The full mechanics (how a loop is one node that passes read and edit through
+helpers, how the scheduler keeps the loop whole, how buffers crossing the loop
+boundary are classified) are documented in [`loop_nodes.md`](loop_nodes.md).
 
 A buffer that crosses the loop boundary and whose access has a nonzero
 coefficient on the loop variable of a given level (`loop_facts.read_advance` /
@@ -438,18 +486,18 @@ spans every tile the buffer occupies across the loop; sizing it for a single
 tile would let the loop overrun into whatever buffer the allocator packed
 next to it. A buffer whose accesses have no loop-variable term at any level, by contrast, never advances and is a candidate for
 a fixed-address LX scratchpad slot instead. See
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the `accum_full` /
-`accum_tile` buffers this distinction matters most for.
+[`loop_nodes.md`](loop_nodes.md#carries) for the carried accumulators this
+distinction matters most for.
 
 ## Related documents
 
-- [`coarse_tiling_loops.md`](coarse_tiling_loops.md): implementation
-  reference for the transformation stage (Layer 1 IR pass, Layer 2
-  scheduler wrapper, Layer 3 codegen tree) that turns `for_each_tile`'s
-  `loop_info` into an executable tiled loop nest.
+- [`loop_nodes.md`](loop_nodes.md): implementation reference for the
+  transformation stage (the `LoopNode`, the scheduler's `LoopSchedulerNode`
+  and the `LoopSpec` codegen tree) that turns a `for_each_tile` call into an
+  executable tiled loop nest.
 - [RFC 1358: Coarse-Tiling Loop IR Design
   Rationale](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md),
-  which explains the reasoning behind the three-layer design.
+  which explains the reasoning behind the design.
 - [`scratchpad_planning.md`](scratchpad_planning.md): how LX scratchpad
   allocation consumes the per-tile iteration spaces produced by WSR.
 - [`work_division_planning.md`](work_division_planning.md): how work

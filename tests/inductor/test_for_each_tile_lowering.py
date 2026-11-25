@@ -734,6 +734,7 @@ class TestSpliceWhileLoop(unittest.TestCase):
         before.inputs = []
 
         while_op = mock.Mock()
+        while_op.mutation_outputs = []
         while_op.carried_inputs = []
         while_op.inputs = []
         while_op.body_subgraph.graph.graph_outputs = []
@@ -755,6 +756,40 @@ class TestSpliceWhileLoop(unittest.TestCase):
         self.assertIn(body_op_a, graph.operations)
         self.assertIn(body_op_b, graph.operations)
 
+    def test_drops_the_while_ops_mutation_outputs(self):
+        """A MutationOutput naming the removed while_op as producer is unregistered.
+
+        It declares the body's write to an additional input, e.g.
+        for_each_tile(out=...)'s destination; after the splice the body's own write
+        declares it, and a buffer whose producer is gone must not stay behind.
+        """
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        body_op = mock.Mock(name="body_op", spec=["get_operation_name"])
+        mutation = mock.Mock(name="mutation")
+        kept = mock.Mock(name="kept")
+
+        while_op = mock.Mock()
+        while_op.mutation_outputs = [mutation]
+        while_op.carried_inputs = []
+        while_op.inputs = []
+        while_op.body_subgraph.graph.graph_outputs = []
+        while_op.body_subgraph.graph.graph_inputs = {}
+        while_op.body_subgraph.graph.operations = [body_op]
+        while_op.body_subgraph.graph.name_to_op = {}
+        while_op.body_subgraph.graph.name_to_buffer = {}
+
+        graph = mock.Mock()
+        graph.operations = [while_op]
+        graph.name_to_op = {}
+        graph.name_to_buffer = {"buf9": mutation, "buf1": kept}
+        graph.buffers = [kept, mutation]
+
+        bridge.splice_while_loop(graph, while_op, carries=[])
+
+        self.assertEqual(graph.name_to_buffer, {"buf1": kept})
+        self.assertEqual(graph.buffers, [kept])
+
     def test_splices_at_while_op_position(self):
         import torch_spyre._inductor.wsr.while_loop_bridge as bridge
 
@@ -765,6 +800,7 @@ class TestSpliceWhileLoop(unittest.TestCase):
         after.inputs = []
 
         while_op = mock.Mock()
+        while_op.mutation_outputs = []
         while_op.carried_inputs = []
         while_op.inputs = []
         while_op.body_subgraph.graph.graph_outputs = []
@@ -835,6 +871,7 @@ class TestSpliceWhileLoop(unittest.TestCase):
         producer_op.inputs = []
 
         while_op = mock.Mock()
+        while_op.mutation_outputs = []
         while_op.carried_inputs = [real_carry_init]
         while_op.inputs = [real_carry_init, real_xs_input]
         while_op.body_subgraph.graph.graph_outputs = [carry_placeholder]
@@ -2930,13 +2967,7 @@ class TestDrainMaterialization(unittest.TestCase):
         from types import SimpleNamespace
 
         from torch._inductor.scheduler import Scheduler, SchedulerNode
-        from torch_spyre._inductor.scheduler import (
-            CountedLoopSchedulerNode,
-            _build_loop_group,
-            _loop_group_id,
-            _regroup_by_outer_loop_key,
-        )
-
+        from torch_spyre._inductor.loop_facts import counted_loop_path
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
         from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 
@@ -3032,12 +3063,9 @@ class TestDrainMaterialization(unittest.TestCase):
                         mutation_renames[resolve(alt_name)] = buf.get_name()
                         mutation_renames[alt_name] = buf.get_name()
 
-            ordered = _regroup_by_outer_loop_key(snodes)
-            wrapped = _build_loop_group(ordered, 0)
-
         drain_node = next(n for n in snodes if getattr(n, "node", None) is drain)
         # The drain carries no loop membership.
-        self.assertIsNone(_loop_group_id(drain_node))
+        self.assertEqual(counted_loop_path(drain), ())
 
         # Its unresolved dependency names the loop's tagged update, not
         # the pre-loop initializer.  Compared by node identity because
@@ -3062,19 +3090,15 @@ class TestDrainMaterialization(unittest.TestCase):
             "dependency means the scheduler rewrite would be required",
         )
 
-        drain_index = next(i for i, n in enumerate(ordered) if n is drain_node)
+        # After every loop member in lowered order, so a node wrapping the
+        # loop's members ends before it and leaves it outside.
+        drain_index = next(i for i, n in enumerate(snodes) if n is drain_node)
         last_loop_member_index = max(
             i
-            for i, n in enumerate(ordered)
+            for i, n in enumerate(snodes)
             if isinstance(n, SchedulerNode) and loop_member_view(n.node) is not None
         )
         self.assertLess(last_loop_member_index, drain_index)
-
-        counted_loops = [n for n in wrapped if isinstance(n, CountedLoopSchedulerNode)]
-        self.assertEqual(len(counted_loops), 1)
-        self.assertNotIn(drain_node, counted_loops[0].get_nodes())
-        wrapped_drain_index = next(i for i, n in enumerate(wrapped) if n is drain_node)
-        self.assertLess(wrapped.index(counted_loops[0]), wrapped_drain_index)
 
 
 class TestTryProveForEachTile(unittest.TestCase):
@@ -5927,12 +5951,6 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
 
         from torch._inductor.scheduler import Scheduler
         from torch_spyre._inductor.pass_utils import PerCoreView, op_read_writes
-        from torch_spyre._inductor.scheduler import (
-            CountedLoopSchedulerNode,
-            _build_loop_group,
-            _loop_group_id,
-            _regroup_by_outer_loop_key,
-        )
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
         from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
         from torch_spyre._inductor.scratchpad.utils import (
@@ -6020,19 +6038,19 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
             for order, snode in enumerate(snodes):
                 snode.min_order = order
                 snode.max_order = order
-            ordered = _regroup_by_outer_loop_key(snodes)
-            wrapped = _build_loop_group(ordered, 0)
 
         clone_node = next(n for n in snodes if getattr(n, "node", None) is clone)
-        self.assertIsNone(_loop_group_id(clone_node))
-        counted_loops = [n for n in wrapped if isinstance(n, CountedLoopSchedulerNode)]
-        self.assertEqual(len(counted_loops), 1)
-        self.assertNotIn(clone_node, counted_loops[0].get_nodes())
-        self.assertLess(wrapped.index(clone_node), wrapped.index(counted_loops[0]))
+        self.assertEqual(counted_loop_group_path(clone), ())
+        members = [n for n in snodes if counted_loop_group_path(n.node)]
+        self.assertTrue(members)
+        # In lowered order the clone is before every loop member, so a node
+        # wrapping the loop's members starts after it and leaves it outside.
+        clone_index = next(i for i, n in enumerate(snodes) if n is clone_node)
+        self.assertLess(clone_index, min(snodes.index(n) for n in members))
         # Some loop member depends on the clone, so the scheduler cannot sink it.
         readers = [
             n
-            for n in counted_loops[0].get_nodes()
+            for n in members
             if any(dep.name == clone_name for dep in n.unmet_dependencies)
         ]
         self.assertTrue(readers)

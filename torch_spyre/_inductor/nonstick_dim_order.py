@@ -1240,7 +1240,7 @@ def _insert_mutation_relayout_copy(
     levels = enclosing_loops(mutation_op)
     if levels:
         for copy_op in (buf_tmp, buf_copyback):
-            record_member(copy_op, [((), ()) for _ in levels], like=mutation_op)
+            record_member(copy_op, [((), ()) for _ in levels])
 
     logger.info(
         "nonstick_dim_order: inserted mutation relayout copy for %s "

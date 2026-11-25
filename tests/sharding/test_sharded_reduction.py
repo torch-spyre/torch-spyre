@@ -279,10 +279,16 @@ def test_cross_shard_reduction_matches_cpu(launched, fn):
 @requires_emulation
 @pytest.mark.parametrize(
     "dtype, width",
-    # One stick per row in both dtypes (64 fp16 or 32 fp32 elements). A
-    # two-stick fp32 row hits the shard-local stride limit (#5827).
-    [(torch.float16, 64), (torch.float32, 32)],
-    ids=["fp16", "fp32"],
+    # One and two sticks per row: a two-stick row (fp16 or fp32) has
+    # shard-local strides different from the global ones — admitted since
+    # issue #5827 was lifted.
+    [
+        (torch.float16, 64),
+        (torch.float16, 128),
+        (torch.float32, 32),
+        (torch.float32, 64),
+    ],
+    ids=["fp16_1stick", "fp16_2stick", "fp32_1stick", "fp32_2stick"],
 )
 def test_cross_shard_sum_of_rank2_tensor(launched, dtype, width):
     """[4n, w] Shard(0).sum(0) -> [w]: a column sum across all shards."""
@@ -429,14 +435,55 @@ def test_unsupported_reductions_fail_at_compile(fn, match):
 
 
 @requires_emulation
-@expects_raise
-def test_reduction_with_unequal_local_strides_fails():
+def test_reduction_with_unequal_local_strides(launched):
     """Shard(0) of [4n, 3, 64] reducing dim 1: the input's device layout puts
-    dim 1 outside the shard dim, so shard-local strides differ from the
-    global ones. TODO: positive once DeepTools uses per-core layout sizes
-    (issue #5827), as for pointwise ops."""
+    dim 1 inside the shard dim, so shard-local strides differ from the global
+    ones. Admitted since the codegen guard checks the split against the shard
+    dim instead of unified-model stride distances (issue #5827); the backend
+    walks each core's tile with the shard-local layout."""
     n = num_shards()
-    x = _sharded(_small_ints((4 * n, 3, 64)), 0, n)
+    src = _small_ints((4 * n, 3, 64), seed=10)
+    x = _sharded(src, 0, n)
 
-    with pytest.raises(RuntimeError, match="shard-local strides equal to the global"):
-        torch.compile(lambda t: t.sum(1), dynamic=False)(x)
+    y = torch.compile(lambda t: t.sum(1), dynamic=False)(x)
+
+    assert len(launched) == 1, launched
+    assert torch.spyre.is_sharded(y)
+    info = torch.spyre.sharding_info(y)
+    assert info.placement == Shard(0) and info.num_shards == n
+    assert torch.equal(y.cpu(), src.sum(1))
+
+
+@requires_emulation
+def test_shard_local_reduction_of_shard_dim_inside_wider_rows(launched):
+    """[8, 4n, 64] Shard(1).sum(0): the reduced dim sits outside the shard
+    dim, whose shard-local stride differs from the global one (the shard dim
+    is a middle device dim, not the innermost non-stick one)."""
+    n = num_shards()
+    src = _small_ints((8, 4 * n, 64), seed=11)
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.sum(0), dynamic=False)(x)
+
+    assert len(launched) == 1, launched
+    assert torch.spyre.is_sharded(y)
+    info = torch.spyre.sharding_info(y)
+    assert info.placement == Shard(0) and info.num_shards == n
+    assert tuple(y.shape) == (4 * n, 64)
+    assert torch.equal(y.cpu(), src.sum(0))
+
+
+@requires_emulation
+def test_cross_shard_reduction_with_unequal_local_strides(launched):
+    """[8, 4n, 64] Shard(1).sum(1): a cross-shard ring reduction whose input
+    shards have shard-local strides different from the global ones — the
+    lifted stride restriction composes with the ring combine."""
+    n = num_shards()
+    src = _small_ints((8, 4 * n, 64), seed=12)
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.sum(1), dynamic=False)(x)
+
+    assert len(launched) == 1, launched
+    assert not torch.spyre.is_sharded(y)
+    assert torch.equal(y.cpu(), src.sum(1))

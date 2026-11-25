@@ -22,10 +22,9 @@ Covers six areas, each in its own class group:
      TestCoarseTileNested, TestRetileLoadIndexFromStrides,
      TestSqueezedRetileDims, TestIndexVarPrefix, TestConsumerOwnDimSymbol,
      TestRetileLoadIndexWithConsumer)
-  3. CountedLoopSchedulerNode, build_loop_scheduler_nodes,
+  3. CountedLoopSchedulerNode,
      _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes loop fusion
-     (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode,
-      TestSpyreFuseNodesLoopFusion)
+     (TestTiledSymsForSchedNode, TestSpyreFuseNodesLoopFusion)
   4. generate_sdsc and compile_op_spec symbol/affine-stride paths
      (TestGenerateSdscTiledSymbols,
       TestCompileOpSpecTwoTiledSymbols, TestCompileOpSpecSymbolMapping)
@@ -118,12 +117,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.fusion import spyre_fuse_nodes
-from torch_spyre._inductor.scheduler import (
-    CountedLoopSchedulerNode,
-    _loop_count,
-    _loop_group_id,
-    build_loop_scheduler_nodes,
-)
+from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _iter_op_specs,
@@ -2825,167 +2819,6 @@ class TestCoarseTileNested(unittest.TestCase):
         op = _make_hinted_op(data, "op0", hints=((1, 0),))
         with self.assertRaisesRegex(Unsupported, "not divisible"):
             _planned_tile_extents_per_level(op, [[0]], [[]], [(1, Integer(3))])
-
-
-# ===========================================================================
-# 3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
-# ===========================================================================
-
-
-class TestHelpers(unittest.TestCase):
-    def test_loop_group_id_present(self):
-        sched = _make_scheduler()
-        op = _make_ir_op(loop_group_id=(0,), loop_count=Integer(4))
-        snode = _make_snode(sched, op)
-        self.assertEqual(_loop_group_id(snode), (0,))
-
-    def test_loop_group_id_absent(self):
-        sched = _make_scheduler()
-        op = _make_ir_op()
-        snode = _make_snode(sched, op)
-        self.assertIsNone(_loop_group_id(snode))
-
-    def test_loop_count(self):
-        sched = _make_scheduler()
-        op = _make_ir_op(loop_group_id=(0,), loop_count=Integer(8))
-        snode = _make_snode(sched, op)
-        self.assertEqual(_loop_count(snode, depth=0), Integer(8))
-
-    def test_loop_count_symbolic(self):
-        sched = _make_scheduler()
-        s = Symbol("s0")
-        op = _make_ir_op(loop_group_id=(0,), loop_count=s)
-        snode = _make_snode(sched, op)
-        self.assertEqual(_loop_count(snode, depth=0), s)
-
-
-class TestBuildLoopSchedulerNodes(unittest.TestCase):
-    def _run(self, nodes):
-        created = []
-
-        def fake_create(snodes, loop_count):
-            node = MagicMock(spec=CountedLoopSchedulerNode)
-            node.snodes = snodes
-            node.loop_count = loop_count
-            node.get_nodes.return_value = snodes
-            node.get_name.return_value = "_".join(n.get_name() for n in snodes)
-            node.scheduler = snodes[0].scheduler
-            created.append(node)
-            return node
-
-        with patch.object(
-            CountedLoopSchedulerNode, "create", staticmethod(fake_create)
-        ):
-            result = build_loop_scheduler_nodes(nodes)
-        return result, created
-
-    def test_passthrough_no_loop_group(self):
-        sched = _make_scheduler()
-        nodes = [
-            _make_snode(sched, _make_ir_op(), "a"),
-            _make_snode(sched, _make_ir_op(), "b"),
-        ]
-        result, created = self._run(nodes)
-        self.assertEqual(result, nodes)
-        self.assertEqual(created, [])
-
-    def test_single_group_two_nodes(self):
-        sched = _make_scheduler()
-        n1 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "a")
-        n2 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "b")
-        result, created = self._run([n1, n2])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(len(created), 1)
-        self.assertEqual(created[0].loop_count, Integer(4))
-        self.assertIn(n1, created[0].snodes)
-        self.assertIn(n2, created[0].snodes)
-
-    def test_non_group_nodes_pass_through_around_group(self):
-        sched = _make_scheduler()
-        before = _make_snode(sched, _make_ir_op(), "before")
-        g1 = _make_snode(sched, _make_ir_op((0,), Integer(2)), "g1")
-        g2 = _make_snode(sched, _make_ir_op((0,), Integer(2)), "g2")
-        after = _make_snode(sched, _make_ir_op(), "after")
-        result, created = self._run([before, g1, g2, after])
-        self.assertEqual(len(result), 3)
-        self.assertIs(result[0], before)
-        self.assertIsInstance(result[1], MagicMock)
-        self.assertIs(result[2], after)
-        self.assertEqual(created[0].loop_count, Integer(2))
-
-    def test_dependency_of_later_group_member_precedes_whole_group(self):
-        """A preheader copy inserted before a later consumer stays outside.
-
-        Coarse tiling may place a loop-invariant copy between two flat loop
-        members when only the later member reads it. Scheduler regrouping must
-        move that dependency before the counted-loop unit, not split the unit.
-        """
-        sched = _make_scheduler()
-        first = _make_snode(sched, _make_ir_op((0,), Integer(4)), "first")
-        copy = _make_snode(sched, _make_ir_op(), "copy")
-        consumer = _make_snode(sched, _make_ir_op((0,), Integer(4)), "consumer")
-
-        for node, name in ((first, "first"), (copy, "copy"), (consumer, "consumer")):
-            node.get_buffer_names.return_value = {name}
-        consumer.unmet_dependencies = OrderedSet(
-            [inductor_deps.MemoryDep("copy", Integer(0), (), ())]
-        )
-
-        result, created = self._run([first, copy, consumer])
-
-        self.assertEqual(result, [copy, created[0]])
-        self.assertEqual(created[0].snodes, [first, consumer])
-
-    def test_two_separate_groups(self):
-        sched = _make_scheduler()
-        g0a = _make_snode(sched, _make_ir_op((0,), Integer(4)), "g0a")
-        g0b = _make_snode(sched, _make_ir_op((0,), Integer(4)), "g0b")
-        g1a = _make_snode(sched, _make_ir_op((1,), Integer(8)), "g1a")
-        g1b = _make_snode(sched, _make_ir_op((1,), Integer(8)), "g1b")
-        result, created = self._run([g0a, g0b, g1a, g1b])
-        self.assertEqual(len(result), 2)
-        self.assertEqual(len(created), 2)
-        self.assertEqual(created[0].loop_count, Integer(4))
-        self.assertEqual(created[1].loop_count, Integer(8))
-
-    def test_nested_group(self):
-        sched = _make_scheduler()
-        outer = _make_snode(sched, _make_ir_op((0,), Integer(4)), "outer")
-        inner1 = _make_snode(
-            sched, _make_ir_op((0, 0), [Integer(4), Integer(2)]), "inner1"
-        )
-        inner2 = _make_snode(
-            sched, _make_ir_op((0, 0), [Integer(4), Integer(2)]), "inner2"
-        )
-        result, created = self._run([outer, inner1, inner2])
-        self.assertEqual(len(result), 1)
-        outer_loop = result[0]
-        self.assertEqual(len(outer_loop.snodes), 2)
-        inner_loop = outer_loop.snodes[1]
-        self.assertEqual(inner_loop.loop_count, Integer(2))
-        self.assertIn(inner1, inner_loop.snodes)
-        self.assertIn(inner2, inner_loop.snodes)
-
-    def test_inconsistent_loop_count_raises(self):
-        sched = _make_scheduler()
-        n1 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "a")
-        n2 = _make_snode(sched, _make_ir_op((0,), Integer(8)), "b")
-        with self.assertRaises(AssertionError):
-            self._run([n1, n2])
-
-    def test_empty_list(self):
-        result, created = self._run([])
-        self.assertEqual(result, [])
-        self.assertEqual(created, [])
-
-    def test_symbolic_loop_count(self):
-        sched = _make_scheduler()
-        s = Symbol("K")
-        n1 = _make_snode(sched, _make_ir_op((0,), s), "a")
-        n2 = _make_snode(sched, _make_ir_op((0,), s), "b")
-        result, created = self._run([n1, n2])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(created[0].loop_count, s)
 
 
 # ===========================================================================
@@ -9632,7 +9465,7 @@ class TestHoistedInputClone(unittest.TestCase):
         self.assertIsNone(counted_loop_entry(ops, pre))
 
     def test_extern_kernel_with_loop_info_is_not_a_member(self):
-        # Same rule as counted_loop_lifetime_overrides / scheduler._loop_group_id.
+        # Same rule as counted_loop_lifetime_overrides: an extern kernel runs once.
         from torch_spyre._inductor.scratchpad.utils import (
             counted_loop_entry,
             counted_loop_group_path,

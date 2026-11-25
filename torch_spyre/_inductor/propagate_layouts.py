@@ -73,6 +73,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MASK_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
@@ -88,9 +89,9 @@ from .loop_node import remove_op
 from .pass_utils import (
     collapse_valid_elements,
     compute_restickify_target_layout,
+    compute_size1_restickify_target,
     concretize_expr,
     dense_relocation_serves_read,
-    expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     forward_valid_elements,
@@ -101,7 +102,7 @@ from .pass_utils import (
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
-    is_keep_by_index,
+    is_index_masking_op,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -1148,6 +1149,57 @@ def _single_arg_op_layout(
     )
 
 
+def _clone_absent_stick_input_target(
+    arg: PropArg,
+    stick_expr: sympy.Expr,
+    out_stl: SpyreTensorLayout,
+    output_dep: MemoryDep,
+) -> SpyreTensorLayout | None:
+    """Return the size-1-stick input STL for a clone that broadcasts into a new
+    stick, or None when the clone does not need split.
+
+    The split is required when the output stick symbol is absent from every
+    device coordinate of the input and the input stick is symbolic: RESTICKIFY_OP
+    cannot move the input stick off and fill the new one in one copy, and
+    padding has no input dim to pad (``_pad_restickify_input``).  The test
+    mirrors ``is_restickify_coords``: both sides are device coordinates, which
+    ``device_coordinates`` sets over the op's iteration.
+
+    Returns None, keeping ``AnyInNode``, when any candidate input
+    layout already has a constant stick (the clone is an identity broadcast
+    fill from it) or no candidate has a size-1 restickify target.
+    """
+    if not stick_expr.free_symbols:
+        return None
+    out_coords = try_device_coordinates(out_stl, output_dep, None)
+    if out_coords is None:
+        return None
+    out_stick_syms = out_coords[-1].free_symbols & output_dep.ranges.keys()
+    if not out_stick_syms:
+        return None
+    in_dep = arg.dep
+    feasible: list[tuple[SpyreTensorLayout, list[sympy.Expr]]] = []
+    for cand in arg.layouts:
+        coords = try_device_coordinates(cand, in_dep, None)
+        if coords is None:
+            continue
+        in_syms = set().union(*(c.free_symbols for c in coords))
+        if not coords[-1].free_symbols or not out_stick_syms.isdisjoint(in_syms):
+            return None
+        if is_stick_expr_offset_free(coords[-1], cand.elems_per_stick()):
+            feasible.append((cand, coords))
+    if not feasible:
+        return None
+    in_host_coords = host_coordinates(arg.layout, in_dep, None)
+    for cand, coords in feasible:
+        target = compute_restickify_target_layout(
+            cand, arg.layout, sympy.S.Zero, in_host_coords, coords, arg=arg
+        )
+        if target is not None:
+            return target
+    return None
+
+
 def _clone_layout(
     op: Operation,
     output: FixedLayout,
@@ -1160,6 +1212,13 @@ def _clone_layout(
     Case 1: Input has supported stick expression
       - No restickify insertion needed
       - Clone op becomes identity if input is already row-major, otherwise becomes restickify
+
+    Case 1b: Output stick is a broadcast dim the input does not index
+      (e.g., ``x.unsqueeze(1).expand(T, K).clone()``)
+      - RESTICKIFY_OP cannot both move the input stick off and fill the new
+        stick in one copy, and padding has no input dim to pad
+      - hence, restickify the input onto a size-1 stick before the clone
+      - clone op then becomes an identity broadcast fill upto interleaved value.
 
     Case 2: Input has unsupported stick expression (due to offset)
       - Insert restickify before clone to swap stick with non-stick dimension
@@ -1192,6 +1251,15 @@ def _clone_layout(
     )
 
     if is_stick_expr_offset_free(stick_expr, stick_size):
+        required_in_stl = _clone_absent_stick_input_target(
+            args[0], stick_expr, out_stl, output_dep
+        )
+        if required_in_stl is not None:
+            # Case 1b: move the input stick onto a size-1 dim (target stick 0).
+            op.restick_cost_fn = FixedInOutNode.from_args(
+                args, out_stl, [required_in_stl], op, output_dep
+            )
+            return [out_stl]
         # Case 1: No restickify insertion needed.
         # Use AnyInNode to produce the fixed output layout.
         op.restick_cost_fn = AnyInNode.from_args()
@@ -1300,7 +1368,18 @@ def _find_layout_avoiding_var_on_stick(
     2. Else return the first layout that can be restickified to move avoid_var
        off the stick, onto a surviving coordinate.
     3. Else raise Unsupported.
+
+    A layout whose stick is a constant (a padded size-1 stick) trivially
+    excludes avoid_var, but it is only accepted when no host coordinate
+    survives avoid_var. Otherwise the kernel reads such an indices layout
+    wrongly, so a real stick on a surviving coordinate is used instead.
     """
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
+    surviving_vars = set()
+    for coord in arg_host_coords:
+        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
+            surviving_vars.update(coord.free_symbols)
+
     constant_stick = None
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep, None)
@@ -1310,18 +1389,17 @@ def _find_layout_avoiding_var_on_stick(
         if avoid_var not in stick_vars:
             if stick_vars:
                 return stl
-            constant_stick = stl
+            if not surviving_vars:
+                constant_stick = stl
 
     if constant_stick is not None:
         return constant_stick
 
-    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
-    surviving_vars = set()
-    for coord in arg_host_coords:
-        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
-            surviving_vars.update(coord.free_symbols)
-
     if not surviving_vars:
+        for stl in arg.layouts:
+            result = compute_size1_restickify_target(stl, arg.layout, arg.dep)
+            if result is not None:
+                return result
         raise Unsupported(
             f"{label}: no surviving coordinates after removing {avoid_var}"
         )
@@ -2555,35 +2633,13 @@ def _topk_layouts(
     return results
 
 
-def _compact_layout(
+def _index_masking_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact: output is the default dense STL."""
-
-    if len(args) != 1:
-        raise Unsupported(f"({op.get_name()}) requires exactly one input")
-
-    in_arg = args[0]
-    out_layouts = []
-
-    for in_stl in in_arg.layouts:
-        _, out_stl = expand_sparse(in_stl, output)
-        out_layouts.append(out_stl)
-
-    op.restick_cost_fn = AnyInNode.from_args()
-    return out_layouts
-
-
-def _keep_by_index_layouts(
-    op: Operation,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    args: list[PropArg],
-) -> list[SpyreTensorLayout]:
-    """Layout propagation for keep_by_index.
+    """Layout propagation for keep_by_index and mask_by_index.
 
     Output shape matches values input (arg0). Search dimension cannot be the
     stick for arg0 or output. Indices (arg1) k dimension cannot be the stick.
@@ -2594,14 +2650,19 @@ def _keep_by_index_layouts(
       3. Find required layout for indices where k dimension is NOT on stick
       4. Compute output STL with stick matching values' output stick position
     """
-    _check_supported_input_sticks(args, "keep_by_index")
+    op_name = (
+        "mask_by_index"
+        if op.data.reduction_type == MASK_BY_INDEX_OP
+        else "keep_by_index"
+    )
+    _check_supported_input_sticks(args, op_name)
     values = args[0]
     indices = args[1]
     out_coords = host_coordinates(output, output_dep, None)
     values_coords = host_coordinates(values.layout, values.dep, None)
 
     # Find search_var: the loop variable in values not present in indices
-    # (unlike reductions, keep_by_index preserves all dimensions)
+    # (unlike reductions, keep/mask_by_index preserve all dimensions)
     indices_coords = host_coordinates(indices.layout, indices.dep, None)
     search_var = None
     for v_coord in values_coords:
@@ -2614,11 +2675,9 @@ def _keep_by_index_layouts(
             break
 
     if search_var is None:
-        raise Unsupported("keep_by_index: could not identify search dimension")
+        raise Unsupported(f"{op_name}: could not identify search dimension")
 
-    values_req_stl = _find_layout_avoiding_var_on_stick(
-        values, search_var, "keep_by_index"
-    )
+    values_req_stl = _find_layout_avoiding_var_on_stick(values, search_var, op_name)
 
     # Find reduction_var: loop variable in indices not in values (the k dimension)
     reduction_var = None
@@ -2631,10 +2690,10 @@ def _keep_by_index_layouts(
             break
 
     if reduction_var is None:
-        raise Unsupported("keep_by_index: could not identify k dimension")
+        raise Unsupported(f"{op_name}: could not identify k dimension")
 
     indices_req_stl = _find_layout_avoiding_var_on_stick(
-        indices, reduction_var, "keep_by_index"
+        indices, reduction_var, op_name
     )
 
     # Compute output STL: stick position matches values' required layout
@@ -2707,8 +2766,8 @@ def compute_layouts(
     if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
 
-    if is_keep_by_index(op):
-        return _keep_by_index_layouts(op, output, output_dep, args)
+    if is_index_masking_op(op):
+        return _index_masking_layouts(op, output, output_dep, args)
 
     if isinstance(data, Reduction):
         return _reduction_layouts(op, output, output_dep, args)
