@@ -669,9 +669,15 @@ size and strides. A view that changes any of them (`t()`, a `view()` to another
 shape, a slice such as `x[1:]`) has no valid reservation: `get_reserved_dims`
 returns `None`. If a reserved tensor is reshaped in place (`t_()`, `squeeze_()`,
 `unsqueeze_()`, `as_strided_()`), or you call `resize_` on a view that changed
-the geometry (`x[1:].resize_(...)`, `x.view(280, 2048).resize_(...)`), its
-reservation is no longer valid: `resize_` raises an error instead of resizing
-the wrong axis.
+the geometry (`x[1:].resize_(...)`, `x.view(280, 2048).resize_(...)`,
+`x.unfold(0, 70, 70).resize_(...)`), its reservation is no longer valid:
+`resize_` raises an error instead of resizing the wrong axis.
+
+A view in a different device layout (`as_strided_with_layout` or
+`reinterpret_tensor_with_layout` with a layout other than the tensor's own)
+reads the same bytes through another layout, so it cannot show a reserved
+tensor's data. Creating one from a reserved tensor raises an error, and so does
+replacing a reserved tensor's layout with `set_spyre_tensor_layout`.
 
 A view or `detach()` result is a new tensor object, so it does not carry the
 `torch._dynamo.mark_dynamic` that `to(dynamic=...)` placed on the original.

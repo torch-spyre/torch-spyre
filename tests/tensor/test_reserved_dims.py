@@ -21,8 +21,8 @@ on arbitrary graph inputs, including tensors that were never reserved and
 tensors that aren't even on this device.
 
 Also covers which eager ops keep the reservation (detach, and views that leave
-offset, sizes and strides alone) and which drop it, and that a view that keeps
-it behaves correctly.
+offset, sizes and strides alone) and which drop it, that a view that keeps
+it behaves correctly, and that a view in another device layout is refused.
 """
 
 from unittest import mock
@@ -32,7 +32,13 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
 import torch_spyre._inductor as spyre_inductor
-from torch_spyre._C import get_reserved_dims
+from torch_spyre._C import (
+    as_strided_with_layout,
+    get_reserved_dims,
+    reinterpret_tensor_with_layout,
+    set_spyre_tensor_layout,
+    SpyreTensorLayout,
+)
 from torch_spyre._inductor.wsr import for_each_tile
 
 DEVICE = torch.device("spyre")
@@ -125,6 +131,10 @@ class TestGetReservedDims(TestCase):
             "reinterpret_tensor": reinterpret_tensor(
                 x_dev, list(x_dev.shape), list(x_dev.stride()), 0
             ),
+            # The tensor's own layout: allowed, and keeps the map.
+            "as_strided_with_layout": as_strided_with_layout(
+                x_dev, x_dev.shape, x_dev.stride(), 0, x_dev.device_tensor_layout()
+            ),
         }
         for name, v in same.items():
             with self.subTest(view=name):
@@ -140,6 +150,7 @@ class TestGetReservedDims(TestCase):
             "reinterpret_tensor": reinterpret_tensor(
                 x_dev, [559, 1024], list(x_dev.stride()), 1024
             ),
+            "unfold": x_dev.unfold(0, 70, 70),
         }
         for name, v in changed.items():
             with self.subTest(view=name):
@@ -155,6 +166,9 @@ class TestGetReservedDims(TestCase):
             "slice": (x_dev[1:], (139, 1024)),
             "reshape": (x_dev.view(280, 2048), (140, 2048)),
             "flatten": (x_dev.view(-1), (70 * 1024,)),
+            # spyre_unfold did not copy the map, so this returned and read
+            # back wrong data (#6513).
+            "unfold": (x_dev.unfold(0, 70, 70), (4, 1024, 70)),
         }
         for name, (v, new_size) in resizes.items():
             with self.subTest(view=name):
@@ -162,6 +176,70 @@ class TestGetReservedDims(TestCase):
                     RuntimeError, "no longer match the allocation"
                 ):
                     v.resize_(new_size)
+
+    def test_view_in_another_layout_is_refused(self) -> None:
+        # A view in another device layout reads the reserved buffer through a
+        # different element-to-address mapping, and it could not carry the
+        # reservation, so resize_ on it took the unreserved path (#6513).
+        _, x_dev = declared_tensor()
+        other = SpyreTensorLayout([280, 1024], torch.float16)
+        makers = {
+            "as_strided_with_layout": lambda t: as_strided_with_layout(
+                t, (280, 1024), (1024, 1), 0, other
+            ),
+            "reinterpret_tensor_with_layout": lambda t: (
+                reinterpret_tensor_with_layout(t, (280, 1024), (1024, 1), 0, other)
+            ),
+        }
+        for name, make in makers.items():
+            for base_name, base in (("tensor", x_dev), ("slice", x_dev[:280])):
+                with self.subTest(view=name, base=base_name):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "different device layout"
+                    ):
+                        make(base)
+
+    def test_view_in_another_layout_of_undeclared_tensor_is_allowed(self) -> None:
+        # The refusal is only for declared tensors: Inductor reuses plain
+        # buffers this way.
+        plain = torch.rand(560, 1024, dtype=torch.float16).to(DEVICE)
+        other = SpyreTensorLayout([280, 1024], torch.float16)
+        views = {
+            "as_strided_with_layout": as_strided_with_layout(
+                plain, (280, 1024), (1024, 1), 0, other
+            ),
+            "reinterpret_tensor_with_layout": reinterpret_tensor_with_layout(
+                plain, (280, 1024), (1024, 1), 0, other
+            ),
+        }
+        for name, v in views.items():
+            with self.subTest(view=name):
+                self.assertEqual(tuple(v.shape), (280, 1024))
+                self.assertIsNone(get_reserved_dims(v))
+
+    def test_set_layout_on_declared_tensor_is_refused(self) -> None:
+        # set_spyre_tensor_layout replaced the layout and kept the map, so the
+        # reservation was still reported and resize_((630, 1024)) was accepted
+        # over a 560-row layout.
+        _, x_dev = declared_tensor()
+        layout = x_dev.device_tensor_layout()
+        with self.assertRaisesRegex(RuntimeError, "changing the device layout"):
+            set_spyre_tensor_layout(
+                x_dev, SpyreTensorLayout([560, 1024], torch.float16)
+            )
+        self.assertEqual(x_dev.device_tensor_layout(), layout)
+        self.assertEqual(get_reserved_dims(x_dev), DECLARATION)
+        # Setting the layout it already has is allowed.
+        set_spyre_tensor_layout(x_dev, layout)
+        self.assertEqual(get_reserved_dims(x_dev), DECLARATION)
+
+    def test_set_layout_on_undeclared_tensor_is_allowed(self) -> None:
+        # Inductor relayouts plain graph inputs this way.
+        plain = torch.rand(560, 1024, dtype=torch.float16).to(DEVICE)
+        other = SpyreTensorLayout([630, 1024], torch.float16)
+        self.assertNotEqual(plain.device_tensor_layout(), other)
+        set_spyre_tensor_layout(plain, other)
+        self.assertEqual(plain.device_tensor_layout(), other)
 
     def test_same_geometry_views_share_the_base_data(self) -> None:
         # The host-to-device copy rounds fp16, so compare with what the device

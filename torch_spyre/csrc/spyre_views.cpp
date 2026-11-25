@@ -108,6 +108,23 @@ static void check_sharded_view(const at::Tensor& self, const SizeVec& sizes,
               "tensor to the CPU and take the view there instead.");
 }
 
+// A view in another device layout reads the same bytes through a different
+// mapping, so it cannot show a reserved tensor's data, nor keep its
+// reservation: has_intact_reservation() would accept the view's own
+// dma_sizes/dma_strides, and without the map resize_ takes the unreserved
+// path (#6513). Inductor never builds one over a reserved tensor: buffer reuse
+// skips graph inputs, and reserved outputs live to the end of the graph.
+static void check_layout_change_of_reserved(
+    const SpyreTensorImpl* orig_impl, const SpyreTensorLayout& device_layout) {
+  TORCH_CHECK(orig_impl->reserved_dims.empty() ||
+                  device_layout == orig_impl->spyre_layout,
+              "a view in a different device layout of a Spyre tensor declared "
+              "with to(\"spyre\", dynamic=...) is not supported: it would read "
+              "the reserved buffer through another layout. tensor layout=",
+              orig_impl->spyre_layout.toString(),
+              ", requested layout=", device_layout.toString());
+}
+
 //
 // templated for ArrayRef<int64_t> and SmallVector<int64_t> use cases
 //
@@ -222,6 +239,7 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   auto storage_offset = storage_offset_.value_or(self.storage_offset());
   check_sharded_view(self, size, stride, storage_offset);
+  check_layout_change_of_reserved(orig_impl, device_layout);
   auto result = at::detail::make_tensor<SpyreTensorImpl>(
       c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
       self.dtype());
@@ -232,8 +250,8 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
     spyre_impl->dma_sizes = orig_impl->dma_sizes;
     spyre_impl->dma_strides = orig_impl->dma_strides;
     // Only here: dma_sizes/dma_strides still describe the original allocation,
-    // so has_intact_reservation() stays meaningful. In the else branch they
-    // are reset to this view's own shape and the check would pass trivially.
+    // so has_intact_reservation() stays meaningful. The else branch is never
+    // reached for a reserved tensor (check_layout_change_of_reserved).
     spyre_impl->reserved_dims = orig_impl->reserved_dims;
   } else {
     spyre_impl->dma_sizes = size.vec();
@@ -276,6 +294,7 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
   SpyreTensorLayout orig_stl = orig_impl->spyre_layout;
   check_sharded_view(self, size, stride,
                      self.sym_storage_offset() + offset_increment);
+  check_layout_change_of_reserved(orig_impl, stl);
   at::Tensor self_ = at::detail::make_tensor<SpyreTensorImpl>(
       c10::Storage(self.storage()), self.key_set(), self.dtype());
   auto* spyre_tensor_impl_ =
@@ -289,6 +308,7 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
     spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
     // As in as_strided_with_layout: only here do dma_sizes/dma_strides still
     // describe the original allocation, so the intact check stays meaningful.
+    // The else branch is never reached for a reserved tensor.
     spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   } else {
     spyre_tensor_impl_->dma_sizes = size.vec();
@@ -341,6 +361,10 @@ at::Tensor spyre_unfold(const at::Tensor& self, int64_t dimension, int64_t size,
   result_impl->spyre_layout = orig_impl->spyre_layout;
   result_impl->dma_sizes = orig_impl->dma_sizes;
   result_impl->dma_strides = orig_impl->dma_strides;
+  // As in spyre_alias_with_sizes_and_strides. unfold always adds a dim, so the
+  // view is never intact: get_reserved_dims() returns nullopt and resize_
+  // raises instead of taking the unreserved path (#6513).
+  result_impl->reserved_dims = orig_impl->reserved_dims;
 
   return result;
 }

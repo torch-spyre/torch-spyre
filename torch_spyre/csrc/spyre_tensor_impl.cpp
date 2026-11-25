@@ -336,6 +336,17 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
   TORCH_CHECK(tensor.is_privateuseone());
   SpyreTensorImpl* impl;
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
+    // A reserved tensor's layout is sized for the declared max, and resize_
+    // keeps it. has_intact_reservation() does not compare layouts, so a new
+    // layout would leave the reservation reported over a layout it does not
+    // describe. Inductor emits this call after relayouting a mutated graph
+    // input; for a declared input that compile fails first today.
+    TORCH_CHECK(impl->reserved_dims.empty() || stl == impl->spyre_layout,
+                "set_spyre_tensor_layout: changing the device layout of a "
+                "Spyre tensor declared with to(\"spyre\", dynamic=...) is not "
+                "supported. tensor layout=",
+                impl->spyre_layout.toString(),
+                ", requested layout=", stl.toString());
     impl->spyre_layout = stl;
   } else {
     TORCH_CHECK(false,
