@@ -652,8 +652,10 @@ def _require_replica_read(
     What is admitted: right-aligned dims equal to the op's or 1, and an index
     built from the write's own iteration variables. Indirect reads (an index
     with a variable the write does not have) fail closed; affine reads over
-    the write's own variables, including a permuted or flipped graph input of
-    the op's shape, use ordinary unified addressing.
+    the write's own variables use ordinary unified addressing. A permuted
+    read of a graph input does not get here: layout propagation turns it into
+    a restickify buffer, which ``_require_replica_source`` rejects as computed
+    in the graph (test_permuted_unsharded_operand_fails_at_compile).
     """
     buf = graph.get_buffer(dep.name)
     shape = [int(s) for s in buf.get_size()] if buf is not None else None

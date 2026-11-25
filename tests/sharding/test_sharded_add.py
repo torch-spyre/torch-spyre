@@ -1022,6 +1022,46 @@ def test_unsharded_operand_read_by_reduction_fails_at_compile():
 
 @requires_emulation
 @expects_raise
+def test_permuted_unsharded_operand_fails_at_compile():
+    """A transposed read of a graph input is not a replica read: layout
+    propagation turns it into a restickify buffer, so it is rejected as computed
+    in the graph, never read through unified addressing with the wrong index."""
+    n = num_shards()
+    torch.manual_seed(0)
+    a = _sharded(torch.randn(8 * n, 8 * n, dtype=torch.float16), 0, n)
+    b = torch.randn(8 * n, 8 * n, dtype=torch.float16).to("spyre")
+
+    with pytest.raises(RuntimeError, match="computed in the graph.*pass it in"):
+        torch.compile(lambda x, y: x + y.t(), dynamic=False)(a, b)
+
+
+@requires_emulation
+@expects_raise
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x, y: y.add_(x),
+        lambda x, y: (y.add_(x), y * 2)[1],
+    ],
+    ids=["return_mutated", "return_derived"],
+)
+def test_in_place_write_into_unsharded_operand_fails_at_compile(fn):
+    """Mutating an unsharded operand from a sharded value is rejected, not
+    admitted as a replica write: functionalization routes the mutation through
+    an intermediate that is not a graph output, so the sharded-intermediate
+    guard fires. Whoever lifts that guard (sharded intermediates, #5818) must
+    keep this case failing closed some other way."""
+    n = num_shards()
+    torch.manual_seed(0)
+    a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
+    b = torch.randn(4 * n, 64, dtype=torch.float16).to("spyre")
+
+    with pytest.raises(RuntimeError, match="every sharded result to be a graph output"):
+        torch.compile(fn, dynamic=False)(a, b)
+
+
+@requires_emulation
+@expects_raise
 def test_scaled_unsharded_operand_fails_at_compile():
     """add(x, b, alpha=2) scales b inside the graph, so b is no longer a graph
     input: rejected, and the message says how to get past it.

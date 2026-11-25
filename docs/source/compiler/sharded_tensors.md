@@ -51,7 +51,9 @@ everything outside it fails at compile time with a specific message:
   graph input of the op's shape or broadcast to it, such as a bias along the
   non-shard dims. Every core reads it with ordinary unified addressing;
   the result takes the sharded operand's placement. An unsharded operand
-  computed inside the graph, or read by a reduction, is rejected. The
+  computed inside the graph, or read by a reduction, is rejected, and so is
+  one mutated in place from a sharded value (for now: the sharded
+  intermediate that mutation produces is not supported). The
   one-dtype rule below applies to replicas too, so an fp16 sharded tensor
   times an fp32 scale (including a 0-d one) is rejected: cast the scale to
   fp16 first.
