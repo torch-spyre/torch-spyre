@@ -165,7 +165,8 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
 auto is_ea_staggered(const ElementArrangement ea) -> bool {
   return ea == ElementArrangement::DL16_TO_FP32 ||
-         ea == ElementArrangement::FP32_TO_DL16;
+         ea == ElementArrangement::FP32_TO_DL16 ||
+         ea == ElementArrangement::QFP8CH;
 }
 
 /**
@@ -186,6 +187,13 @@ void ea_shuffle_fp16tofp32(int64_t elems_per_stick, int64_t sticks,
 
 /**
  * FP32_TO_DL16: host col = stick*64 + half*32 + group*4 + elem.
+ * QFP8CH:       host col = stick*128 + half*64 + group*8 + elem.
+ *
+ * Inside a stick the groups of the two halves alternate: device col =
+ * stick*eps + group*(2*elems_per_group) + half*elems_per_group + elem. QFP8CH
+ * is the same interleave with 8-element groups, because quantizing two fp16
+ * sticks of 64 elements into one fp8 stick of 128 alternates 8-element chunks
+ * of the two.
  *
  * Same outputs as ea_shuffle_fp16tofp32.
  */
@@ -296,15 +304,15 @@ void ea_shuffle(const SpyreTensorLayout& stl, int64_t device_elem_stride,
                 int64_t host_valid_width, int64_t outer_count,
                 perdim_element_arrangement& dim, bool invert,
                 EaPairBoundary& boundary) {
-  constexpr int64_t kElemsPerGroup = 4;
   constexpr int64_t kSticksPerPair = 2;
   constexpr int64_t kHalvesPerStick = 2;
 
   const ElementArrangement ea = stl.element_arrangement;
   TORCH_CHECK(is_ea_staggered(ea),
-              "Element arrangement expected DL16_TO_FP32 or FP32_TO_DL16, "
-              "got: ",
+              "Element arrangement expected DL16_TO_FP32, FP32_TO_DL16 or "
+              "QFP8CH, got: ",
               elementArrangementToString(ea));
+  const int64_t kElemsPerGroup = ea == ElementArrangement::QFP8CH ? 8 : 4;
 
   const int64_t elems_per_stick = stl.elems_per_stick();
   TORCH_CHECK(elems_per_stick > 0 &&
@@ -351,6 +359,7 @@ void ea_shuffle(const SpyreTensorLayout& stl, int64_t device_elem_stride,
     ea_shuffle_fp16tofp32(elems_per_stick, allocated_sticks, kElemsPerGroup,
                           kSticksPerPair, dim.subElems_, dim.subStride_);
   } else {
+    // FP32_TO_DL16 and QFP8CH: the halves of each stick interleave.
     ea_shuffle_fp32tofp16(elems_per_stick, allocated_sticks, kElemsPerGroup,
                           kHalvesPerStick, dim.subElems_, dim.subStride_);
   }
@@ -421,8 +430,9 @@ auto get_device_stride_infos(
   // Known limitation:
   //
   // Slices of a staggered tensor: host storage offset must be aligned to whole
-  // stick pairs (or sticks for FP32_TO_DL16); mid-pair offsets misalign the
-  // sticks and are rejected. See issue #5556.
+  // stick pairs (or sticks for FP32_TO_DL16 and QFP8CH); mid-pair offsets
+  // misalign the sticks and are rejected. See issue #5556. Slices of the
+  // device tensor are restricted in generate_dci.
   const bool shuffle_ea = is_ea_staggered(stl.element_arrangement);
 
   // EA shuffle: stick tiling facts. The innermost device dim holds the elements
@@ -491,7 +501,9 @@ auto get_device_stride_infos(
                     stl.device_dtype == DataFormats::IEEE_FP16 ||
                     stl.device_dtype == DataFormats::IEEE_INT64 ||
                     stl.device_dtype == DataFormats::IEEE_INT32 ||
-                    stl.device_dtype == DataFormats::SEN169_FP16,
+                    stl.device_dtype == DataFormats::SEN169_FP16 ||
+                    stl.device_dtype == DataFormats::SEN143_FP8 ||
+                    stl.device_dtype == DataFormats::SEN152_FP8,
                 "EA shuffle unsupported dtype, got: ", stl.device_dtype,
                 " (element arrangement: ",
                 elementArrangementToString(stl.element_arrangement), ")");
@@ -906,6 +918,54 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     cpu_sizes = std::move(adjusted_cpu_sizes);
     cpu_strides = std::move(adjusted_cpu_strides);
 
+    // Slices of an EA-shuffled tensor. dimwise_ea describes the whole device
+    // tensor, not the slice: for a slice, flex packs the sticks the copy
+    // touches into a compact staging buffer and rebases the DCSIs onto it, but
+    // not dimwise_ea, which ConvertData then applies to the packed buffer as if
+    // it were the whole tensor. Only some slices survive that; see
+    // docs/source/compiler/element_arrangement.md. The checks below reject
+    // only copies that fail without them. TODO(maxdebayser): support slices in
+    // the EA shuffle, then drop them.
+    if (is_ea_staggered(stl.element_arrangement)) {
+      // QFP8CH: every H2D copy into a slice tried either fails in the data
+      // conversion (leaving the stream in an error state) or overwrites the
+      // rest of the stick.
+      TORCH_CHECK(
+          !host2device || stl.element_arrangement != ElementArrangement::QFP8CH,
+          "Copying into a slice of a device tensor with element "
+          "arrangement QFP8CH is not supported; copy the whole tensor "
+          "instead");
+
+      // DL16_TO_FP32 staggers across a pair of sticks, so a D2H copy of a
+      // slice of the stick dim must touch whole pairs, or the packed buffer
+      // pairs the wrong sticks and the copy returns wrong values.
+      bool only_stick_dim_sliced = true;
+      int stick_dma_dim = -1;
+      for (int i = 0; i < dma_rank; i++) {
+        if (dma_strides[i] == 1 && dma_sizes[i] > 1) stick_dma_dim = i;
+        if (dma_strides[i] != 1 && adjusted_dev_sizes[i] != dma_sizes[i]) {
+          only_stick_dim_sliced = false;
+        }
+      }
+      if (!host2device &&
+          stl.element_arrangement == ElementArrangement::DL16_TO_FP32 &&
+          only_stick_dim_sliced && stick_dma_dim >= 0) {
+        // Only the stick dim is sliced, so the storage offset is where the
+        // slice starts along it.
+        const int64_t eps = stl.elems_per_stick();
+        const int64_t start = dev_tensor->storage_offset();
+        const int64_t end = start + adjusted_dev_sizes[stick_dma_dim];
+        const int64_t first_stick = start / eps;
+        const int64_t end_stick = (end + eps - 1) / eps;
+        TORCH_CHECK(first_stick % 2 == 0 && end_stick % 2 == 0,
+                    "Copying from a slice of a device tensor with element "
+                    "arrangement DL16_TO_FP32 is not supported unless the "
+                    "sticks it touches are whole stick pairs (columns ",
+                    start, " to ", end, " touch sticks ", first_stick, " to ",
+                    end_stick - 1, "); copy the whole tensor instead");
+      }
+    }
+
     // Reorder cpu_sizes, cpu_strides, dev_sizes, and dev_strides to the same
     // ordering as dma_sizes and dma_strides.
     std::vector<int64_t> dma_order(dma_rank);
@@ -1270,6 +1330,39 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
                                         device_offset, stl, host2device,
                                         dimwise_ea, ea_boundary);
+    // A D2H copy of a slice can build dimwise_ea entries whose device offsets
+    // reach past the coordinate space they describe (a host dim of the slice
+    // that no longer maps to its device dim, e.g. y[1] of a 3D tensor). The
+    // data conversion then fails its index check and leaves the stream in an
+    // error state, so raise here instead.
+    if (!dimwise_ea.empty() && dev_sliced && !host2device) {
+      int64_t extent = 1;
+      int64_t max_offset = 0;
+      for (const auto& dim : dimwise_ea) {
+        extent *= dim.dimShape_;
+        int64_t dim_max = 0;
+        for (int64_t c = 0; c < dim.dimShape_; c++) {
+          int64_t rest = c;
+          int64_t offset = 0;
+          for (int64_t k = static_cast<int64_t>(dim.cumElemsBefore_.size()) - 1;
+               k >= 0; k--) {
+            offset += rest / dim.cumElemsBefore_[k] * dim.cumOffset_[k];
+            rest %= dim.cumElemsBefore_[k];
+          }
+          dim_max = std::max(dim_max, offset);
+        }
+        max_offset += dim_max;
+      }
+      TORCH_CHECK(max_offset < extent,
+                  "Copying from this slice of a device tensor with element "
+                  "arrangement ",
+                  elementArrangementToString(stl.element_arrangement),
+                  " is not supported: its element arrangement reaches device "
+                  "element ",
+                  max_offset, " of ", extent,
+                  "; copy the whole tensor instead");
+    }
+
     if (!dimwise_ea.empty()) {
       // The shapes of the DCI are innermost first, so the per-dim EA is too.
       std::reverse(dimwise_ea.begin(), dimwise_ea.end());
