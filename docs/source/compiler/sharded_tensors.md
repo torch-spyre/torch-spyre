@@ -75,7 +75,9 @@ everything outside it fails at compile time with a specific message:
   `SpyreTensorLayout`, and the committed device layout must be the default
   global one — a restickified or otherwise relaid tensor cannot use chunk
   addressing (`_non_unified_shard_bytes` in `spyre_kernel.py`).
-* In-place writes into sharded storage are rejected.
+* In-place writes into sharded storage are rejected, and so are in-place
+  writes of sharded data into an unsharded tensor (`b.add_(x_sharded)` with
+  `b` a replica): replicas are read-only.
 
 `num_shards` must equal the active core count (`SENCORES`), so the storage
 and the kernels that consume it agree on how many cores participate.

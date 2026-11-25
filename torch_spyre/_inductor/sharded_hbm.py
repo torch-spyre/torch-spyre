@@ -637,15 +637,21 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
             )
         rw = op_read_writes(op)
         reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
-        # An unsharded operand mutated in place by a sharded value is rejected
-        # downstream by the sharded-intermediate guard (the mutation's
-        # functional intermediate is never a graph output). A change that
-        # admits sharded intermediates inherits the obligation to keep that
-        # case failing closed.
         sharded = [placements[d.name] for d in reads if d.name in placements]
         if not sharded:
             continue
         name = op.get_name()
+        # An unsharded tensor mutated in place from a sharded value, such as
+        # b.add_(x_sharded) with b a replica. Functionalization writes the
+        # sharded result (an intermediate) back into b's storage through a
+        # MutationLayout op that reads it. Replicas are read-only: writing
+        # sharded data into one has no defined semantics yet, so fail closed.
+        # TODO: positive once writes into replicas are designed (#5820).
+        if target is not None:
+            raise Unsupported(
+                f"{name}: in-place writes of sharded data into an unsharded "
+                f"tensor ({target}) are not supported by non-unified kernels"
+            )
         is_reduction = isinstance(op.data, Reduction)
         if not isinstance(op.data, Pointwise) and not is_reduction:
             raise Unsupported(

@@ -815,6 +815,50 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
         torch.compile(fn, dynamic=False)(a, b)
 
 
+def _write_back(b, c):
+    b.copy_(c)
+    return c
+
+
+# Ways to write a sharded value into an unsharded tensor in place. Each one
+# functionalizes to the sharded result (an intermediate) plus a MutationLayout
+# op that writes it back into b's storage.
+_SHARDED_WRITE_INTO_REPLICA = {
+    "add_then_use": lambda b, a: (b.add_(a), b * 2)[1],
+    "add_return_b": lambda b, a: (b.add_(a), b)[1],
+    "add_no_return": lambda b, a: b.add_(a),
+    "explicit_copy": lambda b, a: _write_back(b, b + a),
+}
+
+
+@requires_emulation
+@expects_raise
+@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm_pool", "lx"])
+@pytest.mark.parametrize("variant", sorted(_SHARDED_WRITE_INTO_REPLICA))
+def test_in_place_write_of_sharded_data_into_unsharded_fails(variant, lx_planning):
+    """b.add_(x_sharded) with b an ordinary device tensor fails at compile.
+
+    An unsharded operand is a read-only replica. Writing sharded data into
+    one has no defined semantics yet, so the planner rejects the write-back,
+    and b is left untouched.
+    TODO: positive once writes into replicas are designed (#5820).
+    """
+    n = num_shards()
+    torch.manual_seed(0)
+    a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
+    b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    b = b_cpu.to("spyre")
+    b_before = b.cpu()
+
+    with spyre_config.patch(lx_planning=lx_planning):
+        with pytest.raises(
+            RuntimeError,
+            match=r"in-place writes of sharded data into an unsharded tensor",
+        ):
+            torch.compile(_SHARDED_WRITE_INTO_REPLICA[variant], dynamic=False)(b, a)
+    assert torch.equal(b.cpu(), b_before)
+
+
 @requires_emulation
 @expects_raise
 @pytest.mark.parametrize(
