@@ -1152,6 +1152,20 @@ def test_a_switched_product_past_2_60_is_refused_as_it_is_built():
     assert caught.value.node is None
 
 
+def test_a_switchs_rest_of_several_terms_is_one_variable():
+    """So p multiplies one coefficient in a fraction's constraints: p times the step
+    of a's list passes 2^31 here, where CP-SAT 9.15's presolve called the model
+    infeasible."""
+    case = Case()
+    for name in "xyd":
+        case.integer(name, 0, 2)
+    case.integer("a", 2, 2)
+    case.add_input("b", b=[3.0, 8.0])
+    x, y, d, a, b = (case.symbol(name) for name in "xydab")
+    plan = case.assert_exact((27 * a * y + a + d) * (b * d + x + sympy.sqrt(5)))
+    assert type(plan) is SwitchRealization and len(_named(case.model, "rest")) == 1
+
+
 def test_a_constant_is_read_as_the_double_it_is():
     """A list is the expression's value in floating point, rounded once where it
     enters CP-SAT, and is not held to another evaluator's bits. lambdify prints a
@@ -1196,6 +1210,25 @@ def test_a_quotient_is_divided_as_lambdify_prints_it():
     x, y = case.symbol("x"), case.symbol("y")
     assert math.floor(98 * (1 / 49)) == 1 and math.floor(98 * 7.0**-2) == 1
     case.assert_exact(sympy.floor(x / y) + sympy.floor(x / y**2))
+
+
+@pytest.mark.parametrize(
+    "factor, menu, realization",
+    [((0, 2), [7.0, 49.0], GateRealization), ((1, 3), [7.0, 14.0, 49.0, 98.0], SwitchRealization)],
+    ids=["gate", "switch"],
+)  # fmt: skip
+def test_a_gated_or_switched_quotient_is_divided_as_lambdify_prints_it(
+    factor, menu, realization
+):
+    """A gate's rest holds the product's constants, and a switch that divides is read
+    as its quotient's table: floor(98 * k / a) at a = 49 is 2k, not
+    floor(98 * (1/49) * k)."""
+    case = Case()
+    case.integer("k", *factor)
+    case.add_input("a", a=menu)
+    product = 98 * case.symbol("k") / case.symbol("a")
+    assert type(TableLowering(case.inputs, cap=CAP).print(product)) is realization
+    case.assert_exact(sympy.floor(product))
 
 
 # Expressions over a, b and c, each node's list compared with Stage 1's.
@@ -1520,6 +1553,19 @@ def test_a_relayout_charge_is_a_gate_of_its_prices_on_its_division(
     )
     assert type(case.assert_exact(expr)) is realization
     assert _tables(case.model) == tables
+
+
+def test_a_gated_product_with_no_value_at_the_kept_value_is_refused():
+    """x and y on one literal, y at 3 and 1: where x keeps the term sqrt(y - 2) is
+    imaginary, and sympy raises as it reads the rest there."""
+    case = Case()
+    case.add_input("v", x=[0.0, 1.0], y=[3.0, 1.0])
+    case.add_input("a", a=[1.0, 2.0, 3.0, 4.0])
+    x, y, a = case.symbol("x"), case.symbol("y"), case.symbol("a")
+    expr = x * sympy.Max(sympy.sqrt(y - 2), a)
+    with pytest.raises(TableLoweringError, match="no value") as caught:
+        case.lower(expr)
+    assert caught.value.node == expr
 
 
 @pytest.mark.parametrize("read", [lambda p: sympy.log(p + 1), lambda p: 2**p])

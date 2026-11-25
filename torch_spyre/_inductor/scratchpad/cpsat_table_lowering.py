@@ -380,12 +380,19 @@ class SwitchRealization(SymbolicRealization):
     index: Index
     rest: AbstractRealization
     positions: tuple[Index, ...]
+    quotient: TableRealization | None = None  # its table, for a product that divides
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """A whole value is g == v * w; a fraction, p / q with q = denominator(), is
-        the floor: q * g <= p * w <= q * g + q - 1."""
+        the floor: q * g <= p * w <= q * g + q - 1. A rest of several terms is one
+        variable w, so p multiplies one coefficient, not each term's: CP-SAT 9.15's
+        presolve calls a model with p times a list's step past 2^31 infeasible."""
         w = self.rest.cp_expr(model)
+        if not isinstance(w, (int, cp_model.IntVar)):
+            rest = model.new_int_var(*self.rest.bounds(), "rest")
+            model.add(rest == w)
+            w = rest
         q = self.denominator()
         cases = [model.new_bool_var("case") for _ in self.values]
         model.add_map_domain(self.index.cp_expr(model), cases)
@@ -399,6 +406,12 @@ class SwitchRealization(SymbolicRealization):
                 model.add(p * w <= q * g + q - 1).only_enforce_if(case)
         return g
 
+    def table(self, cap: int) -> TableRealization:
+        """A product that divides is its quotient's table, divided as lambdify prints
+        it (_quotient): its factor times its rest's table multiplies by a reciprocal,
+        and floor(98 * (1/49)) is 1."""
+        return self.quotient or super().table(cap)
+
     def _list(
         self, index: Index, grid: Mapping[Index, np.ndarray], cap: int
     ) -> np.ndarray:
@@ -407,7 +420,10 @@ class SwitchRealization(SymbolicRealization):
 
     def scaled(self, factor: float) -> SwitchRealization:
         rest = self.rest.scaled(factor)
-        return SwitchRealization(self.values, self.index, rest, self.positions)
+        quotient = self.quotient and self.quotient.scaled(factor)
+        return SwitchRealization(
+            self.values, self.index, rest, self.positions, quotient
+        )
 
     def bounds(self) -> tuple[int, int]:
         q = self.denominator()
@@ -425,8 +441,10 @@ class SwitchRealization(SymbolicRealization):
         """Its factor: switches on one factor are one switch over their rests' sum."""
         return self.index, self.values
 
-    def joined(self, others: Sequence[Self]) -> AbstractRealization:
-        return _joined(self, others)
+    def joined(self, others: Sequence[Self]) -> SwitchRealization:
+        """A sum of products, so it has no quotient of its own."""
+        rest, positions = _joined((self, *others))
+        return SwitchRealization(self.values, self.index, rest, positions)
 
     def denominator(self) -> int:
         """q: 1 when every value is whole, otherwise the largest power of two up to
@@ -483,8 +501,9 @@ class GateRealization(SymbolicRealization):
         sum."""
         return self.literal, self.kept
 
-    def joined(self, others: Sequence[Self]) -> AbstractRealization:
-        return _joined(self, others)
+    def joined(self, others: Sequence[Self]) -> GateRealization:
+        rest, positions = _joined((self, *others))
+        return replace(self, rest=rest, positions=positions)
 
 
 # --------------------------------------------------------------------- a node's list
@@ -641,21 +660,29 @@ class TableLowering(Printer):
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
         """A product of several operands is gated (_gated) where one of them is a
-        gate, and is otherwise a switch (_switched), its constants applied to the
-        rest. Otherwise a quotient is one table (_quotient), a constant times one
-        operand is the operand scaled in float, and any other product is declined."""
+        gate, its constants in the gate's rest, and is otherwise a switch
+        (_switched), its constants applied to the rest and, where it divides, with its
+        quotient's table (_quotient). Otherwise a quotient is one table, a constant
+        times one operand is the operand scaled in float, and any other product is
+        declined."""
         constants = [factor for factor in expr.args if not factor.free_symbols]
         operands = [factor for factor in expr.args if factor.free_symbols]
+        divides = any(_divides(factor) for factor in expr.args)
         switch: AbstractRealization | None = None
         if len(operands) > 1:
-            switch = self._gated(expr, operands) or self._switched(expr, operands)
-        if switch is None and any(_divides(factor) for factor in expr.args):
+            gated = self._gated(expr, expr.args)
+            if gated is not None:
+                return gated
+            switch = self._switched(expr, operands)
+        if switch is None and divides:
             return self._quotient(expr)
         realization = self._print(operands[0]) if len(operands) == 1 else switch
-        if realization is None or not constants:
-            return realization
-        coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
-        return realization.scaled(coefficient)
+        if realization is not None and constants:
+            coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
+            realization = realization.scaled(coefficient)
+        if isinstance(realization, SwitchRealization) and divides and self._fits(expr):
+            realization = replace(realization, quotient=self._quotient(expr))
+        return realization
 
     def _gated(
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
@@ -668,7 +695,13 @@ class TableLowering(Printer):
             if gate is not None:
                 literal, kept = gate
                 product = sympy.Mul(*operands)
-                rest = self._print(product.xreplace(self._at(product, literal, kept)))
+                try:  # sympy evaluates the product at the kept value
+                    kept_product = product.xreplace(self._at(product, literal, kept))
+                except (TypeError, ValueError) as exc:
+                    raise TableLoweringError(
+                        expr, f"no value ({type(exc).__name__}: {exc})"
+                    ) from exc
+                rest = self._print(kept_product)
                 return _gate(literal, kept, rest, tuple(self._inputs(expr)))
         return None
 
@@ -702,9 +735,7 @@ class TableLowering(Printer):
         expr's order on a tie, over the others' product. None where no operand's table
         fits or the product keeps its table."""
         tables = {
-            operand: self._table(operand)
-            for operand in operands
-            if math.prod(p.size for p in self._inputs(operand)) <= self.cap
+            operand: self._table(operand) for operand in operands if self._fits(operand)
         }
         if not tables:
             return None
@@ -781,6 +812,10 @@ class TableLowering(Printer):
             )
         return _combined(positions), _grid(positions)
 
+    def _fits(self, expr: sympy.Basic) -> bool:
+        """Whether one table over expr's inputs is within the cap."""
+        return math.prod(position.size for position in self._inputs(expr)) <= self.cap
+
     def _inputs(self, expr: sympy.Basic) -> list[Index]:
         """The positions of expr's inputs, in the order of its symbols."""
         symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
@@ -811,15 +846,12 @@ def _sum(
 
 
 def _joined(
-    first: SwitchRealization | GateRealization,
-    others: Sequence[SwitchRealization] | Sequence[GateRealization],
-) -> AbstractRealization:
-    """first and others, switches on one factor or gates on one literal and kept
-    value, as one over the sum of their rests: one w."""
-    group = (first, *others)
+    group: Sequence[SwitchRealization] | Sequence[GateRealization],
+) -> tuple[SumRealization, tuple[Index, ...]]:
+    """The rest and positions of group, switches on one factor or gates on one
+    literal and kept value, joined into one: the sum of their rests, one w."""
     positions = tuple(dict.fromkeys(p for r in group for p in r.positions))
-    rest = _sum([realization.rest for realization in group], positions)
-    return replace(first, rest=rest, positions=positions)
+    return _sum([realization.rest for realization in group], positions), positions
 
 
 def _switch(
