@@ -2748,7 +2748,8 @@ class TestCoarseTile(unittest.TestCase):
                 return self.name == other.name
 
         class _HoistedConstant(ExternKernel):
-            pass
+            def get_device(self):  # a Spyre extern: runs once, outside the loop
+                return torch.device("spyre")
 
         def _op(name, reads, writes, loop=None, cls=None):
             rw = SimpleNamespace(
@@ -9427,6 +9428,9 @@ def _extern_op(name, path=None):
         def get_mutation_names(self):
             return []
 
+        def get_device(self):  # a Spyre extern: runs once, outside the loop
+            return torch.device("spyre")
+
     op = _Extern()
     object.__setattr__(op, "name", name)
     if path is not None:
@@ -9579,6 +9583,9 @@ class TestHoistedInputClone(unittest.TestCase):
 
             def get_mutation_names(self):
                 return []
+
+            def get_device(self):  # a Spyre extern: runs once, outside the loop
+                return torch.device("spyre")
 
         head = _LoopOp("head", (0,))
         reader = _LoopOp("reader", (0,))

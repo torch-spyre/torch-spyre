@@ -3444,7 +3444,8 @@ def _make_extern(gid, counts):
     from torch._inductor.ir import ExternKernel
 
     class _Extern(_LoopStub, ExternKernel):
-        pass
+        def get_device(self):  # a Spyre extern: runs once, outside the loop
+            return torch.device("spyre")
 
     stub = _Extern.__new__(_Extern)
     _LoopStub.__init__(stub, gid, counts)
