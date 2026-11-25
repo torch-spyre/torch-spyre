@@ -539,6 +539,54 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
 
+    def test_carry_mode_split_k_self_matmul(self):
+        """A coarse-tiled self-matmul: one input is both operands of a split-K
+        matmul in the loop (issue #4198).
+
+        ``insert_restickify`` once copied a consumer's stored per-read advance to
+        each restickify copy, finding the read by buffer name alone and zeroing it
+        after the first, so the second read of the same buffer got no advance. The
+        stored record is gone (#5863 stage 7); a copy's advance now comes from its
+        own read's index, resolved by name and index. The input is passed twice
+        because one tile read twice in a body is a separate gap (#6479).
+        """
+        from torch_spyre._inductor import insert_restickify as restickify
+
+        X = cached_xavier((M, K))
+        ref = dl16_round(X.float()) @ dl16_round(X.float()).T
+
+        def self_split_k(A, B):
+            def body(acc, ops):
+                a, b = ops
+                return acc + a @ b.T, None
+
+            final, _ = for_each_tile(
+                body,
+                (A, B),
+                dims=(-1, -1),
+                tile_size=64,
+                init=torch.zeros(M, M, device=A.device, dtype=A.dtype),
+            )
+            return final
+
+        X_spyre = X.to(DEVICE_NAME)
+        # Caches off: a cache hit skips the passes, and the call count with them
+        # (#6047).
+        with (
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                restickify, "_moved_loop_term", wraps=restickify._moved_loop_term
+            ) as moved_loop_term,
+        ):
+            compiled = torch.compile(self_split_k, backend="inductor", fullgraph=True)
+            out = compiled(X_spyre, X_spyre)
+
+        # The restickify of a looped consumer ran: the path #4198 was about.
+        self.assertGreaterEqual(moved_loop_term.call_count, 1)
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
     @staticmethod
     def _exact_split_k_operands(acc0_shape):
         """Small-integer operands whose split-K sums stay exact.
@@ -840,16 +888,6 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     def test_upcast_add_downcast_in_body(self):
         self._check_upcast_add_tiled(downcast_in_body=True)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "for_each_tile fails to preserve input EA tag in identity op. The "
-            "output is incorrectly tagged STANDARD (default) when data is "
-            "staggered it causes EA DCI to incorrectly apply / restore EA. "
-            "See issue #6462."
-        ),
-    )
     def test_upcast_add_in_body_downcast_after_loop(self):
         self._check_upcast_add_tiled(downcast_in_body=False)
 
@@ -1541,7 +1579,6 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
     """
 
     def test_substick_indirect_advance_is_refused(self):
-        import pytest
         from torch._inductor.exc import InductorError
 
         ids = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32).to(DEVICE_NAME)
