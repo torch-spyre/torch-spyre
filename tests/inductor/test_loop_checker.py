@@ -96,10 +96,14 @@ class _LoopOp(_Op):
 class _ExternLoopOp(_LoopOp, ExternKernel):
     """Like ``_LoopOp`` but an ``ExternKernel``: it keeps its ``loop_member`` and
     runs once, so it has no loop path. Only the base class matters to the checker;
-    ``ExternKernel.__init__`` is not run."""
+    ``ExternKernel.__init__`` is not run. It reports the Spyre device: only a
+    Spyre extern kernel must run outside counted loops."""
 
     def is_no_op(self):
         return False
+
+    def get_device(self):
+        return torch.device("spyre")
 
 
 class _AllocationLoopOp(_ExternLoopOp):

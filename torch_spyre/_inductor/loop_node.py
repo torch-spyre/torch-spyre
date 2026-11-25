@@ -54,6 +54,7 @@ import sympy
 from torch._inductor import dependencies, ir
 from torch.utils._ordered_set import OrderedSet
 
+from .constants import DEVICE_NAME
 from .errors import Unsupported
 from .loop_facts import counted_loop_path
 
@@ -839,10 +840,19 @@ def _group_path(op: ir.Operation) -> tuple[int, ...]:
 
 def runs_once_outside_loops(op: ir.Operation) -> bool:
     """True for an op Spyre runs once, outside every counted loop: an extern
-    kernel that does work. Spyre's codegen cannot run one inside a counted loop.
-    A no-op (an allocation such as a zero-element buffer) stays where it is
-    placed, and a ``ComputedBuffer`` is not an extern kernel."""
-    return isinstance(op, ir.ExternKernel) and not op.is_no_op()
+    kernel that does work, on the Spyre device. Spyre's codegen cannot run one
+    inside a counted loop. A no-op (an allocation such as a zero-element buffer)
+    stays where it is placed, and a ``ComputedBuffer`` is not an extern kernel.
+
+    The rule is Spyre codegen's, so an extern kernel on another device (a graph
+    lowered on CPU tensors, whose matmul is ``aten.mm``) stays where it is placed.
+    One whose device is unknown (no ``get_device``, or ``None``) counts as Spyre,
+    the safe side."""
+    if not isinstance(op, ir.ExternKernel) or op.is_no_op():
+        return False
+    get_device = getattr(op, "get_device", None)
+    dev = get_device() if callable(get_device) else None
+    return dev is None or dev.type == DEVICE_NAME
 
 
 def _place_before_loop(

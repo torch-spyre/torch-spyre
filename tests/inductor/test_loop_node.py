@@ -345,6 +345,7 @@ class TestCollapse(unittest.TestCase):
         ext.loop_member = LoopMember((0,), [4], [[]], [[]])
         ext.get_name.return_value = "ext"
         ext.is_no_op.return_value = False
+        ext.get_device.return_value = torch.device("spyre")
         ext.get_read_writes.return_value = ReadWrites(
             OrderedSet(), OrderedSet([_dep("ext")]), OrderedSet()
         )
@@ -1133,10 +1134,14 @@ class TestDeadcodeOnRealNestedList(unittest.TestCase):
 
 
 class _Extern(_Op, ExternKernel):
-    """A stub extern kernel: it runs once, so node build moves it out of a body."""
+    """A stub extern kernel on the Spyre device: it runs once, so node build moves
+    it out of a body."""
 
     def is_no_op(self):
         return False
+
+    def get_device(self):
+        return torch.device("spyre")
 
     # ir.Operation's dataclass __eq__ compares fields this stub never sets.
     def __eq__(self, other):
@@ -1233,6 +1238,38 @@ def test_an_extern_reading_a_carry_storage_is_refused():
         r"loop writes, so it cannot be placed before the loop",
     ):
         collapse(_graph([init, upd, ext, z]))
+
+
+class _CpuExtern(_Extern):
+    """An extern kernel on the CPU device (a graph lowered on CPU tensors)."""
+
+    def get_device(self):
+        return torch.device("cpu")
+
+
+def test_an_extern_on_another_device_stays_in_the_body():
+    """Only Spyre codegen cannot run an extern kernel in a counted loop: one on
+    another device stays where it is, and is not refused even though it reads
+    what the loop writes."""
+    w = _Op("w", (0,), [4])
+    mm = _CpuExtern("mm", (0,), [4], reads=["w"])
+    z = _Op("z", (0,), [4], reads=["mm"])
+    graph = _graph([w, mm, z])
+    collapse(graph)
+    (node,) = graph.operations
+    assert node.body == [w, mm, z]
+
+
+def test_an_extern_with_no_known_device_counts_as_spyre():
+    class _NoDevice(_Extern):
+        def get_device(self):
+            return None
+
+    a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+    ext = _NoDevice("ext", (0,), [4])
+    graph = _graph([a, ext, b])
+    collapse(graph)
+    assert _names(graph.operations) == ["ext", "loopnode0"]
 
 
 def test_an_allocation_in_a_body_stays_in_place():
