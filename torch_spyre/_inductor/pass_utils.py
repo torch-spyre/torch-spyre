@@ -1369,9 +1369,25 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     eff = _effective_output_layout(op)
     sizes = indirect_sizes_from_op(op)
 
+    # Only fold in a loop var's range when this dep's own index actually
+    # carries that var: merging unconditionally would turn `sizes=None` --
+    # a Scatter op's deliberate "I can't size the scatter-row symbol, skip
+    # unknowns silently" signal (see indirect_sizes_from_op /
+    # _build_indirect_store_subs) -- into a real-but-incomplete dict the
+    # moment for_each_tile stamps a dim_hints loop var onto the op, even
+    # when that var plays no part in THIS op's write index. compute_coordinates
+    # then raises Unsupported for the still-unresolved scatter symbol instead
+    # of skipping it, e.g. an index_copy write whose destination row is a
+    # loaded, data-dependent position (tmp0) rather than an affine function
+    # of the spliced loop var.
     loop_var_ranges = loop_var_ranges_from_dim_hints(op)
     if loop_var_ranges:
-        sizes = {**(sizes or {}), **loop_var_ranges}
+        free_syms = output_dep.index.free_symbols
+        relevant_loop_var_ranges = {
+            lv: rng for lv, rng in loop_var_ranges.items() if lv in free_syms
+        }
+        if relevant_loop_var_ranges:
+            sizes = {**(sizes or {}), **relevant_loop_var_ranges}
 
     return host_coordinates(eff, output_dep, sizes)
 

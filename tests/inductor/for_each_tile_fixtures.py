@@ -1584,6 +1584,43 @@ def scatter_carry_old_value_fn(values, indices, output):
     )
 
 
+def kv_cache_write_tiled_fn(
+    key_cache, value_cache, key, value, positions, *, tile_size
+):
+    """A KV-cache write (``index_copy`` keyed by a data-dependent row) tiled
+    by ``for_each_tile`` -- issue #6483.
+
+    Unlike ``scatter_carry_fn``/``scatter_carry_old_value_fn`` above, the
+    carry here is written by ``index_copy`` ALONE: no accumulate, no
+    reduction op shares the loop body with it. That is what makes this
+    Scatter op's write index carry nothing but the data-dependent row
+    symbol (e.g. ``d1 + 128*tmp0``) -- the WhileLoop-splice loop var never
+    appears in it, even though ``for_each_tile`` still stamps that var's
+    ``dim_hints`` onto the op simply for being part of the spliced body.
+    ``pass_utils.op_out_coords`` used to fold that irrelevant loop var into
+    ``indirect_sizes`` unconditionally, turning the Scatter op's
+    deliberate "size unknown, skip" ``None`` into a dict missing the real
+    row symbol, and crashing with "indirect symbol tmp0 not found in
+    indirect_sizes {u0: N}".
+    """
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(carry, tiles):
+        key_tile, value_tile, position_tile = tiles
+        next_key = carry[0].index_copy(0, position_tile, key_tile)
+        next_value = carry[1].index_copy(0, position_tile, value_tile)
+        return (next_key, next_value), None
+
+    (result_key, result_value), _ = for_each_tile(
+        body,
+        (key, value, positions),
+        dims=(0, 0, 0),
+        tile_size=tile_size,
+        init=(key_cache, value_cache),
+    )
+    return result_key, result_value
+
+
 # ---------------------------------------------------------------------------
 # Graph-shape fixtures: for_each_tile bodies that interact with other passes
 # (restickify, views, broadcast, outside consumers, E-tiled matmul, carried
