@@ -8722,6 +8722,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_raise": TO_DTYPE_OP_EXPECT_RAISE,
+            # The EA shuffle that writes the upcast into d writes one float32 stick
+            # past d's 3 sticks, so the result is right or wrong depending on what
+            # lies behind d's buffer (#6693). A strict xfail would turn that into
+            # a flaky failure, so these are non-strict.
+            "expect_fail_unstable": {
+                f"{dtype}_to_float32_68": "the EA shuffle writes past d, #6693"
+                for dtype in ("float16", "bfloat16")
+            },
         },
         (
             "test_round_trip_to_dtype_implicit",
