@@ -14144,20 +14144,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
-    @expects_raise
     def test_bool_host_reshaped_to_fp32_cpu(self):
         # Same as test_bool_host_to_fp32_cpu, but through a reshape view first,
         # which leaves 8 elements on the stick dim. The only input layout folds
         # rows into one stick (stick expression 8*d0 + d1), which the conversion
-        # cannot read, so no output layout is found.
-        # TODO: read a view that folds rows into one stick; then this reads back
-        # like test_bool_host_to_fp32_cpu.
+        # cannot read; it found no output layout until #6557, and now reads the
+        # input relocated or sparse like any other unservable read.
         def fn(x):
             return x.reshape(8, 8).to(dtype=torch.float32)
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
-        with pytest.raises(Exception, match="no supported output layout"):
-            self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
     def test_bool_host_to_fp32_consumed_cpu(self):
         # A host bool is float16-format like a computed one: its float32 is

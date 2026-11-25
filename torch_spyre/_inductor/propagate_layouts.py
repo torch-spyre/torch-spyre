@@ -627,6 +627,7 @@ def _typecast_layouts(
     dep: MemoryDep,
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
+    op: "Operation | None" = None,
 ) -> list[SpyreTensorLayout]:
     """Output STLs of a typecast that changes the elements per stick.
 
@@ -635,6 +636,13 @@ def _typecast_layouts(
     These let a consumer ask for another stick dim, and are the only route for an
     input whose stick starts at a slice offset. The optimizer inserts the
     restickify on the input edge.
+
+    A read the input's layout cannot serve (a reshape that cuts the stick dim off
+    a stick boundary, e.g. ``[2, 8, 40]`` read as ``[2, 320]`` at fp16) is handled
+    as ``_default_pointwise_layout`` handles it (#6557): the input's stick is first
+    relocated densely onto a dim the read leaves alone, and the layouts below are
+    derived from that; failing that, the output takes the sparse layout.
+    ``compute_restickify_needed`` picks the same targets for the input edge.
 
     A read that can take the source's layout (``_can_rescale_input_stl``)
     rescales it (``rescale_stl_for_dtype``), keeping all its device dims. A slice
@@ -648,7 +656,30 @@ def _typecast_layouts(
     ``insert_staggered_ea_padding`` adds the rest.
     """
     in_device_coords = try_device_coordinates(stl, dep, None)
+    relocated = None
     if in_device_coords is None:
+        # As in _default_pointwise_layout: a dense relocation of the stick may
+        # serve the read, and the candidates below are then derived from it.
+        relocated = (
+            None
+            if output_is_indirectly_mutated(op)
+            else dense_relocation_serves_read(stl, in_layout, dep)
+        )
+        if relocated is not None:
+            stl = relocated
+            in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
+        if (
+            output.dtype != torch.float8_e4m3fn
+            and sparse_target_for_unservable_read(stl, in_layout, dep) is not None
+        ):
+            # As in _default_pointwise_layout: compute_restickify_needed moves the
+            # input to its sparse layout, and the output is sparse on its own host
+            # dims. A sparse stick holds one element at any width, so the cast
+            # needs no rescale. Not for QFP8CH, whose arrangement a sparse layout
+            # does not carry.
+            # TODO(#5872): offer this next to the normal candidates, not early.
+            return [sparse_stl_from_host(output, output.dtype)]
         # This input layout cannot address the read, e.g. a row read of a layout
         # whose stick runs along the rows; another candidate of the input may.
         return []
@@ -679,9 +710,12 @@ def _typecast_layouts(
     # ReStickifyOpHBM supports only fp16 in the STANDARD arrangement, so the output
     # of a conversion from fp16 cannot be restickified. Add candidates from the
     # input's alternate layouts, so the optimizer restickifies the input just
-    # before the conversion instead.
+    # before the conversion instead. Not for a relocated input: the input edge is
+    # restickified to the relocation (compute_restickify_needed), so an output
+    # derived from any other stick dim could not be fed.
     if (
-        stl.device_dtype == DataFormats.SEN169_FP16
+        relocated is None
+        and stl.device_dtype == DataFormats.SEN169_FP16
         and input_ea == ElementArrangement.STANDARD
     ):
         in_coords = host_coordinates(in_layout, dep, None)
@@ -1138,7 +1172,7 @@ def _single_arg_op_layout(
         ) if output.dtype != torch.bool and stl.elems_per_stick() != get_elem_in_stick(
             output.dtype
         ):
-            return _typecast_layouts(output, output_dep, dep, in_layout, stl)
+            return _typecast_layouts(output, output_dep, dep, in_layout, stl, op)
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
