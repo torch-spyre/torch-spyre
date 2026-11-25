@@ -113,6 +113,9 @@ SHAPE_PREFIXES = (
 )  # fmt: skip
 # The host resource sampler's file: records of {test_name, metric, value[, model]}.
 HOST_RESOURCES_SUFFIX = ".host_resources.json"
+# Run-context files beside a vLLM bench's results; benchmeta reads them into run props.
+SIDECAR_KINDS = ("env", "phases", "host_resources", "outputs", "compile_summary")
+SIDECAR_FILES = frozenset(f"{k}.json" for k in SIDECAR_KINDS)
 # A record carrying any of these is a vLLM bench result (native) or vLLM's pytorch format.
 VLLM_SIGNATURES = (
     "avg_latency", "requests_per_second", "tokens_per_second", "request_throughput",
@@ -424,11 +427,26 @@ def shapes(name: str) -> dict:
     return out
 
 
+def is_sidecar(filename: str) -> bool:
+    """A `<kind>.json` or `<test_name>.<kind>.json` file; not a benchmark record file."""
+    return filename in SIDECAR_FILES or any(
+        filename.endswith(f".{k}.json") and k != "host_resources" for k in SIDECAR_KINDS
+    )
+
+
+def _nested_sidecar(path: str) -> bool:
+    """`results/<test>/<kind>.json`, the per-test sidecar layout."""
+    parts = path.split("/")
+    return len(parts) == 3 and parts[2] in SIDECAR_FILES
+
+
 def check_vllm(root: Path, meta: dict, results: list) -> None:
     """Each results/*.json is a vLLM bench result named as the runner names it, consistent
     with `perf`. The ingest re-reads them through the live leg's extraction."""
     perf = meta.get("perf", {})
     for p in results:
+        if is_sidecar(Path(p).name):
+            continue
         host = Path(p).name.endswith(HOST_RESOURCES_SUFFIX)
         name = (
             Path(p)
@@ -995,7 +1013,10 @@ def check(root: Path) -> dict:
     present = bundle_files(root)
     stray = [p for p in present if not p.startswith(("results/", "attachments/"))]
     if stray or any(
-        "/" in p.removeprefix("results/") for p in present if p.startswith("results/")
+        "/" in p.removeprefix("results/")
+        and not (kind == "vllm" and _nested_sidecar(p))
+        for p in present
+        if p.startswith("results/")
     ):
         errors.append(
             f"files belong in results/ (flat) or attachments/: {stray or present}"
@@ -1308,7 +1329,13 @@ def write(args, validate_times: bool = True) -> Path:
         if not args.vllm_results_dir:
             raise BundleError("--kind vllm needs --vllm-results-dir")
         src = Path(args.vllm_results_dir)
-        results = sorted(src.glob("*.json"))
+        results = sorted(p for p in src.glob("*.json") if not p.is_symlink()) + sorted(
+            p
+            for p in src.glob("*/*.json")
+            if p.name in SIDECAR_FILES
+            and p.parent.name != "repeats"
+            and not (p.is_symlink() or p.parent.is_symlink())
+        )
         extra = sorted(
             p for p in src.iterdir() if p.is_file() and p.suffix in (".cmd", ".log")
         )
@@ -1399,12 +1426,19 @@ def write(args, validate_times: bool = True) -> Path:
         raise BundleError(f"{root} is not empty")
     (root / "results").mkdir(parents=True, exist_ok=True)
     for p in results:
-        shutil.copy2(
-            p,
+        dest = (
             root
             / "results"
-            / ("invalidation.json" if kind == "bench-invalidation" else p.name),
+            / (
+                "invalidation.json"
+                if kind == "bench-invalidation"
+                else p.relative_to(src)
+                if kind == "vllm"
+                else p.name
+            )
         )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, dest)
     if staged:
         shutil.rmtree(staged, ignore_errors=True)
     if getattr(args, "redact_host", False):
