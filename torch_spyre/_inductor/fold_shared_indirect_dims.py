@@ -30,8 +30,10 @@ user-written op, lowers
 
 and wraps the op's ``inner_fn`` so it reads ``rows`` instead of ``idx`` and drops
 ``c * b`` from ``x``'s address. The result is a plain row gather whose index and
-value dims are disjoint. Spyre cannot generate ``offsets`` on the device
-(no ``index_expr``), so ``arange`` lowers to its CPU fallback.
+value dims are disjoint. ``offsets`` is the cached device ramp
+(``spyre.arange``) scaled by the step and converted to the index dtype: this
+pass runs after the decompositions, so it emits what the ``arange``
+decomposition (#4647) produces rather than an ``aten.arange`` node.
 
 Only Pointwise ops with exactly one indirect load are rewritten, and only one
 shared dim is folded; anything else is left unchanged.
@@ -198,14 +200,12 @@ def _lower_rows(
     """Lower ``rows = idx + arange(0, step * extent, step)`` before ``op``.
 
     Built from FX nodes and ``run_node``, like ``lower_pad_sequence``, so the
-    ops lower exactly as a user-written ``arange`` and ``add`` would (``arange``
-    takes Spyre's CPU fallback). Returns (rows buffer name, new operations).
-
-    TODO(#4647): that PR drops ``aten.arange`` from the host fallbacks and
-    replaces it with a Spyre decomposition, which a node created after the
-    decompositions run never sees. Whichever PR lands second must emit
-    ``spyre.arange`` plus scale/shift and an int64 convert here instead, as
-    #4647 does in ``strided_stick_slice_to_index_select``.
+    ops lower exactly as user-written ones would. A node created here skips the
+    ``arange`` decomposition (it ran before this pass), and ``aten.arange`` has
+    no host fallback (#4647), so emit what the decomposition produces, as
+    ``strided_stick_slice_to_index_select`` does: the cached device ramp
+    ``spyre.arange`` in float32, scaled by the step, converted to the index
+    dtype. Returns (rows buffer name, new operations).
     """
     index_fx = _index_fx_node(graph, plan.index_name)
     anchor = op.get_origin_node() or (next(iter(op.origins)) if op.origins else None)
@@ -216,15 +216,33 @@ def _lower_rows(
     size = [concretize_expr(s) for s in index_buf.get_size()]
     offsets_shape = [1] * len(size)
     offsets_shape[plan.index_dim] = plan.extent
+    # The ramp is computed in float32, exact only up to 2**24 (as the arange
+    # decomposition refuses past it); a larger offset would read wrong rows.
+    if plan.step * (plan.extent - 1) >= 2**24:
+        raise Unsupported(
+            f"{op.get_name()}: folded gather offsets up to "
+            f"{plan.step * (plan.extent - 1)} exceed 2**24, past what the float32 "
+            "device ramp holds exactly (#4840)"
+        )
 
     fx_graph = graph.graph
     ops_before = len(graph.operations)
+    ramp_val = torch.empty([plan.extent], dtype=torch.float32, device=device)
     with fx_graph.inserting_before(anchor):
+        ramp_fx = fx_graph.create_node(
+            "call_function",
+            torch.ops.spyre.arange.default,
+            args=(plan.extent, torch.float32, device),
+        )
+        ramp_fx.meta["val"] = ramp_val
+        scaled_fx = fx_graph.create_node(
+            "call_function", aten.mul.Tensor, args=(ramp_fx, float(plan.step))
+        )
+        scaled_fx.meta["val"] = ramp_val
         offsets_fx = fx_graph.create_node(
             "call_function",
-            aten.arange.start_step,
-            args=(0, plan.step * plan.extent, plan.step),
-            kwargs={"dtype": dtype, "device": device},
+            torch.ops.prims.convert_element_type.default,
+            args=(scaled_fx, dtype),
         )
         offsets_fx.meta["val"] = torch.empty([plan.extent], dtype=dtype, device=device)
         view_fx = fx_graph.create_node(
@@ -235,7 +253,7 @@ def _lower_rows(
             "call_function", aten.add.Tensor, args=(index_fx, view_fx)
         )
         rows_fx.meta["val"] = torch.empty(size, dtype=dtype, device=device)
-    for node in (offsets_fx, view_fx, rows_fx):
+    for node in (ramp_fx, scaled_fx, offsets_fx, view_fx, rows_fx):
         graph.env[node] = graph.run_node(node)
     rows_tb = graph.env[rows_fx]
     rows_tb.realize()
