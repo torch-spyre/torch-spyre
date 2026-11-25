@@ -36,7 +36,7 @@
 
 namespace spyre {
 
-// Whether a view of sharded storage is a box view (see sharded_box_start).
+// Whether a view of sharded storage is a box view (see sharded_box).
 // Symbolic sizes, strides or offsets are never a box: sharded tensors are
 // static-shape only.
 template <typename SizeVec, typename StrideVec>
@@ -56,7 +56,7 @@ static bool is_sharded_box(const at::Tensor& self, const SizeVec& sizes,
   }
   auto offset = storage_offset.maybe_as_int();
   return offset.has_value() &&
-         sharded_box_start(self, int_sizes, int_strides, *offset).has_value();
+         sharded_box(self, int_sizes, int_strides, *offset).has_value();
 }
 
 // A view over sharded storage must keep a mapping from its elements onto the
@@ -64,9 +64,10 @@ static bool is_sharded_box(const at::Tensor& self, const SizeVec& sizes,
 // base tensor, and the sharded copy path maps view elements onto shards
 // through that record. Two kinds of view keep it:
 // - identity views (alias, detach, as_strided of the tensor itself);
-// - box views: a block of the base in the same dimension order (the base's
-//   rank, unit steps, the base's strides), such as x[8:16] or x[:, 64:128].
-//   See sharded_box_start. Only copies to the CPU accept a box view so far;
+// - box views: a block of the base in the same dimension order (unit steps,
+//   the base's strides), such as x[8:16] or x[:, 64:128], possibly dropping
+//   dimensions of extent 1, such as x[3] or x[:, -1]. See sharded_box.
+//   Only copies to the CPU accept a box view so far;
 //   kernels, fills and the other consumers still reject it.
 // Any other view (a transpose, a strided slice, a flattened slice, a
 // broadcast) is rejected here, before it can reach a consumer.
