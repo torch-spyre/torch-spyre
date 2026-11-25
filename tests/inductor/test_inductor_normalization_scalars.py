@@ -26,9 +26,10 @@ def _xfail_fp16_large_reduction(request):
     ``var`` runs on Spyre, but its fp16 mean over a reduction this large sits
     at the edge of the fp16 tolerance (atol 1e-3, rtol 1e-2). Whether it passes
     varies with the backend build and the reduction order: locally it is up to
-    0.03-0.09 off on a few hundred to 18% of the elements, while the compiled
-    group_norm cases did not fail that way in CI and pass locally under
-    deterministic mode. So an unexpected pass must not fail the run.
+    0.03-0.09 off on a few hundred to 18% of the elements; in CI the compiled
+    group_norm cases passed and the compiled instance_norm_2d case failed,
+    the reverse of the local results. So it covers both modes, and an
+    unexpected pass must not fail the run.
     """
     request.applymarker(
         pytest.mark.xfail(
@@ -345,7 +346,7 @@ class TestNormalizationScalarOperations:
     )
     def test_groupnorm(self, request, execution_mode, num_groups, dtype):
         """Test GroupNorm with various group counts and dtypes."""
-        if dtype == torch.float16 and execution_mode == "compiled":
+        if dtype == torch.float16:
             _xfail_fp16_large_reduction(request)
 
         eps = 1e-5
@@ -391,7 +392,7 @@ class TestNormalizationScalarOperations:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
     def test_instancenorm_2d(self, request, execution_mode, dtype):
         """Test 2D InstanceNorm with epsilon constant."""
-        if dtype == torch.float16 and execution_mode == "eager":
+        if dtype == torch.float16:
             _xfail_fp16_large_reduction(request)
 
         eps = 1e-5
