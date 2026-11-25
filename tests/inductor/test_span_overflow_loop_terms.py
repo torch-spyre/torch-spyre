@@ -344,10 +344,10 @@ def _recording(run):
     """Run ``run()`` (a compile) with a spy on the lowering. Returns
     ``(result, [_Looped])``.
 
-    The spy sits where the pass calls the lowering and where the solve's apply
-    does, since under CP-SAT the solve tiles the groups it can take."""
+    The spy sits at ``coarse_tiling.tile_groups``, which the pass, the
+    allocator and the solve's apply all reach."""
     seen: list[_Looped] = []
-    original = passes.tile_groups
+    original = coarse_tiling.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
@@ -361,7 +361,6 @@ def _recording(run):
         return result
 
     patches = [
-        mock.patch.object(passes, "tile_groups", spy),
         mock.patch.object(coarse_tiling, "tile_groups", spy),
     ]
     with contextlib_exit_stack(patches):
@@ -475,7 +474,7 @@ def test_the_memoized_read_writes_see_the_term():
     reading the old index would not see the loop."""
     from torch_spyre._inductor.pass_utils import op_read_writes
 
-    original = passes.tile_groups
+    original = coarse_tiling.tile_groups
     memoized: dict[str, str] = {}
 
     def fill_the_memo_then_tile(graph, groups, group_idx_offset=0):
@@ -495,7 +494,7 @@ def test_the_memoized_read_writes_see_the_term():
 
     fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with mock.patch.object(passes, "tile_groups", fill_the_memo_then_tile):
+    with mock.patch.object(coarse_tiling, "tile_groups", fill_the_memo_then_tile):
         compile_span_overflow(fn, args, limit)
     assert memoized
     assert any(regex.search(r"\bu\d+\b", text) for text in memoized.values()), memoized
@@ -513,7 +512,7 @@ def test_a_for_each_tile_loop_and_a_span_overflow_group_have_distinct_variables(
     shapes = [(256, 256), (256, 64), (4096, 1024), (4096, 1024)]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     seen: dict[int, set[str]] = {}
-    original = passes.tile_groups
+    original = coarse_tiling.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
@@ -529,7 +528,7 @@ def test_a_for_each_tile_loop_and_a_span_overflow_group_have_distinct_variables(
         return result
 
     with (
-        mock.patch.object(passes, "tile_groups", spy),
+        mock.patch.object(coarse_tiling, "tile_groups", spy),
     ):
         compiled = compile_span_overflow(fn, args, 4 * 1024 * 1024)
     assert compiled.groups, "no span-overflow group formed"

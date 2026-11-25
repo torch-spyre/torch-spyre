@@ -199,10 +199,12 @@ Two ordering constraints fix this slot:
 
 ### Span-overflow tiling in the solve
 
-Under CP-SAT with ortools (`solve_decides_span_overflow_tiling(graph)`), the
-span-overflow pass does nothing. LX planning runs the planner instead, at its
-start, just before the solve. One function in `coarse_tiling.py`,
-`span_overflow_tilings(graph)`, does the work. It runs the planner, which
+Under CP-SAT with ortools, the span-overflow pass does nothing. The
+co-optimizing allocator runs the planner instead, before it first reads the
+graph (`CoOptimizingAllocator._plan_span_overflow`, at the start of
+`_prepare_buffers`). The pass and the allocator ask one switch,
+`allocator_plans_span_overflow`, so they agree on who runs it. One function in
+`coarse_tiling.py`, `span_overflow_tilings(graph)`, does the work. It runs the planner, which
 decides which ops tile and groups them into loop nests. Each op of a group then
 gets a menu of the tilings the solve can take (`_span_overflow_menu`), in two
 steps:
@@ -215,8 +217,9 @@ steps:
    solver's tiling space does not admit (the stick dim), and one that leaves no
    legal core split per tile.
 
-A group whose every op has a non-empty menu is left to the solve. The menus go
-to the allocator as a dict from op name to tilings (`span_overflow_menus`).
+A group whose every op has a non-empty menu is left to the solve. The allocator
+keeps the menus as a dict from op name to tilings (`span_overflow_menus`), and
+`_tiling_candidates` offers an op its menu, as it offers auto tiling's options.
 Each op's candidates are the divisions of each menu tiling's per-tile frame, so
 the solve picks a tiling with the split, and `apply_chosen_tilings` applies it
 after the solve. The cost objective prices a one-tiling menu with its concrete
@@ -224,7 +227,8 @@ tile counts, and a menu of several with the symbolic counts
 `auto_coarse_tiling` uses. Every other group is tiled with the planner's
 tilings right away (`apply_planner_tilings`), so the solve plans the graph the
 pass would have built for those groups. If the solve fails, the groups left to
-it get the planner's tilings before greedy placement.
+it get the planner's tilings before greedy placement
+(`tile_span_overflow_left`).
 
 The tiling of a group the solve cannot take now runs after `plan_sharded_hbm`,
 work division and `report_output_layouts`, not before them. Under CP-SAT work

@@ -133,11 +133,11 @@ from torch_spyre._inductor.scratchpad.graph_editor import (
 )
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     MAX_SEARCH_TILE_DEPTH,
-    SpanOverflowApply,
     SpanOverflowTilings,
     apply_chosen_tilings,
     apply_planner_tilings,
     planned_splits,
+    span_overflow_tilings,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor.constants import (
@@ -3410,10 +3410,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         self._decides_lx_relayouts = layout_planning.decides_lx_relayouts()
         self._tilings_from_menu = layout_planning.tilings_from_menu()
-        # The span-overflow menus LX planning gives the solve
-        # (``coarse_tiling.span_overflow_tilings``): op name -> the tilings the
-        # solve picks from. ``scratchpad_planning`` sets them.
+        # The span-overflow menus (``coarse_tiling.span_overflow_tilings``): op
+        # name -> the tilings the solve picks from. ``_plan_span_overflow`` sets
+        # them, and keeps the planner's groups for a failed solve.
         self.span_overflow_menus: Mapping[str, tuple[TileSpec, ...]] = {}
+        self._span_overflow: Optional[SpanOverflowTilings] = None
         if config.lx_planner_relayout and not self._decides_lx_relayouts:
             logger.debug(
                 "%s does not decide LX relayouts; continuing without relayout",
@@ -3427,6 +3428,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         lx_relayout_plans: list[LXRelayoutPlan] | None = None,
     ) -> Sequence[Any]:
         # Joint selection derives its own divisions; fixed-division plans do not apply.
+        self._plan_span_overflow(graph)
         # Validate the post-loop drain plans exactly once, here, before the
         # solver runs: the residency gate, the lifetime extension and the push
         # must all consume this same object.  Re-deriving it after the solve
@@ -3482,6 +3484,43 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """Takes span-overflow menus (``span_overflow_menus``): it takes tilings
         off its menus, which are not pruned around the committed split."""
         return self._tilings_from_menu and not self.prune
+
+    def _plan_span_overflow(self, graph: GraphLowering) -> None:
+        """Run the span-overflow planner here, in place of its pass, when this
+        solve picks the tilings.
+
+        :func:`allocator_plans_span_overflow` decides whether it does; this
+        calls it with ``self``. The pass calls the same function with the
+        configured allocator, so exactly one of the two runs the planner.
+
+        A group the solve cannot take is tiled at once, with the planner's
+        tilings, before anything here reads the graph. For every other group,
+        each op's menu is kept for :meth:`_tiling_candidates`, and the group
+        for :meth:`tile_span_overflow_left`, which tiles it if the solve fails.
+        """
+        self.span_overflow_menus = {}
+        self._span_overflow = None
+        if not allocator_plans_span_overflow(self, graph):
+            return
+        with timing_recorder.stage(
+            "stage:CoOptimizingAllocator:span_overflow_tilings"
+        ) as event:
+            tilings = span_overflow_tilings(graph)
+        event.meta["menu_ops"] = len(tilings.menus)
+        event.meta["left_groups"] = len(tilings.left)
+        event.meta["kept_groups"] = len(tilings.kept)
+        apply_planner_tilings(graph, tilings.kept, tilings.dim_hint_assignments)
+        self.span_overflow_menus = tilings.menus
+        self._span_overflow = tilings
+
+    def tile_span_overflow_left(self, graph: GraphLowering) -> None:
+        """After a failed solve, tile the span-overflow groups left to it with
+        the planner's tilings, so greedy placement plans the graph the pass
+        would have built. Does nothing the second time."""
+        tilings, self._span_overflow = self._span_overflow, None
+        self.span_overflow_menus = {}
+        if tilings is not None:
+            apply_planner_tilings(graph, tilings.left, tilings.dim_hint_assignments)
 
     @staticmethod
     def _direct_read_candidates_priced(op, divisions, buffers) -> bool:
@@ -5941,28 +5980,29 @@ def solve_decides_work_division() -> bool:
     return solver_cls is not None and solver_cls.chooses_core_divisions()
 
 
-def solve_decides_span_overflow_tiling(graph: GraphLowering) -> bool:
-    """Whether LX planning, not the span-overflow pass, runs the span-overflow
-    planner on ``graph``, so the solve picks the tilings
-    (:func:`~torch_spyre._inductor.scratchpad.coarse_tiling.span_overflow_tilings`).
+def allocator_plans_span_overflow(
+    allocator: ScratchpadAllocator, graph: GraphLowering
+) -> bool:
+    """Whether ``allocator`` runs the span-overflow planner on ``graph`` itself,
+    in place of the span-overflow pass, so that the solve picks the tilings
+    (:meth:`CoOptimizingAllocator._plan_span_overflow`).
 
-    Span-overflow tiling must be on, and the allocator :func:`select_allocator`
-    builds must take span-overflow menus. That is CP-SAT with ortools. The
-    annealer, the pruned exhaustive search and the placement-only allocators
-    keep the pass. Work division must be left to the solve as well
-    (:func:`solve_decides_work_division`), because the planner's tilings are
-    then applied after work division. A graph with sharded placements keeps the
-    pass: the shard plan, which runs after the pass, must see every op that
-    reads a sharded buffer, and tiling adds such ops.
+    This is the one switch for who runs the planner. The allocator asks it about
+    itself, and the pass about the configured allocator
+    (:func:`solve_decides_span_overflow_tiling`), so a patch here switches both.
+
+    Span-overflow tiling must be on, and the allocator must take span-overflow
+    menus. That is CP-SAT with ortools. The annealer, the pruned exhaustive
+    search and the placement-only allocators keep the pass. Work division must
+    be left to the solve as well (:func:`solve_decides_work_division`), because
+    the planner's tilings are then applied after work division. A graph with
+    sharded placements keeps the pass: the shard plan, which runs after the
+    pass, must see every op that reads a sharded buffer, and tiling adds such
+    ops.
     """
     from torch_spyre._inductor.sharded_hbm import graph_placements
 
     if config.ignore_span_overflow_hints or not solve_decides_work_division():
-        return False
-    try:
-        allocator = select_allocator()
-    except ValueError:
-        # A solver config select_allocator refuses; scratchpad_planning raises it.
         return False
     if not (
         isinstance(allocator, CoOptimizingAllocator)
@@ -5972,13 +6012,27 @@ def solve_decides_span_overflow_tiling(graph: GraphLowering) -> bool:
     return not graph_placements(graph)
 
 
+def solve_decides_span_overflow_tiling(graph: GraphLowering) -> bool:
+    """Whether the allocator :func:`select_allocator` builds runs the
+    span-overflow planner on ``graph``, in place of the pass
+    (:func:`allocator_plans_span_overflow`). The span-overflow pass asks this.
+    """
+    # The cheap checks first, so no allocator is built when the answer is no.
+    if config.ignore_span_overflow_hints or not solve_decides_work_division():
+        return False
+    try:
+        allocator = select_allocator()
+    except ValueError:
+        # A solver config select_allocator refuses; scratchpad_planning raises it.
+        return False
+    return allocator_plans_span_overflow(allocator, graph)
+
+
 def scratchpad_planning(
     graph: GraphLowering,
     allocator: Optional[ScratchpadAllocator] = None,
     *,
     lx_relayout_plans: list[LXRelayoutPlan] | None = None,
-    span_overflow: Optional[SpanOverflowTilings] = None,
-    apply_span_overflow_groups: Optional[SpanOverflowApply] = None,
 ) -> None:
     """Assign LX scratchpad addresses to eligible buffers in a lowered graph.
 
@@ -5992,30 +6046,20 @@ def scratchpad_planning(
         lx_relayout_plans: Plans from immediately preceding ownership anchoring.
             None requests collection; an empty list is a completed empty result.
             The caller must not mutate the graph between collection and this call.
-        span_overflow: The span-overflow planner's groups, split by who tiles
-            them (``coarse_tiling.span_overflow_tilings``), when the solve picks
-            the tilings. The allocator must take span-overflow menus.
-        apply_span_overflow_groups: The span-overflow pass's own apply. If the
-            solve fails, it tiles the groups left to the solve with the
-            planner's tilings. Needed only with ``span_overflow``.
     """
     if allocator is None:
         allocator = select_allocator()
-    if span_overflow is not None:
-        assert (
-            isinstance(allocator, CoOptimizingAllocator)
-            and allocator.takes_span_overflow_tilings
-        ), "span-overflow menus need an allocator that takes them"
-        allocator.span_overflow_menus = span_overflow.menus
     try:
         allocator.plan_allocation(graph, lx_relayout_plans=lx_relayout_plans)
     except SolveError as error:
         # Strong exception guarantee: SolveError comes from the solve, or from the
         # span-overflow menu check before it (``_division_map``), before the
         # allocator commits divisions, relayouts or addresses, and select_allocator
-        # configures no pre-passes. The graph is unchanged, so greedy placement
-        # replans it with the work divisions already committed and recollects
-        # relayout plans itself.
+        # configures no pre-passes. The one change to the graph before it is the
+        # span-overflow groups the solve cannot take, tiled with the planner's
+        # tilings, which the fallback keeps. So greedy placement replans the graph
+        # with the work divisions already committed and recollects relayout plans
+        # itself.
         # Keep the failed allocator's post-allocation passes: select_allocator
         # adds LxContextSwitchingPass under the same flag that lets residency skip
         # the extern-kernel liveness guard, so dropping it would leave LX buffers
@@ -6028,14 +6072,8 @@ def scratchpad_planning(
         )
         # Tile and divide what was left to the failed solve, in that order, so
         # greedy placement plans the graph the passes would have built.
-        if span_overflow is not None:
-            assert apply_span_overflow_groups is not None
-            apply_planner_tilings(
-                graph,
-                span_overflow.left,
-                span_overflow.dim_hint_assignments,
-                apply_span_overflow_groups,
-            )
+        if isinstance(allocator, CoOptimizingAllocator):
+            allocator.tile_span_overflow_left(graph)
         divide_deferred_ops(graph)
         ScratchpadAllocator(
             GreedyLayoutSolver,

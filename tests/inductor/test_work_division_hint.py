@@ -836,73 +836,16 @@ def test_lx_anchor_pass_respects_planning_switch(enabled):
     graph = SimpleNamespace()
     with (
         config.patch({"lx_planning": enabled}),
-        # The span-overflow planner is the next test's subject, not this one's.
-        mock_patch.object(
-            passes, "solve_decides_span_overflow_tiling", lambda graph: False
-        ),
         mock_patch.object(passes, "anchor_lx_relayout_ownership") as anchor,
         mock_patch.object(passes, "scratchpad_planning") as allocate,
     ):
         passes._maybe_scratchpad_planning(graph)
     if enabled:
         anchor.assert_called_once_with(graph)
-        allocate.assert_called_once_with(
-            graph,
-            lx_relayout_plans=anchor.return_value,
-            span_overflow=None,
-            apply_span_overflow_groups=passes._apply_span_overflow_groups,
-        )
+        allocate.assert_called_once_with(graph, lx_relayout_plans=anchor.return_value)
     else:
         anchor.assert_not_called()
         allocate.assert_not_called()
-
-
-def test_lx_planning_tiles_what_the_solve_cannot_take_then_plans():
-    """Under CP-SAT, LX planning runs the span-overflow planner. It tiles the
-    groups the solve cannot take, with the planner's tilings, then hands the
-    menus to the allocator. It tiles before it calls
-    ``anchor_lx_relayout_ownership``, as when the pass tiled, although anchoring
-    does nothing under co-optimization."""
-    from torch_spyre._inductor import passes
-
-    graph = SimpleNamespace()
-    tilings = SimpleNamespace(
-        menus={}, left=[], kept=[("group",)], dim_hint_assignments=[("op", [])]
-    )
-    order = []
-    with (
-        config.patch({"lx_planning": True}),
-        mock_patch.object(
-            passes, "solve_decides_span_overflow_tiling", lambda graph: True
-        ),
-        mock_patch.object(
-            passes, "span_overflow_tilings", return_value=tilings
-        ) as plan,
-        mock_patch.object(
-            passes, "apply_planner_tilings", side_effect=lambda *a: order.append("tile")
-        ) as tile,
-        mock_patch.object(
-            passes,
-            "anchor_lx_relayout_ownership",
-            side_effect=lambda graph: order.append("anchor") or ["plan"],
-        ),
-        mock_patch.object(passes, "scratchpad_planning") as allocate,
-    ):
-        passes._maybe_scratchpad_planning(graph)
-    plan.assert_called_once_with(graph)
-    tile.assert_called_once_with(
-        graph,
-        tilings.kept,
-        tilings.dim_hint_assignments,
-        passes._apply_span_overflow_groups,
-    )
-    assert order == ["tile", "anchor"]
-    allocate.assert_called_once_with(
-        graph,
-        lx_relayout_plans=["plan"],
-        span_overflow=tilings,
-        apply_span_overflow_groups=passes._apply_span_overflow_groups,
-    )
 
 
 @pytest.mark.parametrize("plans", [[], [_relayout_plan()]])

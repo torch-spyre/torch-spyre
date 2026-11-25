@@ -30,6 +30,8 @@ import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 from torch._inductor.ir import ComputedBuffer
 
 from torch_spyre._inductor import config, passes
+from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import coarse_tiling
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.wsr.loop_tiling_lowering import (
     LoopTilingGroup,
@@ -79,20 +81,22 @@ def _before_tile_groups(before):
     """Call ``before(operations, groups, group_idx_offset)`` at every call of
     ``tile_groups`` (the graph is still undivided), then let the lowering run.
 
-    The spy sits where the planner's tilings are applied, so the pass keeps
-    every group and each op takes the planner's tiling. Under CP-SAT the solve
-    would otherwise take some groups (``bmm_output_tiled``) and apply them
-    elsewhere."""
-    original = passes.tile_groups
+    The pass keeps every group here, so each op takes the planner's tiling and
+    the graph is still undivided. Under CP-SAT the solve would otherwise take
+    some groups (``bmm_output_tiled``) and pick their tilings itself."""
+    original = coarse_tiling.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         before(graph.operations, groups, group_idx_offset)
         return original(graph, groups, group_idx_offset)
 
     with (
-        mock.patch.object(passes, "tile_groups", spy),
+        mock.patch.object(coarse_tiling, "tile_groups", spy),
+        # The one switch for who runs the planner: the pass and the allocator ask it.
         mock.patch.object(
-            passes, "solve_decides_span_overflow_tiling", lambda graph: False
+            allocator_module,
+            "allocator_plans_span_overflow",
+            lambda allocator, g: False,
         ),
     ):
         yield
@@ -226,7 +230,7 @@ def test_a_group_holding_an_op_with_loop_info_is_refused():
 
     fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    original = passes.tile_groups
+    original = coarse_tiling.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         groups[0][0][0].loop_member = LoopMember(
@@ -238,7 +242,7 @@ def test_a_group_holding_an_op_with_loop_info_is_refused():
         return original(graph, groups=groups, group_idx_offset=group_idx_offset)
 
     with (
-        mock.patch.object(passes, "tile_groups", spy),
+        mock.patch.object(coarse_tiling, "tile_groups", spy),
         pytest.raises(Exception, match="existing loop_member"),
     ):
         compile_span_overflow(fn, args, limit)
@@ -674,12 +678,12 @@ def test_a_loop_member_may_not_read_a_reductions_partial_result():
 
 
 def test_both_callers_tile_through_tile_groups():
-    """The span-overflow pass and the allocator's ``apply_tilings`` reach the lowering
-    through one entry point, ``tile_groups``, and both pass it the groups they built."""
-    from torch_spyre._inductor.scratchpad import coarse_tiling
+    """The planner's tilings (``apply_planner_tilings``) and the allocator's
+    ``apply_tilings`` reach the lowering through one entry point, ``tile_groups``,
+    and both pass it the groups they built."""
     from torch_spyre._inductor.wsr import loop_tiling_lowering as lowering
 
-    seen = {"passes": [], "coarse_tiling": []}
+    seen = {"planner": [], "apply_tilings": []}
 
     def recording(where):
         original = lowering.tile_groups
@@ -692,7 +696,7 @@ def test_both_callers_tile_through_tile_groups():
 
     fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with mock.patch.object(passes, "tile_groups", recording("passes")):
+    with mock.patch.object(coarse_tiling, "tile_groups", recording("planner")):
         compile_span_overflow(fn, args, limit)
 
     from test_solver_auto_coarse_tiling import TileAxis, TileSpec
@@ -700,10 +704,10 @@ def test_both_callers_tile_through_tile_groups():
     x = torch.randn(64, 64, 128, dtype=torch.float16)
     y = torch.randn(64, 64, 128, dtype=torch.float16)
     by_four = TileSpec((TileAxis(host_dim=0, count=4),))
-    with mock.patch.object(coarse_tiling, "tile_groups", recording("coarse_tiling")):
+    with mock.patch.object(coarse_tiling, "tile_groups", recording("apply_tilings")):
         _compile_with_menu(lambda x, y: (x + y) * 2, (x, y), lambda op: [by_four])
-    assert seen["passes"] and all(n >= 1 for n in seen["passes"]), seen
-    assert seen["coarse_tiling"] and all(n >= 1 for n in seen["coarse_tiling"]), seen
+    assert seen["planner"] and all(n >= 1 for n in seen["planner"]), seen
+    assert seen["apply_tilings"] and all(n >= 1 for n in seen["apply_tilings"]), seen
 
 
 def test_a_plain_int_range_is_a_range():

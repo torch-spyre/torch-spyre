@@ -46,7 +46,6 @@ it is rejected instead.
 """
 
 import contextlib
-import functools
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
@@ -59,7 +58,7 @@ from torch._inductor.utils import run_and_get_code
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._inductor import config
-from torch_spyre._inductor import nonstick_dim_order, passes, work_division
+from torch_spyre._inductor import nonstick_dim_order, work_division
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import coarse_tiling, ilp_solver_ortools
@@ -124,14 +123,24 @@ def normalise(text):
 def compile_span_overflow(fn, args, limit_bytes, *, in_solve=True):
     """Compile ``fn`` with span-overflow on and the span limit lowered.
 
-    The lowering is watched where the planner's tilings are applied
-    (``passes.tile_groups``: the pass, and under CP-SAT the groups the solve
-    cannot take) and where the solve's are (``coarse_tiling.tile_groups``). Each
-    op whose menu came out empty is recorded with why each candidate was
+    The lowering is watched at ``coarse_tiling.tile_groups``, which both the
+    planner's tilings and the solve's reach. A call inside ``apply_tilings`` is
+    the solve's ("solve"); any other call applies the planner's tilings
+    ("pass"): in the pass, or under CP-SAT for the groups the solve cannot take.
+    Each op whose menu came out empty is recorded with why each candidate was
     dropped. ``in_solve=False`` keeps every group with the pass."""
     formed, added, paths, kept = [], [], [], []
-    original = passes.tile_groups
+    original = coarse_tiling.tile_groups
+    solve_apply = coarse_tiling.apply_tilings
+    in_solve_apply = [False]
     menu_of = coarse_tiling._span_overflow_menu
+
+    def solve_applies(choices, graph):
+        in_solve_apply[0] = True
+        try:
+            return solve_apply(choices, graph)
+        finally:
+            in_solve_apply[0] = False
 
     def record_kept(op, hints, ctx):
         menu, refused = menu_of(op, hints, ctx)
@@ -139,7 +148,8 @@ def compile_span_overflow(fn, args, limit_bytes, *, in_solve=True):
             kept.append((op.get_name(), refused))
         return menu, refused
 
-    def spy(graph, groups, group_idx_offset=0, *, path):
+    def spy(graph, groups, group_idx_offset=0):
+        path = "solve" if in_solve_apply[0] else "pass"
         before = {op.get_operation_name() for op in graph.operations}
         formed.extend(
             (
@@ -158,16 +168,14 @@ def compile_span_overflow(fn, args, limit_bytes, *, in_solve=True):
         )
         return result
 
-    # The pass and LX planning both look the predicate up in passes.
+    # The one switch for who runs the planner: the pass and the allocator ask it.
     in_pass = mock.patch.object(
-        passes, "solve_decides_span_overflow_tiling", lambda graph: False
+        allocator_module, "allocator_plans_span_overflow", lambda allocator, g: False
     )
     torch._dynamo.reset()
     with (
-        mock.patch.object(passes, "tile_groups", functools.partial(spy, path="pass")),
-        mock.patch.object(
-            coarse_tiling, "tile_groups", functools.partial(spy, path="solve")
-        ),
+        mock.patch.object(coarse_tiling, "tile_groups", spy),
+        mock.patch.object(coarse_tiling, "apply_tilings", solve_applies),
         mock.patch.object(coarse_tiling, "_span_overflow_menu", record_kept),
         contextlib.nullcontext() if in_solve else in_pass,
         span_limit(limit_bytes),
@@ -528,10 +536,10 @@ def test_a_k_tile_is_refused_before_anything_reads_the_op():
 
 
 def test_tiling_with_the_planner_defers_the_ops_it_adds():
-    """``apply_planner_tilings`` hands the pass's apply the groups and the
-    planner's hints. It runs after work division was deferred, so the ops the
-    apply adds join the deferred set, as they would have when the pass tiled
-    before work division. With no groups it does nothing."""
+    """``apply_planner_tilings`` tiles the groups with the planner's hints. When
+    it runs after work division was deferred, the ops the tiling adds join the
+    deferred set, as they would have when the pass tiled before work division.
+    With no groups it does nothing."""
     from torch._inductor.ir import ComputedBuffer, Pointwise
 
     added = MagicMock(spec=ComputedBuffer, data=MagicMock(spec=Pointwise))
@@ -541,46 +549,80 @@ def test_tiling_with_the_planner_defers_the_ops_it_adds():
     setattr(graph, work_division._DEFERRED_WORK_DIVISION, {"buf1", "buf2"})
     group = ([a, b], [(10001, 2)])
     hints = [(a, ["buf1"]), (b, ["buf2"])]
-    applied = []
+    tiled = []
 
-    def apply(graph, groups, hints):
-        applied.append((groups, hints))
+    def tile(graph, groups, hints):
+        tiled.append((groups, hints))
         graph.operations.append(added)
 
-    coarse_tiling.apply_planner_tilings(graph, [group], hints, apply)
-    coarse_tiling.apply_planner_tilings(graph, [], hints, apply)
+    with mock.patch.object(coarse_tiling, "_tile_planner_groups", tile):
+        coarse_tiling.apply_planner_tilings(graph, [group], hints)
+        coarse_tiling.apply_planner_tilings(graph, [], hints)
 
-    assert applied == [([group], hints)]
+    assert tiled == [([group], hints)]
     deferred = work_division.deferred_work_division(graph)
     assert deferred == {"buf1", "buf2", "coarse_tile_copy_buf2"}
 
 
 @needs_ortools
-def test_the_allocator_gets_the_menus_and_a_failed_solve_tiles_the_groups():
-    """``scratchpad_planning`` hands the menus to the allocator. If the solve
-    fails, the groups left to it are tiled with the planner's tilings, then the
-    work division the solve left is done, then greedy placement runs."""
+def test_the_allocator_runs_the_planner_and_tiles_what_the_solve_cannot_take():
+    """Under CP-SAT the allocator runs the span-overflow step itself. It tiles
+    the kept groups with the planner's tilings and keeps the menus of the
+    others. After a failed solve it tiles the groups left to the solve, once."""
     with config.patch(_CPSAT):
         allocator = allocator_module.select_allocator()
     tilings = coarse_tiling.SpanOverflowTilings(
         menus={"buf0": (_D0,)},
-        left=[("group",)],
-        kept=[],
+        left=[("left",)],
+        kept=[("kept",)],
         dim_hint_assignments=[("op", [])],
     )
-    graph, apply = object(), object()
-    menus_seen, order = [], []
-
-    def fail(graph, lx_relayout_plans):
-        menus_seen.append(dict(allocator.span_overflow_menus))
-        raise SolveError("failed by the test")
-
+    graph = object()
+    tiled = []
     with (
-        mock.patch.object(allocator, "plan_allocation", side_effect=fail),
+        mock.patch.object(
+            allocator_module, "allocator_plans_span_overflow", lambda a, g: True
+        ),
+        mock.patch.object(allocator_module, "span_overflow_tilings", lambda g: tilings),
         mock.patch.object(
             allocator_module,
             "apply_planner_tilings",
-            side_effect=lambda *args: order.append(("tile", args)),
+            lambda g, groups, hints: tiled.append((g, groups, hints)),
+        ),
+    ):
+        allocator._plan_span_overflow(graph)
+        assert allocator.span_overflow_menus == {"buf0": (_D0,)}
+        assert tiled == [(graph, tilings.kept, tilings.dim_hint_assignments)]
+        allocator.tile_span_overflow_left(graph)
+        allocator.tile_span_overflow_left(graph)
+    assert tiled[1:] == [(graph, tilings.left, tilings.dim_hint_assignments)]
+    assert allocator.span_overflow_menus == {}
+
+    # When the pass runs the planner, the allocator does not.
+    with mock.patch.object(
+        allocator_module, "allocator_plans_span_overflow", lambda a, g: False
+    ):
+        allocator._plan_span_overflow(graph)
+    assert allocator.span_overflow_menus == {} and len(tiled) == 2
+
+
+@needs_ortools
+def test_a_failed_solve_tiles_what_was_left_to_it_then_divides():
+    """If the solve fails, the groups left to it are tiled with the planner's
+    tilings, then the work division the solve left is done, then greedy
+    placement runs."""
+    with config.patch(_CPSAT):
+        allocator = allocator_module.select_allocator()
+    graph = object()
+    order = []
+    with (
+        mock.patch.object(
+            allocator, "plan_allocation", side_effect=SolveError("failed by the test")
+        ),
+        mock.patch.object(
+            allocator,
+            "tile_span_overflow_left",
+            side_effect=lambda graph: order.append(("tile", graph)),
         ),
         mock.patch.object(
             allocator_module,
@@ -594,20 +636,9 @@ def test_the_allocator_gets_the_menus_and_a_failed_solve_tiles_the_groups():
             side_effect=lambda *args, **kwargs: order.append(("greedy",)),
         ),
     ):
-        allocator_module.scratchpad_planning(
-            graph,
-            allocator,
-            lx_relayout_plans=[],
-            span_overflow=tilings,
-            apply_span_overflow_groups=apply,
-        )
+        allocator_module.scratchpad_planning(graph, allocator, lx_relayout_plans=[])
 
-    assert menus_seen == [{"buf0": (_D0,)}]
-    assert order == [
-        ("tile", (graph, tilings.left, tilings.dim_hint_assignments, apply)),
-        ("divide", graph),
-        ("greedy",),
-    ]
+    assert order == [("tile", graph), ("divide", graph), ("greedy",)]
 
 
 @needs_ortools
@@ -650,7 +681,7 @@ def test_an_op_with_a_menu_is_offered_its_menu():
     from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
     op = SimpleNamespace(
-        loop_info=None, get_operation_name=lambda: "op0", get_name=lambda: "buf0"
+        loop_member=None, get_operation_name=lambda: "op0", get_name=lambda: "buf0"
     )
     owner = SimpleNamespace(span_overflow_menus={"buf0": (_D0, _D1)})
     for auto in (False, True):

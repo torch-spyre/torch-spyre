@@ -55,7 +55,7 @@ from .temp_passes import (
     mm_to_bmm_pass,
     strided_stick_slice_to_index_select,
 )
-from .wsr.coarse_tile import reject_nested_loops, validate_coarse_tile_groups
+from .wsr.coarse_tile import validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
 from .wsr.for_each_tile_lowering import clear_marker_maps, splice_while_loops
 from . import config
@@ -93,7 +93,7 @@ from .scratchpad.allocator import (
     solve_decides_span_overflow_tiling,
     solve_decides_work_division,
 )
-from .scratchpad.coarse_tiling import apply_planner_tilings, span_overflow_tilings
+from .scratchpad.coarse_tiling import apply_planner_tilings
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import sink_collective_waits, spyre_fuse_nodes
 from .scheduler import (
@@ -103,14 +103,12 @@ from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .loop_carries import apply_loop_carries
 from .loop_checker import check_loops
-from .loop_facts import counted_loop_path
 from .loop_node import (
     OpsView,
     all_ops,
     build_pending_loop_nodes,
     expand,
     has_loop_nodes,
-    request_loop_nodes,
 )
 from . import loop_scheduler
 from .dedup_constants import dedup_and_promote_constants
@@ -392,6 +390,7 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
     span_overflow_groups,
     validate_coarse_tile_groups,
     tile_groups,
+    apply_planner_tilings,
 )
 def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """Span-overflow coarse tiling only.  Runs POST-stickification.
@@ -406,57 +405,14 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     benefit.
 
     Under CP-SAT (``solve_decides_span_overflow_tiling``) the pass does nothing:
-    LX planning runs the planner instead, just before the solve
-    (``_maybe_scratchpad_planning``), so that the solve picks the tilings.
+    the LX planning allocator runs the planner instead, before the solve
+    (``CoOptimizingAllocator._plan_span_overflow``), so that the solve picks the
+    tilings.
     """
     if config.ignore_span_overflow_hints or solve_decides_span_overflow_tiling(graph):
         return
     groups, dim_hint_assignments = span_overflow_groups(graph)
-    _apply_span_overflow_groups(graph, groups, dim_hint_assignments)
-
-
-def _apply_span_overflow_groups(
-    graph: GraphLowering,
-    groups: list[tuple],
-    dim_hint_assignments: list[tuple[Operation, list]],
-) -> None:
-    """Tile ``groups`` with the planner's tilings (its hints): in the pass, and
-    under CP-SAT the groups the solve cannot take, or the others if the solve
-    fails (``apply_planner_tilings``)."""
-    if not groups:
-        return
-    # span_overflow_groups is a pure planning step: it decides each op's
-    # dim_hints but does not set them.  Apply them now, before
-    # validate_coarse_tile_groups/tile_groups run, since dim_hints is an input
-    # those consume (the plan's hint lookups), not something they produce.
-    # Only the members of ``groups``: an op the solve tiles carries no hints.
-    members = {id(op) for group_ops, _levels in groups for op in group_ops}
-    for op, dim_hints in dim_hint_assignments:
-        if id(op) in members:
-            op.dim_hints = dim_hints  # type: ignore[attr-defined]
-    # Compute offset to avoid loop_group_id collision with any groups already
-    # stamped by splice_while_loops (for_each_tile), or by an earlier call on
-    # the same graph (the groups the solve cannot take, before a failed solve's
-    # fallback tiles the others).
-    # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
-    used_ids = [
-        counted_loop_path(op, include_extern=True)[0]
-        for op in graph.operations
-        if counted_loop_path(op, include_extern=True)
-    ]
-    group_idx_offset = max(used_ids, default=-1) + 1
-    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
-    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
-    validate_coarse_tile_groups(groups)
-    reject_nested_loops(groups, "span-overflow coarse tiling")
-    request_loop_nodes(
-        graph,
-        tile_groups(
-            graph,
-            groups=groups,
-            group_idx_offset=group_idx_offset,
-        ),
-    )
+    apply_planner_tilings(graph, groups, dim_hint_assignments)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
@@ -473,43 +429,14 @@ def _distribute_work(graph: GraphLowering) -> None:
     work_distribution(graph, preassigned_ops)
 
 
-@_runs(
-    anchor_lx_relayout_ownership,
-    scratchpad_planning,
-    span_overflow_tilings,
-    tile_groups,
-)
+@_runs(anchor_lx_relayout_ownership, scratchpad_planning)
 def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     if not config.lx_planning:
         return
     # The allocator (and its layout solver) is selected from config by
     # scratchpad_planning -> select_allocator; no allocator wiring here.
-    # Under CP-SAT the span-overflow planner runs here, in place of its pass, so
-    # that the solve picks the tilings. The groups the solve cannot take are
-    # tiled now, with the planner's tilings. They come before anchoring, as when
-    # the pass tiled them, although anchoring does nothing under co-optimization.
-    span_overflow = None
-    if solve_decides_span_overflow_tiling(graph):
-        with timing_recorder.stage(
-            "stage:CustomPreSchedulingPasses:span_overflow_tilings"
-        ) as event:
-            span_overflow = span_overflow_tilings(graph)
-        event.meta["menu_ops"] = len(span_overflow.menus)
-        event.meta["left_groups"] = len(span_overflow.left)
-        event.meta["kept_groups"] = len(span_overflow.kept)
-        apply_planner_tilings(
-            graph,
-            span_overflow.kept,
-            span_overflow.dim_hint_assignments,
-            _apply_span_overflow_groups,
-        )
     plans = anchor_lx_relayout_ownership(graph)
-    scratchpad_planning(
-        graph,
-        lx_relayout_plans=plans,
-        span_overflow=span_overflow,
-        apply_span_overflow_groups=_apply_span_overflow_groups,
-    )
+    scratchpad_planning(graph, lx_relayout_plans=plans)
 
 
 def _log_after_pass(graph: GraphLowering, pass_name: str) -> None:

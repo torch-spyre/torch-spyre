@@ -255,11 +255,13 @@ The loop-tiling lowering (`wsr/loop_tiling_lowering.py`) tiles ops that a pass
 decided to tile, without a user-written loop. It has two entry points, both
 through `tile_groups(graph, groups, group_idx_offset)`:
 
-- the **span-overflow pass** (`_maybe_coarse_tile_span_overflow`), which tiles
-  ops whose per-core span would exceed the hardware limit. It is opt-in
-  (`config.ignore_span_overflow_hints = False`). Under CP-SAT the pass does
-  nothing: LX planning runs the planner instead, just before the solve, so that
-  the solve picks the tilings
+- the **span-overflow planner's tilings** (`apply_planner_tilings` in
+  `scratchpad/coarse_tiling.py`), for ops whose per-core span would exceed the
+  hardware limit. It is opt-in (`config.ignore_span_overflow_hints = False`).
+  The span-overflow pass (`_maybe_coarse_tile_span_overflow`) calls it. Under
+  CP-SAT the pass does nothing: the co-optimizing allocator runs the planner
+  instead, before the solve, so that the solve picks the tilings, and calls it
+  for the groups the solve cannot take
   ([Span-overflow tiling in the solve](scratchpad_planning.md#span-overflow-tiling-in-the-solve));
 - the **allocator's tiling** (`apply_tilings` in `scratchpad/coarse_tiling.py`),
   which tiles to fit the working set in the scratchpad. It is opt-in

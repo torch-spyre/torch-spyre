@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 import operator
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
 import sympy
@@ -932,19 +932,14 @@ def planned_splits(
 # --------------------------------------------------------------------------
 # Span-overflow tilings the joint solve picks (#5682)
 #
-# Under CP-SAT the span-overflow pass does nothing. LX planning runs the
-# planner instead, just before the solve (span_overflow_tilings). Each op of a
-# planner group gets a menu: the tilings of it the solve can take. The solve
-# picks one tiling from each menu, and apply_chosen_tilings applies it after the
-# solve. A group the solve cannot take is tiled before the solve, with the
-# planner's tilings, as the pass would have tiled it.
+# Under CP-SAT the span-overflow pass does nothing. The allocator runs the
+# planner instead, before it reads the graph (span_overflow_tilings, called by
+# CoOptimizingAllocator._plan_span_overflow). Each op of a planner group gets a
+# menu: the tilings of it the solve can take. The solve picks one tiling from
+# each menu, and apply_chosen_tilings applies it after the solve. A group the
+# solve cannot take is tiled before the solve with the planner's tilings
+# (apply_planner_tilings), as the pass would have tiled it.
 # --------------------------------------------------------------------------
-
-# The span-overflow pass's own apply (``_apply_span_overflow_groups`` in
-# passes.py), called as apply(graph, groups, dim_hint_assignments).
-SpanOverflowApply = Callable[
-    [GraphLowering, list[tuple], list[tuple[Operation, list]]], None
-]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1132,7 +1127,7 @@ def span_overflow_tilings(graph: GraphLowering) -> SpanOverflowTilings:
     """Run the span-overflow planner, give each op its menu, and split the
     planner's groups by who tiles them.
 
-    LX planning calls this just before the joint solve, in place of the
+    The allocator calls this before the joint solve, in place of the
     span-overflow pass (``solve_decides_span_overflow_tiling``). A group whose
     every op has a menu (:func:`_span_overflow_menu`) is left to the solve. A
     group is left only whole, because it is one loop nest. The other groups are
@@ -1166,25 +1161,66 @@ def span_overflow_tilings(graph: GraphLowering) -> SpanOverflowTilings:
     return SpanOverflowTilings(menus, left, kept, list(dim_hint_assignments))
 
 
+def _tile_planner_groups(
+    graph: GraphLowering,
+    groups: list[tuple],
+    dim_hint_assignments: Sequence[tuple[Operation, list]],
+) -> None:
+    """Tile ``groups`` with the planner's hints."""
+    # span_overflow_groups is a pure planning step: it decides each op's
+    # dim_hints but does not set them.  Apply them now, before
+    # validate_coarse_tile_groups/tile_groups run, since dim_hints is an input
+    # those consume (the plan's hint lookups), not something they produce.
+    # Only the members of ``groups``: an op the solve tiles carries no hints.
+    members = {id(op) for group_ops, _levels in groups for op in group_ops}
+    for op, dim_hints in dim_hint_assignments:
+        if id(op) in members:
+            op.dim_hints = dim_hints  # type: ignore[attr-defined]
+    # Compute offset to avoid loop_group_id collision with any groups already
+    # stamped by splice_while_loops (for_each_tile), or by an earlier call on
+    # the same graph (the groups the solve cannot take, before a failed solve's
+    # fallback tiles the others).
+    # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
+    used_ids = [
+        counted_loop_path(op, include_extern=True)[0]
+        for op in graph.operations
+        if counted_loop_path(op, include_extern=True)
+    ]
+    group_idx_offset = max(used_ids, default=-1) + 1
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    validate_coarse_tile_groups(groups)
+    reject_nested_loops(groups, "span-overflow coarse tiling")
+    request_loop_nodes(
+        graph,
+        tile_groups(
+            graph,
+            groups=groups,
+            group_idx_offset=group_idx_offset,
+        ),
+    )
+
+
 def apply_planner_tilings(
     graph: GraphLowering,
     groups: list[tuple],
-    dim_hint_assignments: list[tuple[Operation, list]],
-    apply: SpanOverflowApply,
+    dim_hint_assignments: Sequence[tuple[Operation, list]],
 ) -> None:
-    """Tile ``groups`` with the planner's tilings, by ``apply``, after work
-    division was left to the solve.
+    """Tile ``groups`` with the planner's tilings.
 
-    The span-overflow pass runs before work division. Here work division has
-    already been deferred (``defer_work_division``), so the ops the tiling adds
-    join the deferred set, as they would have if the pass had added them.
+    The span-overflow pass calls this before work division. Under CP-SAT the
+    allocator calls it instead: for the groups the solve cannot take, before the
+    solve, and for the others if the solve fails. Work division has been
+    deferred by then (``defer_work_division``), so the ops the tiling adds join
+    the deferred set, as they would have if the pass had added them. Before
+    work division nothing is deferred, and nothing joins.
     """
     if not groups:
         return
     from ..work_division import deferred_work_division
 
     before = {op.get_name() for op in graph.operations}
-    apply(graph, groups, dim_hint_assignments)
+    _tile_planner_groups(graph, groups, dim_hint_assignments)
     deferred_work_division(graph).update(
         op.get_name()
         for op in graph.operations
