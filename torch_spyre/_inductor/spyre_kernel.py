@@ -284,6 +284,10 @@ class SpyreOpFuncs:
         return ReductionOp("keepbyindex", [x, indices])
 
     @staticmethod
+    def mask_by_index(x, indices):
+        return ReductionOp("maskbyindex", [x, indices])
+
+    @staticmethod
     def layernormnorm(*args):
         return PointwiseOp("layernormnorm", list(args))
 
@@ -1997,6 +2001,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                     buf.writeline(
                         "count_symbol_sources="
                         f"{_serialize_value(op_spec.count_symbol_sources)},"
+                    )
+                if op_spec.count_from_buffer is not None:
+                    buf.writeline(
+                        "count_from_buffer="
+                        f"{_serialize_value(op_spec.count_from_buffer)},"
                     )
                 buf.writeline("body=[")
                 with buf.indent():
