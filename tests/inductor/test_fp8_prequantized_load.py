@@ -48,6 +48,30 @@ from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
 DEVICE_TYPE = DEVICE.type  # 'spyre' — used for device.type comparisons
 
 
+def _assert_fp8_pipeline_close(out, ref):
+    """Compare an FP8 pipeline output with its CPU reference, in units of std(ref).
+
+    The device quantises the activation differently from the reference (fp16
+    is rounded to 9 mantissa bits on the device, and the E4M3 conversion rounds
+    ties away from zero), and its matmul has a gain of about +0.4%. Measured on
+    the card over 30 shapes (K 512 to 12800) and 3 to 20 seeds each (#5952),
+    out - ref had an rms of at most 1.97% of std(ref), and its largest element
+    was 0.084 * std(ref) beyond 0.02 * |ref|. Both scale with std(ref), i.e.
+    with sqrt(K), so a fixed atol fails at large K. Device and reference are
+    equally far from the exact fp64 product (rms 3.8% of its std).
+
+    Bounds: 0.15 * std(ref) per element (1.8x the largest seen; an exponential
+    fit to the measured tail puts a 1e-3 chance per seed of exceeding 0.116 *
+    std(ref) at 5M elements), and an rms of 3% of std(ref) (1.5x the largest
+    seen), which a 5% gain or scale error exceeds.
+    """
+    out, ref = out.float(), ref.float()
+    sd = ref.std().item()
+    rms = (out - ref).pow(2).mean().sqrt().item()
+    assert rms <= 0.03 * sd, f"rms(out - ref) = {rms:.4g} > 3% of std(ref) = {sd:.4g}"
+    torch.testing.assert_close(out, ref, atol=0.15 * sd, rtol=0.02)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — no model checkpoint required
 # ---------------------------------------------------------------------------
@@ -478,9 +502,7 @@ class TestQuantScalePerTokenFp8WithPrequantizedWeight:
         cpu_ref = q_a_fp16 @ q_b_fp16.T
 
         out_cpu = result.to("cpu").to(torch.float16)
-        # atol=4.0: FP8 quantization error accumulated over K terms (see
-        # test_prequantized_closed_over for tolerance justification).
-        torch.testing.assert_close(out_cpu, cpu_ref, atol=4.0, rtol=0.1)
+        _assert_fp8_pipeline_close(out_cpu, cpu_ref)
 
 
 # ---------------------------------------------------------------------------
