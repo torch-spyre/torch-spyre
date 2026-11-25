@@ -1645,4 +1645,14 @@ def splice_while_loop(
         if op is while_op or while_op not in (getattr(op, "inputs", None) or ())
     ]
 
+    # The while_op's MutationOutputs declare its body's writes to inputs, e.g.
+    # for_each_tile(out=...)'s destination. The spliced body op that does the
+    # write now declares it itself, through its MutationLayoutSHOULDREMOVE
+    # target, so drop the buffers that name the removed while_op as producer.
+    dropped = {id(m) for m in getattr(while_op, "mutation_outputs", None) or ()}
+    if dropped:
+        graph.buffers[:] = [b for b in graph.buffers if id(b) not in dropped]
+        for name in [n for n, b in graph.name_to_buffer.items() if id(b) in dropped]:
+            del graph.name_to_buffer[name]
+
     return body_ops

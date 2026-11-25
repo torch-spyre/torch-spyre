@@ -1,0 +1,156 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+# Where each Model's weights come from. The hub id in `source.uri` is what the runner hands vLLM, so
+# this file is the single place a model's identity is written down.
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: micro-g3.3-8b-instruct-1b-weights, annotations: {revision.state: unpinned}}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/ibm-ai-platform/micro-g3.3-8b-instruct-1b', revision: '0000000000000000000000000000000000000000'}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: granite-3.3-8b-instruct-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/ibm-granite/granite-3.3-8b-instruct', revision: 51dd4bc2ade4059a6bd87649d68aa11e4fb2529b}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: granite-3.3-8b-instruct-fp8-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/ibm-granite/granite-3.3-8b-instruct-FP8', revision: 4b5990b8d402a75febe0086abbf1e490af494e3d}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: granite-4.1-8b-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/ibm-granite/granite-4.1-8b', revision: 1504002f650e656a0a3789d99574df12e3e94ed0}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: granite-4.1-8b-fp8-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/ibm-granite/granite-4.1-8b-fp8', revision: 070021b3608433b6107a00733d561c9779b9937e}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: gemma-4-26b-a4b-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: gemma
+  visibility: public
+  source: {uri: 'hf://models/google/gemma-4-26B-A4B', revision: 24548b62aa021d562695c04aaf7758a1ea47990b}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: gemma-4-26b-a4b-it-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: gemma
+  visibility: public
+  source: {uri: 'hf://models/google/gemma-4-26B-A4B-it', revision: 4d7ae4984b7db7de8f8457170b3f1a419ee76d52}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: ministral-3-14b-instruct-bf16-weights, annotations: {revision.state: unpinned}}
+spec:
+  type: fileset
+  format: safetensors
+  license: apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/mistralai/Ministral-3-14B-Instruct-2512-BF16', revision: '0000000000000000000000000000000000000000'}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: granite-embedding-125m-english-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/ibm-granite/granite-embedding-125m-english', revision: 4ab61ffd423be45cd932b21a7c696063d82bf45f}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: granite-embedding-278m-multilingual-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/ibm-granite/granite-embedding-278m-multilingual', revision: a9cb5338491faf32b73dd17b714a31821c021bbf}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: multilingual-e5-large-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: MIT
+  visibility: public
+  source: {uri: 'hf://models/intfloat/multilingual-e5-large', revision: 3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: all-roberta-large-v1-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/sentence-transformers/all-roberta-large-v1', revision: cf74d8acd4f198de950bf004b262e6accfed5d2c}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: bge-reranker-v2-m3-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: Apache-2.0
+  visibility: public
+  source: {uri: 'hf://models/BAAI/bge-reranker-v2-m3', revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: bge-reranker-large-weights}
+spec:
+  type: fileset
+  format: safetensors
+  license: MIT
+  visibility: public
+  source: {uri: 'hf://models/BAAI/bge-reranker-large', revision: 55611d7bca2a7133960a6d3b71e083071bbfc312}
+  integrity: {revision_pinned: true}
