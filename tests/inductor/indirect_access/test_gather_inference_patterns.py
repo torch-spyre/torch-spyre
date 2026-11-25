@@ -42,11 +42,6 @@ _INDEX_2D_EAGER = rejection(
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
-_FP16_TO_FP32_EAGER = (
-    5856,
-    "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
-)
 _GATHER_OUT_EAGER = rejection(
     4328,
     "aten::gather.out is not registered on Spyre.",
@@ -59,9 +54,9 @@ _GATHER_STICK_MISMATCH = (
     r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _CAST_STAGGERED_READ = rejection(
-    5856,
-    "Eager topk of an fp16 tensor cast to fp32 on device: the fp16 to fp32 copy_from_d2d of a small tensor raises 'staggered read with no unique num-sticks dim'.",
-    r"staggered read with no unique num-sticks dim",
+    3193,
+    "Eager topk of an fp16 tensor cast to fp32 on device: the cast keeps its DL16_TO_FP32 layout and topk (a Reduction) raises 'no mechanism to resolve stick incompatibility'.",
+    r"no mechanism to resolve stick incompatibility",
 )
 _TOPK_CAST_EAGER = (
     5856,
@@ -200,8 +195,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_online_softmax(self, execution_mode):
         """K gather + attention scores + softmax."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         kv = cached_randn((512, 8, 64), differentiation="gpa14", dtype=torch.float16)
         q = cached_randn((8, 4, 64), differentiation="gpa14q", dtype=torch.float16)
         idx = torch.randint(0, 512, (64,), dtype=torch.int64)
@@ -219,8 +212,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_full_attention(self, execution_mode):
         """Full paged attention: gather K + V + attention + weighted V sum."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         kv_k = cached_randn((512, 8, 64), differentiation="gpa15k", dtype=torch.float16)
         kv_v = cached_randn((512, 8, 64), differentiation="gpa15v", dtype=torch.float16)
         q = cached_randn((8, 4, 64), differentiation="gpa15q", dtype=torch.float16)
@@ -583,7 +574,7 @@ class TestGatherInferencePatternsEagerCompile:
         """Beam search: topk beam scores → gather KV rows for top beams."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
         _xfail_existing(
-            execution_mode, eager=_CAST_STAGGERED_READ, compiled=_TOPK_CAST_COMPILED
+            execution_mode, eager=_TOPK_CAST_EAGER, compiled=_TOPK_CAST_COMPILED
         )
         kv = cached_randn((8, 8, 64), differentiation="topk05", dtype=torch.float16)
         beam_scores = cached_randn((8,), differentiation="topk05s", dtype=torch.float16)
