@@ -366,7 +366,7 @@ the lowering's `loop_member`.
 |---|---|
 | `enclosing_loops(op)` | the `LoopLevel`s around `op`, outermost first: `group_path`, `trip_count`, `induction`, `tiled_dims`, `tiled_reduction_dims` |
 | `loop_depth(op)` | the number of levels |
-| `counted_loop_path(op, include_extern=False)` | the group path `op` runs in; `()` for an `ExternKernel` unless `include_extern` is set (it runs once, outside the loop) |
+| `counted_loop_path(op, include_extern=False)` | the group path `op` runs in; `()` for an op that `runs_once_outside_loops` (a Spyre extern kernel, which runs once, outside the loop) unless `include_extern` is set |
 | `is_looped(op)` | whether `op` is a member of a counted loop |
 | `strict_loop_vars(op)` | whether the loop-tiling lowering made the op's loops |
 | `read_advance(op, dep)`, `output_advance(op)` | the per-trip advance of a read or of the write, one entry per level, in host elements |
