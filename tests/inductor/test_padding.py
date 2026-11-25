@@ -2395,7 +2395,10 @@ class TestRecordedPadding(unittest.TestCase):
             return (x[:, : x.shape[1] - 3] + 1).sum(dim=1)
 
         x = torch.ones(4, 64, dtype=torch.float16)
-        result = torch.compile(fn, fullgraph=True, dynamic=True)(x.to("spyre"))
+        x_dev = x.to("spyre")
+        # Spyre refuses dynamic=True; declare the varying dim on the tensor.
+        torch._dynamo.mark_dynamic(x_dev, 1)
+        result = torch.compile(fn, fullgraph=True)(x_dev)
         torch.testing.assert_close(result.cpu(), fn(x))
 
     # TODO(mbayser): SpyreTensorLayout's operator== (and std::hash) skip the
