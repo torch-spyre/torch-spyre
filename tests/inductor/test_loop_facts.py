@@ -17,7 +17,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import torch  # noqa: F401
+import torch
 import sympy
 from torch._inductor.ir import ExternKernel
 
@@ -47,8 +47,10 @@ def _op(info=None):
     return SimpleNamespace(loop_member=info) if info is not None else SimpleNamespace()
 
 
-def _extern(info):
+def _extern(info, device="spyre"):
     op = MagicMock(spec=ExternKernel)
+    op.is_no_op.return_value = False
+    op.get_device.return_value = torch.device(device)
     op.loop_member = info
     return op
 
@@ -89,6 +91,20 @@ def test_extern_excluded_by_default():
     op = _extern(_info((0,), [4]))
     assert counted_loop_path(op) == ()
     assert counted_loop_path(op, include_extern=True) == (0,)
+
+
+def test_an_extern_on_another_device_sits_in_its_loop():
+    """A CPU extern kernel is no different from any op: ``runs_once_outside_loops``
+    is Spyre's rule, so ``counted_loop_path`` reports its loop."""
+    op = _extern(_info((0,), [4]), device="cpu")
+    assert counted_loop_path(op) == (0,)
+    assert len(enclosing_loops(op)) == 1
+
+
+def test_a_spyre_extern_no_op_sits_in_its_loop():
+    op = _extern(_info((0,), [4]))
+    op.is_no_op.return_value = True
+    assert counted_loop_path(op) == (0,)
 
 
 def test_default_tiled_reduction_dims_is_still_a_loop():

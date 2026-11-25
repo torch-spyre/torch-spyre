@@ -1184,6 +1184,18 @@ def test_an_extern_in_a_nested_body_moves_before_the_outermost_node():
     assert not hasattr(ext, "loop_member")
 
 
+def test_an_extern_outside_the_first_and_last_member_stays_where_it_is():
+    """An extern with a ``loop_member`` just before the first member or after the
+    last is in no span, so node build leaves it where it is (its record stays)."""
+    a, b = _Op("a", gid=(0,), counts=[4]), _Op("b", gid=(0,), counts=[4])
+    before = _Extern("before", gid=(0,), counts=[4])
+    after = _Extern("after", gid=(0,), counts=[4])
+    graph = _graph([before, a, b, after])
+    collapse(graph)
+    assert _names(graph.operations) == ["before", "loopnode0", "after"]
+    assert _names(graph.operations[1].body) == ["a", "b"]
+
+
 def test_two_sibling_loops_each_get_their_own_extern_first():
     a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
     c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])

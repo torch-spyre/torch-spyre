@@ -30,6 +30,7 @@ import sympy
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ExternKernel, Operation
 
+from .constants import DEVICE_NAME
 from .errors import Unsupported
 
 
@@ -175,17 +176,38 @@ def loop_depth(op: Operation) -> int:
     return len(enclosing_loops(op))
 
 
+def runs_once_outside_loops(op: Operation) -> bool:
+    """True for an op Spyre runs once, outside every counted loop: an extern
+    kernel on the Spyre device. Spyre's codegen cannot run one inside a counted
+    loop. An allocation (a zero-element ``ComputedBuffer``) is not an extern
+    kernel and stays where it is placed. The ``is_no_op()`` clause mirrors
+    ``Scheduler.create_scheduler_node``, which checks ``node.is_no_op()`` first
+    for any op and makes a ``NopKernelSchedulerNode``: an op the scheduler treats
+    as a no-op is not an extern kernel it refuses to run in a loop.
+
+    The rule is Spyre codegen's, so an extern kernel on another device (a graph
+    lowered on CPU tensors, whose matmul is ``aten.mm``) stays where it is placed.
+    One whose device is unknown (no ``get_device``, or ``None``) counts as Spyre,
+    the safe side."""
+    if not isinstance(op, ExternKernel) or op.is_no_op():
+        return False
+    get_device = getattr(op, "get_device", None)
+    dev = get_device() if callable(get_device) else None
+    return dev is None or dev.type == DEVICE_NAME
+
+
 def counted_loop_path(
     op: Operation, *, include_extern: bool = False
 ) -> tuple[int, ...]:
     """The counted-loop group path ``op`` runs in, outermost first; ``()`` if none.
 
-    An ``ExternKernel`` keeps its ``loop_member`` (e.g. a hoisted loop-body
-    constant) but runs once, outside the loop, so it yields ``()`` unless
-    ``include_extern`` is set.  A malformed id yields ``()`` rather than
-    raising.
+    An op that :func:`runs_once_outside_loops` (a Spyre extern kernel that does
+    work) yields ``()`` unless ``include_extern`` is set: node build moves it out
+    of its loop and deletes its ``loop_member``, so before the build ``include_extern``
+    reads the lowering's record. An extern kernel on another device sits in its
+    loop like any op.  A malformed id yields ``()`` rather than raising.
     """
-    if isinstance(op, ExternKernel) and not include_extern:
+    if not include_extern and runs_once_outside_loops(op):
         return ()
     if _in_built_node(op):
         return tuple(node.group_id for node in op._loop_chain)  # type: ignore[attr-defined]

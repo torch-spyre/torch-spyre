@@ -332,7 +332,8 @@ writes, is refused (`Unsupported`): before the loop it would read a value not ye
 produced, or change what the body reads. The refusal set also includes a body
 allocation and a non-member output the extern reads: the old scheduler hoisted
 both, and refusing them is harmless. An extern kernel on another device is not
-moved. `expand` leaves a
+moved. An extern with a `loop_member` that sits just before the first member or
+after the last is in no span, so node build leaves it where it is. `expand` leaves a
 moved op where it was moved. `collapse`
 (called at the end of `splice_while_loops`) and `build_pending_loop_nodes` (for
 the loop-tiling lowering) call `_wrap` and then `_record_node_facts`, which:
@@ -423,7 +424,11 @@ A Spyre extern kernel (one that `runs_once_outside_loops`) never goes in a body;
 one on another device is placed like any op. `insert_before`, `insert_after`,
 `move_before` and `move_after` put one next to a body anchor before the anchor's
 outermost loop (or raise `Unsupported` if it reads what the loop writes, or writes
-what the loop reads or writes); `insert_at_start`,
+what the loop reads or writes). The refusal comes from the graph's content, an
+extern that needs data from inside the loop, which Spyre cannot run there: a limit,
+not an API misuse. The redirect is sound because it succeeds only when the extern
+reads nothing the loop writes, and the anchor's output is among those, so before
+the loop is equivalent to after the anchor. `insert_at_start`,
 `insert_on_back_edge` and `replace_op` name a body position, so they raise
 `ValueError` for one. An allocation (a no-op) can still go in a body.
 
