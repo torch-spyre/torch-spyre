@@ -325,6 +325,10 @@ def _collective_accesses_buffer(graph: GraphLowering, uses: list[int]) -> bool:
     buffer out of LX: the wrapper then names a buffer it never allocated
     (torch-spyre#6563). A validated drain plan, which repoints the collective at
     an HBM copy, is the one exception (see the residency rule).
+
+    Only the ops that access the buffer matter, not its whole live range as in
+    :func:`_extern_kernel_in_live_range`: a collective never uses LX, so one that
+    runs while the buffer is resident cannot overwrite it.
     """
     return any(isinstance(graph.operations[i], _CollectiveKernel) for i in uses)
 
