@@ -414,6 +414,12 @@ body op keeps the op in that body (it runs every trip). Each helper keeps the op
 `_loop_chain` and the nodes' `tiling` right, and each accepts the `OpsView` or the
 real nested list.
 
+An extern kernel never goes in a body. `insert_before`, `insert_after`, `move_before`
+and `move_after` put one next to a body anchor before the anchor's outermost loop
+(or raise `Unsupported` if it reads what the loop writes); `insert_at_start`,
+`insert_on_back_edge` and `replace_op` name a body position, so they raise
+`ValueError` for one. An allocation (a no-op) can still go in a body.
+
 ### Telling the nodes what a new op is
 
 An op placed in a body has a chain but is not yet a member. A pass that creates an

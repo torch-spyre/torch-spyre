@@ -62,7 +62,9 @@ from torch_spyre._inductor.loop_node import (
     expand,
     in_building_loop,
     insert_after,
+    insert_at_start,
     insert_before,
+    insert_on_back_edge,
     move_after,
     move_before,
     owning_list,
@@ -1260,3 +1262,102 @@ def test_expand_after_a_move_keeps_producers_first():
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+# ---------------------------------------------------------------------------
+# The edit helpers never put an extern kernel in a loop body
+# ---------------------------------------------------------------------------
+
+
+def test_inserting_an_extern_next_to_a_body_op_lands_before_the_outer_loop():
+    a = _Op("a")
+    node = _node("n0", [_node("n1", [a])])
+    real = [_Op("pre"), node]
+    insert_after(real, a, _Extern("ext"))
+    assert _names(real) == ["pre", "ext", "n0"]
+    real = [_Op("pre"), node]
+    insert_before(real, a, _Extern("ext2"))
+    assert _names(real) == ["pre", "ext2", "n0"]
+    assert _names(all_ops(node.body)) == ["a"]
+
+
+def test_moving_an_extern_next_to_a_body_op_lands_before_the_outer_loop():
+    a = _Op("a")
+    node = _node("n0", [_node("n1", [a])])
+    ext = _Extern("ext")
+    real = [_Op("pre"), node, ext]
+    move_after(real, a, ext)
+    assert _names(real) == ["pre", "ext", "n0"]
+    ext2 = _Extern("ext2")
+    real = [node, ext2]
+    move_before(real, a, ext2)
+    assert _names(real) == ["ext2", "n0"]
+
+
+def test_externs_placed_next_to_a_body_keep_their_order():
+    a = _Op("a")
+    node = _node("n0", [a])
+    real = [node]
+    insert_after(real, a, _Extern("e1"))
+    insert_after(real, a, _Extern("e2"))
+    assert _names(real) == ["e1", "e2", "n0"]
+
+
+def test_an_extern_inserted_next_to_a_top_level_op_stays_put():
+    pre = _Op("pre")
+    node = _node("n0", [_Op("a")])
+    real = [pre, node]
+    insert_after(real, pre, _Extern("ext"))
+    assert _names(real) == ["pre", "ext", "n0"]
+    insert_after(real, node, _Extern("post"))
+    assert _names(real) == ["pre", "ext", "n0", "post"]
+
+
+def test_inserting_an_extern_that_reads_what_the_loop_writes_is_refused():
+    a = _Op("a")
+    node = _node("n0", [a])
+    real = [node]
+    with pytest.raises(Unsupported, match=r"reads \['a'\], which the loop writes"):
+        insert_after(real, a, _Extern("ext", reads=["a"]))
+    assert real == [node]
+    ext = _Extern("ext2", reads=["a"])
+    real = [node, ext]
+    with pytest.raises(Unsupported, match="cannot be placed before the loop"):
+        move_before(real, a, ext)
+    assert real == [node, ext]  # a refused move changes nothing
+
+
+def test_explicit_body_positions_refuse_an_extern():
+    for place in (
+        lambda n, op: insert_at_start(n, op),
+        lambda n, op: insert_on_back_edge(n, op),
+    ):
+        node = _node("n0", [_Op("a")])
+        with pytest.raises(ValueError, match="cannot run in a loop body"):
+            place(node, _Extern("ext"))
+        assert _names(node.body) == ["a"]
+    a = _Op("a")
+    node = _node("n0", [a])
+    real = [node]
+    with pytest.raises(ValueError, match="cannot run in a loop body"):
+        replace_op(real, a, _Extern("ext"))
+    assert node.body == [a]
+
+
+def test_replacing_a_top_level_op_by_an_extern_is_allowed():
+    pre = _Op("pre")
+    real = [pre]
+    ext = _Extern("ext")
+    replace_op(real, pre, ext)
+    assert real == [ext]
+
+
+def test_an_allocation_can_still_go_in_a_body():
+    a = _Op("a")
+    node = _node("n0", [a])
+    real = [node]
+    insert_after(real, a, _Alloc("alloc"))
+    assert _names(node.body) == ["a", "alloc"]
+    insert_at_start(node, _Alloc("alloc2"))
+    insert_on_back_edge(node, _Alloc("alloc3"))
+    assert _names(node.body) == ["alloc2", "a", "alloc", "alloc3"]

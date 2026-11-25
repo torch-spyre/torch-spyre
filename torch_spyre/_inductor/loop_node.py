@@ -600,6 +600,30 @@ def _take_donor_tiling(entry: ir.Operation) -> None:
                 node.tiling[leaf.get_name()] = node.tiling[donor.get_name()]
 
 
+def _extern_entry(
+    real: list[ir.Operation], anchor: ir.Operation, op: ir.Operation
+) -> ir.Operation | None:
+    """The top-level entry ``op`` must go before, when ``op`` runs once and
+    ``anchor`` sits in a loop body; ``None`` when ``op`` goes next to ``anchor``.
+    Raises ``Unsupported`` if ``op`` reads what that loop writes."""
+    if not runs_once_outside_loops(op):
+        return None
+    entry = top_level_entry(real, anchor)
+    if entry is anchor:
+        return None
+    assert isinstance(entry, LoopNode)
+    _place_before_loop([], entry, [op])
+    return entry
+
+
+def _refuse_extern_in_body(op: ir.Operation) -> None:
+    if runs_once_outside_loops(op):
+        raise ValueError(
+            f"{type(op).__name__} {op.get_name()} is an extern kernel; an extern "
+            "kernel cannot run in a loop body"
+        )
+
+
 def insert_before(
     operations: "list[ir.Operation] | OpsView",
     anchor: ir.Operation,
@@ -613,9 +637,14 @@ def insert_before(
     ``operations`` may be the flat :class:`OpsView` a pass is handed. Unlike
     ``view.insert(view.index(x), op)``, naming a node puts the op outside it even
     when the node's first member is the next flat op.
+
+    An extern kernel (:func:`runs_once_outside_loops`) never goes in a body: next
+    to a body op it goes before the anchor's outermost loop, or ``Unsupported``
+    is raised if it reads what that loop writes.
     """
     real = _real_list(operations)
-    lst, i = _holder(real, anchor)
+    entry = _extern_entry(real, anchor, op)
+    lst, i = _holder(real, anchor if entry is None else entry)
     lst.insert(i, op)
     _adopt(real, op)
 
@@ -634,8 +663,17 @@ def insert_after(
     goes next to its anchor in the nested list. ``view.insert`` cannot say that, and
     puts an op inserted past the last flat position at the top level, outside the
     loop it was meant for.
+
+    An extern kernel never goes in a body: next to a body op it goes before the
+    anchor's outermost loop (see :func:`insert_before`), not after the anchor.
     """
     real = _real_list(operations)
+    entry = _extern_entry(real, anchor, op)
+    if entry is not None:
+        lst, i = _holder(real, entry)
+        lst.insert(i, op)
+        _adopt(real, op)
+        return
     lst, i = _holder(real, anchor)
     lst.insert(i + 1, op)
     _adopt(real, op)
@@ -667,10 +705,13 @@ def replace_op(
 ) -> None:
     """Put ``new`` where ``old`` is, in whichever list holds ``old``.
 
-    Raises ``ValueError`` if ``old`` is not in ``operations``.
+    Raises ``ValueError`` if ``old`` is not in ``operations``, or if ``new`` is an
+    extern kernel and ``old`` is in a loop body (an extern cannot run there).
     """
     real = _real_list(operations)
     lst, i = _holder(real, old)
+    if lst is not real:
+        _refuse_extern_in_body(new)
     lst[i] = new
     _set_chain(new, tuple(getattr(old, "_loop_chain", ())))
     # ``new`` may reuse ``old``'s name (replace_computed_buffer_body does) with a
@@ -712,6 +753,7 @@ def _move(
     # Find both before touching either list, so a missing one changes nothing.
     _holder(real, op)
     _holder(real, anchor)
+    _extern_entry(real, anchor, op)  # refuse before anything is detached
     if isinstance(op, LoopNode) and owning_list(op.body, anchor) is not None:
         # Taking the node out would take the anchor with it.
         raise ValueError(f"cannot move {op!r} relative to {anchor!r}, which it holds")
@@ -731,7 +773,8 @@ def move_before(
     placement rule is :func:`insert_before`'s: before a node the op is outside the
     loop, before a body op it is in that body. ``op`` may come from any list, and
     may be a :class:`LoopNode` (it moves with its body) as long as ``anchor`` is not
-    inside it.
+    inside it. An extern kernel goes before the anchor's outermost loop, or is
+    refused (:func:`insert_before`).
     """
     _move(operations, anchor, op, after=False)
 
@@ -742,13 +785,15 @@ def move_after(
     op: ir.Operation,
 ) -> None:
     """Move ``op``, already in the graph, to immediately after ``anchor``
-    (:func:`insert_after`'s placement rule)."""
+    (:func:`insert_after`'s placement rule: an extern kernel goes before the
+    anchor's outermost loop, or is refused)."""
     _move(operations, anchor, op, after=True)
 
 
 def insert_at_start(node: LoopNode, op: ir.Operation) -> None:
     """Insert ``op`` as the first entry of ``node``'s body: it runs every trip,
-    before the rest of the body."""
+    before the rest of the body. An extern kernel cannot run there: ``ValueError``."""
+    _refuse_extern_in_body(op)
     node.body.insert(0, op)
     _set_chain(op, _chain_of(node))
     _fill_tiling(op)
@@ -765,7 +810,10 @@ def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
     0.785). The position is the guarantee, so there is nothing to search for
     and nothing to check; a caller that wants an op NEAR an update, not at the
     end, wants :func:`insert_after` and owns that choice.
+
+    An extern kernel cannot run in a body: ``ValueError``.
     """
+    _refuse_extern_in_body(op)
     node.body.append(op)
     _set_chain(op, _chain_of(node))
     _fill_tiling(op)
