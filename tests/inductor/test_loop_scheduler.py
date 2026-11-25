@@ -45,7 +45,7 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.scheduler import (
-    ExternKernelSchedulerNode,
+    NopKernelSchedulerNode,
     Scheduler,
     SchedulerNode,
 )
@@ -80,6 +80,13 @@ def _current():
 
 def _version(text):
     return mock.patch.object(torch, "__version__", text)
+
+
+class _NopExtern(ir.ExternKernel):
+    """An op whose ``is_no_op()`` is true, like a zero-element allocation."""
+
+    def is_no_op(self):
+        return True
 
 
 class _Graph(unittest.TestCase):
@@ -134,11 +141,11 @@ class _Graph(unittest.TestCase):
         V.graph.name_to_op[name] = buf
         return buf
 
-    def _extern(self, name, reads="x"):
+    def _extern(self, name, reads="x", device="cpu", cls=ir.ExternKernel):
         src = V.graph.name_to_buffer.get(reads) or self._input(reads)
-        op = ir.ExternKernel(
+        op = cls(
             None,
-            FixedLayout(torch.device("cpu"), torch.float32, [8], [1]),
+            FixedLayout(torch.device(device), torch.float32, [8], [1]),
             [src],
         )
         op.name = name
@@ -146,6 +153,10 @@ class _Graph(unittest.TestCase):
         V.graph.name_to_buffer[name] = op
         V.graph.name_to_op[name] = op
         return op
+
+    def _nop(self, name, reads="x"):
+        """A no-op op (an allocation): ``is_no_op()`` is true."""
+        return self._extern(name, reads=reads, cls=_NopExtern)
 
     @staticmethod
     def _loop(name, body, trip=4):
@@ -657,9 +668,9 @@ class TestSchedulerFrontHalf(_Graph):
         self.assertEqual([n.get_name() for n in loop_snode.get_nodes()], ["upd", "rd"])
         self.assertIn("acc", loop_snode.ancestors)
 
-    def test_extern_in_body_lands_immediately_before_its_loop(self):
+    def test_nop_in_body_lands_immediately_before_its_loop(self):
         pre = self._buf("pre", reads="x")
-        ext = self._extern("ext", reads="x")
+        ext = self._nop("ext", reads="x")
         t = self._buf("t", reads="pre")
         self.outputs = ["t", "ext"]
         loop = self._loop("loopnode0", [ext, t])
@@ -668,16 +679,16 @@ class TestSchedulerFrontHalf(_Graph):
         sched.update_zero_dim_cpu_tensor()
         names = [n.get_name() for n in sched.nodes]
         self.assertEqual(names, ["pre", "ext", "loopnode0"])
-        self.assertIsInstance(sched.nodes[1], ExternKernelSchedulerNode)
+        self.assertIsInstance(sched.nodes[1], NopKernelSchedulerNode)
         self.assertNotIn("ext", [n.get_name() for n in sched.nodes[2].get_nodes()])
 
     def test_each_loops_hoisted_op_lands_before_its_own_loop(self):
         # The prototype's one module-level list put every hoisted op before
         # the FIRST loop.
-        e0 = self._extern("e0", reads="x")
+        e0 = self._nop("e0", reads="x")
         t0 = self._buf("t0", reads="x")
         mid = self._buf("mid", reads="t0")
-        e1 = self._extern("e1", reads="mid")
+        e1 = self._nop("e1", reads="mid")
         t1 = self._buf("t1", reads="mid")
         sched = self._scheduler()
         ops = [self._loop("loopnode0", [e0, t0]), mid]
@@ -718,8 +729,8 @@ class TestSchedulerFrontHalf(_Graph):
         self.assertEqual([n.get_name() for n in nodes], ["a", "mut", "loopnode0"])
         self.assertIn("mut", set(nodes[2].ancestors))
 
-    def test_extern_in_nested_body_lands_before_the_outermost_loop(self):
-        ext = self._extern("ext", reads="x")
+    def test_nop_in_nested_body_lands_before_the_outermost_loop(self):
+        ext = self._nop("ext", reads="x")
         a = self._buf("a", reads="x")
         b = self._buf("b", reads="a")
         self.outputs = ["b", "ext"]
@@ -728,7 +739,7 @@ class TestSchedulerFrontHalf(_Graph):
         self.assertEqual([n.get_name() for n in nodes], ["ext", "loopnode0"])
 
     def test_hoisted_state_is_per_scheduler(self):
-        ext = self._extern("ext", reads="x")
+        ext = self._nop("ext", reads="x")
         t = self._buf("t", reads="x")
         loop = self._loop("loopnode0", [ext, t])
         first = self._scheduler()
@@ -757,13 +768,25 @@ class TestSchedulerFrontHalf(_Graph):
     def test_hoisted_op_reading_a_loop_buffer_is_refused(self):
         # Hoisting it before the loop would put it before its producer.
         t = self._buf("t", reads="x")
-        ext = self._extern("ext", reads="t")
+        ext = self._nop("ext", reads="t")
         loop = self._loop("loopnode0", [t, ext])
         with self.assertRaisesRegex(Unsupported, "ext"):
             self._scheduler().create_scheduler_node(loop)
 
+    def test_an_extern_scheduler_node_in_a_body_trips_the_assertion(self):
+        # The IR places a Spyre extern kernel before its loop; one still in a
+        # body is a pass bug, not something the scheduler moves.
+        t = self._buf("t", reads="x")
+        ext = self._extern("ext", reads="x", device="spyre")
+        loop = self._loop("loopnode0", [ext, t])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "extern kernel .* in the body of .*: the IR places it before the loop",
+        ):
+            self._scheduler().create_scheduler_node(loop)
+
     def test_body_with_no_kernel_is_refused(self):
-        ext = self._extern("ext", reads="x")
+        ext = self._nop("ext", reads="x")
         loop = self._loop("loopnode0", [ext])
         with self.assertRaises(Unsupported):
             self._scheduler().create_scheduler_node(loop)

@@ -43,7 +43,13 @@ from unittest import mock
 import pytest
 import torch
 import torch.nn.functional as F
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+from torch._inductor.ir import (
+    ComputedBuffer,
+    ExternKernel,
+    FallbackKernel,
+    FlexibleLayout,
+    Pointwise,
+)
 from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
@@ -63,7 +69,6 @@ from torch_spyre._inductor.loop_node import (
     LoopNode,
     all_ops,
     insert_after,
-    insert_at_start,
     record_member,
     remove_op,
 )
@@ -772,21 +777,15 @@ def test_constant_written_in_a_body_runs_once_before_the_loop():
 
 
 def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
-    """With a constant inside the LoopNode at the hand-off,
-    ``create_scheduler_node`` makes it an extern scheduler node and places it
-    immediately before its loop, so it runs once.  The hoisting rule assumes a
-    hoisted op gives the same result every trip; that holds here (a constant) and
-    is not checked."""
+    """A pass that put an extern kernel in a LoopNode body by direct list
+    manipulation (bypassing ``insert_at_start``, which refuses it) reaches the
+    scheduler's assertion: ``create_scheduler_node`` raises ``RuntimeError``
+    rather than silently moving the extern before its loop."""
     X, Y = _matmul_inputs()
     seen: dict = {}
     real = ts_passes._hand_off_loop_nodes
 
     def hand_off(graph):
-        # Put the body's constant (dedup hoisted it out of the body) at the head
-        # of the LoopNode's body, after the pass loop and before the hand-off.
-        # Production keeps it outside (see the test above; the passes'
-        # re-collapse moves it out again), so this is what reaches the
-        # scheduler's own hoisting rule on a real compile.
         node = next(op for op in graph.operations if isinstance(op, LoopNode))
         # The body's ``torch.full((M, N), 0.5)`` (``_scaled_split_k_fn``); the graph's
         # other constants are not from the loop body.
@@ -796,23 +795,56 @@ def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
             if isinstance(op, SpyreConstantFallback) and op.constant_args[0] == 0.5
         )
         remove_op(graph.operations, constant)
-        insert_at_start(node, constant)
+        node.body.insert(0, constant)
         seen["body_externs"] = [constant.get_name()]
         real(graph)
 
     def patch():
         return mock.patch.object(ts_passes, "_hand_off_loop_nodes", hand_off)
 
-    nodes = _compile(_scaled_split_k_fn, (X, Y), patch)
-    assert seen["body_externs"], "no extern op was inside a LoopNode"
-    shape = nodes["pre_fusion"]
-    loop_at = next(i for i, e in enumerate(shape) if isinstance(e[1], list))
-    # Immediately before its loop, and nothing but kernels inside it.
-    assert shape[loop_at - 1][0] == "once", shape
-    assert all(e[0] == "kernel" for e in shape[loop_at][1]), shape
-    _assert_compiled_with_nodes(nodes)
+    with pytest.raises(
+        Exception,
+        match=r"extern kernel .* in the body of .*: the IR places it before the loop",
+    ):
+        _compile(_scaled_split_k_fn, (X, Y), patch)
+    assert seen["body_externs"], "no extern op was put inside a LoopNode"
+
+
+def test_the_cumsum_mask_extern_sits_before_its_loop_at_the_hand_off():
+    """cumsum's ``triu`` mask is a ``FallbackKernel``.  At the hand-off no
+    LoopNode body holds an extern kernel, and the mask precedes its loop."""
+    X, Y = _matmul_inputs()
+    seen: dict = {}
+    real = ts_passes._hand_off_loop_nodes
+
+    def hand_off(graph):
+        ops = list(graph.operations)
+        loops = [op for op in ops if isinstance(op, LoopNode)]
+        seen["loops"] = len(loops)
+        seen["body_externs"] = [
+            op.get_name()
+            for loop in loops
+            for op in all_ops(loop.body)
+            if isinstance(op, ExternKernel)
+        ]
+        first_loop = next(i for i, op in enumerate(ops) if isinstance(op, LoopNode))
+        seen["fallbacks_before"] = [
+            op.get_name() for op in ops[:first_loop] if isinstance(op, FallbackKernel)
+        ]
+        real(graph)
+
+    def patch():
+        return mock.patch.object(ts_passes, "_hand_off_loop_nodes", hand_off)
+
+    nodes = _compile(_cumsum_split_k_fn, (X, Y), patch)
+    assert seen["loops"], "no LoopNode at the hand-off"
+    assert seen["body_externs"] == [], seen
+    assert seen["fallbacks_before"], "the mask FallbackKernel is not before the loop"
     torch.testing.assert_close(
-        nodes["out"].float(), 0.5 * _split_k_reference(X, Y), atol=1e-2, rtol=1e-2
+        nodes["out"].float(),
+        torch.cumsum(_split_k_reference(X, Y), dim=0),
+        atol=5e-2,
+        rtol=1e-2,
     )
 
 

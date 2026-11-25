@@ -60,7 +60,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .errors import Unsupported
 from .loop_facts import counted_loop_path
-from .loop_node import LoopNode, expand
+from .loop_node import LoopNode, expand, runs_once_outside_loops
 from .scheduler import CountedLoopSchedulerNode
 
 # One torch release at a time: the one ``pyproject.toml`` pins (``torch~=2.14.0``).
@@ -76,7 +76,8 @@ SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
 PATCHED_SURFACE: tuple[str, ...] = (
     # Patched (per compile, restored afterwards).
     "patched: Scheduler.create_scheduler_node -- a LoopNode becomes one "
-    "LoopSchedulerNode; no-op and extern body ops are hoisted",
+    "LoopSchedulerNode; no-op (allocation) body ops are hoisted, an extern "
+    "kernel in a body is refused",
     "patched: Scheduler.update_zero_dim_cpu_tensor -- first call after "
     "Scheduler._init builds self.nodes; splices the hoisted ops in and puts "
     "graph.operations back to the leaf ops",
@@ -158,7 +159,7 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
     changes.  Every body buffer's ``defining_op`` is the outermost loop node,
     the node that is in ``Scheduler.nodes``.
 
-    ``hoisted`` holds the no-op and extern scheduler nodes of the body
+    ``hoisted`` holds the no-op (allocation) scheduler nodes of the body
     (nested bodies included), in body order, until the scheduler splices them
     in front of the loop.
     """
@@ -342,11 +343,16 @@ def _build_loop_scheduler_node(
 ) -> LoopSchedulerNode:
     """Create the scheduler nodes of ``loop_node``'s body and wrap them.
 
-    A no-op (an allocation that generates no code) or an extern kernel is not
-    a kernel, and Spyre's codegen rejects it inside a counted loop.  They are
-    created as ordinary nodes and placed immediately before their (outermost)
-    loop.  One that reads a buffer the loop writes cannot go before it, and is
-    refused.
+    The IR guarantees no Spyre extern kernel is in a body: node build and the
+    edit helpers place it before the loop (``runs_once_outside_loops``).  One
+    reaching here is a bug in a pass that bypassed them, and raises
+    ``RuntimeError`` rather than being silently moved.
+
+    A no-op (an allocation that generates no code) is not a kernel.  It is
+    created as an ordinary node and emitted once, immediately before its
+    (outermost) loop's kernel.  That is a code-generation detail, and it is
+    equivalent: a pooled allocation is static and has no data effect.  One that
+    reads a buffer the loop writes cannot go before it, and is refused.
     """
     children: list[BaseSchedulerNode] = []
     hoisted: list[BaseSchedulerNode] = []
@@ -359,6 +365,11 @@ def _build_loop_scheduler_node(
             children.append(inner)
             continue
         snode = scheduler.create_scheduler_node(op)
+        if isinstance(snode, ExternKernelSchedulerNode) and runs_once_outside_loops(op):
+            raise RuntimeError(
+                f"extern kernel {snode.get_name()} in the body of "
+                f"{loop_node.get_name()}: the IR places it before the loop"
+            )
         if isinstance(snode, (NopKernelSchedulerNode, ExternKernelSchedulerNode)):
             hoisted.append(snode)
         else:

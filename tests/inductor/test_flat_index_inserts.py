@@ -30,8 +30,8 @@ mutators raise), so a pass names the anchor with ``insert_after`` / ``move_after
 * The allocator's clone placement (``GraphEditor._place_clone``) is pinned in
   ``test_graph_editor_placement.py``.
 * ``lx_context_switching``'s restore is not changed. Its target is an extern kernel,
-  and a body whose extern kernel reads a value the loop writes is refused by the loop
-  scheduler. One that reads only a loop-invariant value does reach the bracket, and the
+  and a body whose extern kernel reads a value the loop writes is refused at node
+  build. One that reads only a loop-invariant value does reach the bracket, and the
   compile then fails in ``compute_ancestors`` for a reason that is not the restore's
   placement (#6217). Not covered here.
 """

@@ -512,9 +512,14 @@ reads `min_order` and `max_order` before `compute_ancestors` has set them, and
 leaves `node` unset where `compute_dependencies` expects one. It carries the
 `LoopNode` as `node`, and `loop_count` is the node's `trip_count`.
 
-- **Hoisting.** A no-op or extern body op becomes an ordinary scheduler node placed
-  immediately before the outermost loop, since it runs once. One that reads a
-  buffer the loop writes is refused with `Unsupported`.
+- **Allocations.** The IR guarantees that no Spyre extern kernel is in a body: node
+  build and the edit helpers place it before the loop (`runs_once_outside_loops`).
+  One that reaches the scheduler is a bug in a pass that bypassed them, and raises
+  `RuntimeError`. A no-op body op (an allocation) becomes an ordinary scheduler node
+  emitted once, immediately before the outermost loop's kernel. This is a
+  code-generation detail and is equivalent, because a pooled allocation is static
+  and has no data effect. One that reads a buffer the loop writes is refused with
+  `Unsupported`.
 - **Membership.** Every kernel op directly in a body must be a member of that
   loop, with one group path (`_check_members`). An op without membership would run
   every trip, so it is refused rather than run wrongly.
