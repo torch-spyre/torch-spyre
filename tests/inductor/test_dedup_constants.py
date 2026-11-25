@@ -1380,7 +1380,14 @@ class TestDedupConstantsWithLoopNodes(_PassLevelBase):
 
         return nested_online_softmax_fn, args()
 
-    def test_body_constants_leave_their_loop_and_duplicates_are_removed(self) -> None:
+    def test_body_constants_arrive_outside_their_loop_and_duplicates_are_removed(
+        self,
+    ) -> None:
+        """Node build already places a constant written in a loop body before its
+        loop (it is an extern kernel, which runs once), so the pass sees every
+        constant at the top level and removes the duplicates there. The pass's own
+        path for a constant inside a body is
+        ``test_a_constant_inside_a_body_is_hoisted_to_the_head``."""
         fn, args = self._nested_fixture()
         seen: dict[str, Any] = {}
 
@@ -1389,10 +1396,10 @@ class TestDedupConstantsWithLoopNodes(_PassLevelBase):
 
             real = graph.operations
             before = self._tree_constants(real)
-            # PRECONDITION: the fixture must put constants inside a loop body and
-            # contain a duplicate, or this exercises nothing.
-            assert any(depth > 0 for _, depth, _ in before), (
-                "PRECONDITION: no constant inside a loop body",
+            # PRECONDITION: node build left no constant in a body, the graph holds
+            # a node, and it contains a duplicate, or this exercises nothing.
+            assert before and all(depth == 0 for _, depth, _ in before), (
+                "PRECONDITION: a constant inside a loop body after node build",
                 before,
             )
             assert any(isinstance(op, LoopNode) for op in real), "PRECONDITION: no node"
@@ -1412,6 +1419,57 @@ class TestDedupConstantsWithLoopNodes(_PassLevelBase):
         self.assertEqual({depth for _, depth, _ in after}, {0}, after)
         self.assertEqual([i for _, _, i in after], list(range(len(after))), after)
         self.assertLess(len(after), seen["n_before"])
+
+    def test_a_constant_inside_a_body_is_hoisted_to_the_head(self) -> None:
+        """The pass's node-aware path: a constant inside a loop body (put there by
+        hand, since node build and the edit helpers keep extern kernels out of
+        bodies) leaves it through ``OpsView.hoist_to_front`` and lands with the
+        other constants at the head of the graph."""
+        fn, args = self._nested_fixture()
+        seen: dict[str, Any] = {}
+
+        def innermost(node):
+            from torch_spyre._inductor.loop_node import LoopNode
+
+            chain = [node]
+            while True:
+                inner = [op for op in chain[-1].body if isinstance(op, LoopNode)]
+                if not inner:
+                    return chain
+                chain.append(inner[0])
+
+        def cb(graph: GraphLowering) -> None:
+            from torch_spyre._inductor.loop_node import LoopNode
+
+            real = graph.operations
+            constants = [op for op in real if isinstance(op, SpyreConstantFallback)]
+            keys = [(c.constant_args[0], c.layout.dtype) for c in constants]
+            unique = [c for c, k in zip(constants, keys) if keys.count(k) == 1]
+            assert unique, ("PRECONDITION: no constant without a duplicate", keys)
+            node = next((op for op in real if isinstance(op, LoopNode)), None)
+            assert node is not None, "PRECONDITION: no node"
+            # Bypass the edit helpers (they refuse an extern kernel in a body):
+            # put the constant at the head of the innermost body by hand.
+            const = unique[-1]
+            chain = innermost(node)
+            real.remove(const)
+            chain[-1].body.insert(0, const)
+            const._loop_chain = tuple(chain)  # type: ignore[attr-defined]
+            depths = {n: d for n, d, _ in self._tree_constants(real)}
+            assert depths[const.get_operation_name()] == len(chain), depths
+
+            after_real = self._run_pass_on_view(graph)
+            seen["name"] = const.get_operation_name()
+            seen["after"] = self._tree_constants(after_real)
+            seen["chain"] = const._loop_chain  # type: ignore[attr-defined]
+            raise _TestStopSignal()
+
+        self._drive(cb, fn, args)
+        after = seen["after"]
+        self.assertEqual({depth for _, depth, _ in after}, {0}, after)
+        self.assertEqual([i for _, _, i in after], list(range(len(after))), after)
+        self.assertIn(seen["name"], [name for name, _, _ in after])
+        self.assertEqual(seen["chain"], ())
 
     def test_constants_keep_their_relative_order(self) -> None:
         fn, args = self._nested_fixture()
