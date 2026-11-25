@@ -208,6 +208,7 @@ def test_active_core_count_reads_inductor_sencores():
         (torch.empty(16, device="meta"), "CPU tensor"),
         (torch.tensor(1.0), "scalar"),
         (torch.empty(0), "positive"),
+        (torch.empty(64, 0), "positive"),  # an empty sharded tensor
         (torch.empty(16, requires_grad=True), "gradients"),
         (torch.empty(16).as_strided((8,), (1,), 1), "zero storage offset"),
         (torch.empty(4, 4).t(), "contiguous"),

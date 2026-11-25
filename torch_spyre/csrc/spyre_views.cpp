@@ -83,6 +83,15 @@ static void check_sharded_view(const at::Tensor& self, const SizeVec& sizes,
                                const c10::SymInt& storage_offset,
                                bool allow_box = true) {
   if (!spyre_is_sharded(self)) return;
+  // An empty view, such as x[64:] or x[:, 5:5], addresses no element, so it
+  // keeps the mapping trivially. Its consumers see numel() == 0: copies
+  // return at once, and fills reject empty tensors as for unsharded ones.
+  if (allow_box) {
+    for (const auto& s : sizes) {
+      auto v = c10::SymInt(s).maybe_as_int();
+      if (v && *v == 0) return;
+    }
+  }
   if (allow_box && is_sharded_box(self, sizes, strides, storage_offset)) {
     return;
   }

@@ -1326,3 +1326,57 @@ def test_box_views_of_sharded_fail_in_other_consumers():
 
     assert torch.equal(x.cpu(), cpu)
     assert torch.spyre.sharding_info(x).num_shards == n
+
+
+@requires_emulation
+@pytest.mark.parametrize("dim", [0, 1])
+@pytest.mark.parametrize(
+    "view",
+    [
+        lambda t: t[t.shape[0] :],  # past the end
+        lambda t: t[:0],
+        lambda t: t[5:5],
+        lambda t: t[:, t.shape[1] :],
+        lambda t: t[2:2, 1:9],
+    ],
+)
+def test_empty_views_of_sharded_copy_to_cpu(dim, view):
+    """An empty slice addresses no element, so it keeps the shard mapping:
+    it is built, copied to the CPU and printed, and copying into it does
+    nothing."""
+    n = num_shards()
+    shape = (4 * n, 64) if dim == 0 else (16, 64 * n)
+    cpu = _box_source(shape, torch.float16)
+    x = _sharded(cpu, dim, n)
+
+    v = view(x)
+
+    assert torch.spyre.is_sharded(v)
+    assert v.numel() == 0
+    assert v.shape == view(cpu).shape
+    assert torch.equal(v.cpu(), view(cpu))
+    assert str(v).replace(", device='spyre:0'", "") == str(view(cpu))
+    v.copy_(torch.empty(v.shape, dtype=v.dtype))
+    assert torch.equal(x.cpu(), cpu)
+
+
+@requires_emulation
+@expects_raise
+def test_empty_views_of_sharded_reject_fills_and_in_place_as_strided():
+    n = num_shards()
+    cpu = _box_source((4 * n, 64), torch.float16)
+    x = _sharded(cpu, 0, n)
+    v = x[5:5]
+
+    with pytest.raises(RuntimeError, match="cannot fill empty tensor"):
+        v.fill_(0)
+    with pytest.raises(RuntimeError, match="cannot fill empty tensor"):
+        v.zero_()
+    # In-place as_strided_ must keep the whole shape, even an empty one.
+    with pytest.raises(
+        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    ):
+        x.as_strided_(v.shape, v.stride(), v.storage_offset())
+
+    assert torch.equal(x.cpu(), cpu)
+    assert x.shape == cpu.shape
