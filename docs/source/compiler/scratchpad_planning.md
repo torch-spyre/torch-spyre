@@ -400,7 +400,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 | `unsized (no device layout)` | Without a device layout, the allocator cannot measure the LX footprint. | computable footprint | None | `TestEmptyLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
 | `empty tensor` | A zero-sized tensor needs no LX reservation. | nonempty output | None | `TestEmptyLxEligibility` |
 | `mutation target` | Offset writes cannot use one fixed LX base. A counted-loop carry is accepted only when the solver also chooses its update division. | no mutation target | Counted-loop carry: `_is_loop_carry_storage` (joint division choice) | `TestLoopCarryLxEligibility` |
-| `tiled (advancing)` | LX addresses cannot use affine.apply symbols. The write or read advances per tile; loop_info supplies the tile geometry. | fixed LX address | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
+| `tiled (advancing)` | LX addresses cannot use affine.apply symbols. The write or read advances per tile; the loop node supplies the tile geometry. | fixed LX address | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
 | `read by restickify` | A transposed or uncertified local read may cross cores. The joint solver checks each candidate division, so the committed-division barrier can reject a valid candidate (#4655). | fixed divisions agree or exact local-read proof | None | `test_buffer_residency_adapter_rejection_strings` |
 | `extern kernel user or live across extern kernel` | Extern kernels read HBM. PR #3683 added this guard; enable_lx_context_switching uses LxContextSwitchingPass to dump and restore LX around the call. | extern boundary protected | None | `test_buffer_residency_adapter_rejection_strings` |
 | `live across multi-output extern kernel` | Multi-output extern calls need HBM under either flag setting. LxContextSwitchingPass does not bracket them; the earlier extern guard handles the disabled case. | multi-output boundary protected | None | `test_buffer_residency_adapter_rejection_strings` |
@@ -912,8 +912,8 @@ bugs that the hand-written cases miss.
 - [`work_division_planning.md`](work_division_planning.md) describes how
   work distribution decides per-op core splits that scratchpad planning
   then consumes.
-- [`coarse_tiling_loops.md`](coarse_tiling_loops.md) describes coarse
-  tiling, which reduces working sets so adjacent ops can fit on LX in
+- [`loop_nodes.md`](loop_nodes.md) describes the counted loops by which coarse
+  tiling reduces working sets so adjacent ops can fit on LX in
   the first place.
 - [`hbm_pool_planning.md`](hbm_pool_planning.md) describes the
   complementary device-memory pass, which packs every intermediate that

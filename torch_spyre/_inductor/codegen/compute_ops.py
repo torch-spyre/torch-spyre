@@ -28,7 +28,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.sharded_hbm import (
-    verify_mixed_ring_args,
+    verify_mixed_args,
     verify_non_unified_split,
 )
 from torch_spyre._inductor.op_spec import TensorWorkDivision
@@ -953,9 +953,10 @@ def generate_sdsc(
     non_unified_args = [t for t in sdsc_spec.args if t.non_unified]
     if non_unified_args:
         if len(non_unified_args) != len(sdsc_spec.args):
-            # Only a cross-shard (ring) reduction mixes the two: sharded
-            # inputs, one ordinary output written by the chain's end core.
-            verify_mixed_ring_args(sdsc_spec, non_unified_args)
+            # A sharded pointwise output with ordinary (replicated) inputs, or
+            # a cross-shard (ring) reduction: sharded inputs and one ordinary
+            # output written by the chain's end core.
+            verify_mixed_args(sdsc_spec, non_unified_args)
         verify_non_unified_split(sdsc_spec, non_unified_args)
     for tensor in sdsc_spec.args:
         if tensor.non_unified:
