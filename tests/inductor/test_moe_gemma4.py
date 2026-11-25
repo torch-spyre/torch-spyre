@@ -211,8 +211,8 @@ GROUPED_MOE_EAGER = _xfail(
 )
 GROUPED_MOE_COMPILED = _xfail(
     InductorError,
-    "#4648: restickify padding finds no input host dim for the new stick symbol",
-    "restickify padding: no input host dim carries new-stick symbol",
+    "#4531: routing flatten of the [T, 8] topk ids raises Unexpected stick expression",
+    r"Unexpected stick expression Mod\(d0, 8\)",
 )
 STABLE_SORT = _xfail(
     NotImplementedError,
@@ -229,14 +229,22 @@ TOPK_FLOAT_IDS = _xfail(
     "#5847: topk returns float32 indices",
     r"'dtype' do not match: torch\.float32 != torch\.int64",
 )
-# topk of a DL16_TO_FP32 input (the FP32 softmax of a BF16 [12, 128] input) puts the
-# stick on the row dim, and the result is tagged STANDARD, so the D2H copy does not
-# restore the staggered row order: every row from row 4 up holds another row's top-k.
-# #5495 does not help, it shuffles Pointwise ops only.
+# topk of a DL16_TO_FP32 input (the FP32 softmax of a BF16 [12, 128] input): the
+# compiled DL16_TO_FP32 shuffle rejects the stick dim, which is not a whole stick
+# pair per core.
 TOPK_STAGGERED_INPUT = _xfail(
-    AssertionError,
-    "#5856: topk of a DL16_TO_FP32 input returns rows in staggered order",
-    "Tensor-likes are not close",
+    InductorError,
+    "#5856: compiled topk of a DL16_TO_FP32 input: the DL16_TO_FP32 shuffle "
+    "requires whole stick pairs",
+    "requires whole stick pairs",
+)
+# Eager: the topk reduction of the FP32 softmax of a BF16 [12, 128] input cannot
+# resolve the stick incompatibility of its DL16_TO_FP32 operand.
+TOPK_STICK_INCOMPATIBLE_EAGER = _xfail(
+    InductorError,
+    "#5856: eager topk of a DL16_TO_FP32 input raises no mechanism to resolve "
+    "stick incompatibility",
+    "no mechanism to resolve stick incompatibility",
 )
 # An FP32 softmax of a BF16 [12, 128] input, or a .float() of its [12, 8] top-k
 # mask, stages a DL16_TO_FP32 operand whose stick pair is on no single dim. This
@@ -258,10 +266,15 @@ INDEX_ADD_DUPLICATES = _xfail(
 )
 # At T=1 the routing flatten succeeds and the grouped path stops at the stable sort.
 SORT_AT_DECODE = dict(decode_eager=STABLE_SORT, decode_compiled=STABLE_SORT)
-MIXED_EA = _xfail(
+INDIRECT_RESTICKIFY_ARGS = _xfail(
     InductorError,
-    "#4714: BF16 x FP32 broadcast multiply raises mixed EA with no staggered operand",
-    "Multi-arg pointwise with mixed EA",
+    "restickify of an indirect store keeps its index arg in op_spec",
+    "restickify op_spec has 3 args",
+)
+SCATTER_IA_RETILE = _xfail(
+    InductorError,
+    "scatter-IA index buffer has no size-1 stick target for re-tiling",
+    "cannot re-tile .* no size-1 stick target",
 )
 FLOAT_IDS_AS_INDEX = _xfail(
     RuntimeError,
@@ -285,11 +298,16 @@ SORT_STICK_INCOMPATIBILITY = _xfail(
     "#3193: compiled grouped_mm sort raises no mechanism to resolve stick incompatibility",
     "no mechanism to resolve stick incompatibility",
 )
-# At T=1 the compiled tied topk runs, but selects experts outside the tied pool.
+# At T=1 the tied topk runs, but selects experts outside the tied pool.
 TIED_TOPK_COMPILED = _xfail(
     AssertionError,
     "#4639: compiled tied topk selects experts outside the tied pool",
     r"compiled spyre <-> cpu\[1\] mismatch",
+)
+TIED_TOPK_EAGER = _xfail(
+    AssertionError,
+    "#4639: eager tied topk selects experts outside the tied pool",
+    r"eager spyre <-> cpu\[1\] mismatch",
 )
 HISTC = _xfail(
     NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
@@ -305,12 +323,6 @@ REPEAT_INTERLEAVE = _xfail(
 GROUPED_MM_SORT = dict(eager=STABLE_SORT, compiled=SORT_RESTICKIFY)
 GROUPED_MM_SORT_CASES = dict(
     GROUPED_MM_SORT, decode_compiled=SORT_STICK_INCOMPATIBILITY
-)
-UPCAST_RMS_NORM = _xfail(
-    AssertionError,
-    "#5893: FP32 RMSNorm of an upcast BF16 input returns wrong values, so eager "
-    "attention outputs NaN",
-    "Greatest absolute difference: nan",
 )
 
 
@@ -831,7 +843,7 @@ def _f32(tensors):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS,
+        eager=TOPK_STICK_INCOMPATIBLE_EAGER,
         compiled=TOPK_STAGGERED_INPUT,
         decode_compiled=TOPK_FLOAT_IDS,
     ),
@@ -878,8 +890,9 @@ def test_G4_RT_001_batch_routing(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS,
+        eager=TOPK_STICK_INCOMPATIBLE_EAGER,
         compiled=TOPK_STAGGERED_INPUT,
+        decode_eager=TOPK_FLOAT_IDS,
         decode_compiled=TOPK_FLOAT_IDS,
     ),
 )
@@ -979,7 +992,11 @@ def test_G4_RT_003_per_expert_scale(execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
+    _cases(
+        eager=TOPK_STICK_INCOMPATIBLE_EAGER,
+        compiled=FLOAT_IDS_AS_INDEX,
+        decode_eager=FLOAT_IDS_AS_INDEX_EAGER,
+    ),
 )
 def test_G4_RT_004_router_from_hidden_states(execution_mode, T):
     """Gemma4TextRouter: RMS norm, scale, proj, softmax, top-8, renorm, rescale."""
@@ -1092,7 +1109,17 @@ def test_G4_GM_003_grouped_mm_expert_ffn(execution_mode, T):
 
 
 @pytest.mark.parametrize(
-    ("execution_mode", "T"), _cases(eager=MIXED_EA, compiled=MIXED_EA)
+    ("execution_mode", "T"),
+    _cases(
+        eager=_xfail(
+            NotImplementedError,
+            "#692: aten::_index_put_impl_ has no Spyre kernel",
+            "aten::_index_put_impl_",
+        ),
+        decode_eager=TOPK_STAGGERED_INPUT,
+        compiled=INDIRECT_RESTICKIFY_ARGS,
+        decode_compiled=SCATTER_IA_RETILE,
+    ),
 )
 def test_G4_GM_004_inverse_permute_fp32_combine(execution_mode, T):
     """Weight rows, restore token order and sum each token's 8 rows in FP32."""
@@ -1243,14 +1270,10 @@ def test_G4_EC_002_empty_expert_segments(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=STAGGERED_UPCAST,
+        eager=TOPK_STICK_INCOMPATIBLE_EAGER,
         compiled=TOPK_STAGGERED_INPUT,
         decode_compiled=TIED_TOPK_COMPILED,
-        decode_eager=_xfail(
-            InductorError,
-            "#4404: restickify restore expects a padding-prepended gap dim",
-            "restickify restore: expected padding-prepended",
-        ),
+        decode_eager=TIED_TOPK_EAGER,
     ),
 )
 def test_G4_EC_003_topk_tied_candidates(execution_mode, T):
@@ -1418,14 +1441,14 @@ def _attention_case(kind, execution_mode, T):
     return cos, sin, weights
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(eager=UPCAST_RMS_NORM))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases())
 def test_G4_AT_001_sliding_window_attention(execution_mode, T):
     """Sliding layer: 16 Q / 8 KV heads of 256, RoPE theta 1e4 over the full head."""
     _, _, weights = _attention_case("sliding", execution_mode, T)
     assert weights[2] is not None
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(eager=UPCAST_RMS_NORM))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases())
 def test_G4_AT_002_full_attention_k_eq_v(execution_mode, T):
     """Full layer: 2 KV heads of 512, V from k_proj, proportional RoPE theta 1e6."""
     cos, sin, weights = _attention_case("full", execution_mode, T)

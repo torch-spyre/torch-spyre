@@ -29,11 +29,11 @@ Each op resolves its own tiled dimension from its ``loop_var`` in ``dim_hints``.
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 
 Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
-rewiring in this file, read "Appendix: How IR rewiring works, and why it's
-sound" in ``docs/source/compiler/coarse_tiling_loops.md``. It documents the
-wrap-never-reconstruct convention and why ``MutationLayoutSHOULDREMOVE``
-sites must satisfy the single-mutation-target invariant -- the same ground
-this file's rewrite sites depend on.
+rewiring in this file, read "Invariants and failure modes" in
+``docs/source/compiler/loop_nodes.md``. It documents the wrap-never-reconstruct
+convention and why ``MutationLayoutSHOULDREMOVE`` sites must satisfy the
+single-mutation-target invariant -- the same ground this file's rewrite sites
+depend on.
 """
 
 from __future__ import annotations

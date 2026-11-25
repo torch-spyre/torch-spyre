@@ -670,7 +670,8 @@ def test_a_broken_attribution_keeps_the_price(monkeypatch):
 def test_ops_that_run_different_numbers_of_times_are_grouped_apart(monkeypatch):
     """A coarse_tile_fill sits OUTSIDE the loop and runs once beside ops that do not.
 
-    coarse_tiling_loops.md: the fill op is inserted "outside the loop, no loop_member".
+    The fill writes the identity once, before the loop, and is in no loop
+    (``_insert_fill`` in ``wsr/loop_tiling_lowering.py``).
     A kernel therefore has no single iteration count, so the count is stated per loop
     rather than in one column beside every op in the kernel.
     """
