@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import sympy
+from sympy.core.function import AppliedUndef
 from sympy.printing.printer import Printer
 
 from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
@@ -267,6 +268,8 @@ class _SympyExprToCpSat(Printer):
 
         if expr.is_Piecewise and expr.args[-1][1] != sympy.true:
             return None  # Preserve the ordinary printer's required default.
+        if isinstance(expr, AppliedUndef):
+            return None  # An implemented function is _print_AppliedUndef's lookup.
         args = (
             [part for pair in expr.args for part in pair]
             if expr.is_Piecewise

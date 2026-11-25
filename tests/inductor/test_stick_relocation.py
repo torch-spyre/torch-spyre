@@ -55,11 +55,14 @@ def _reduce_after(view, kind):
     return lambda a: reduce(view(a) * 2)
 
 
-def _compile_and_measure(fn, *shapes):
+def _compile_and_measure(fn, *shapes, dtype=torch.float16):
     """Compile ``fn`` on Spyre, check it against an fp32 CPU reference, and return
     the peak extra device memory of the compiled call relative to its inputs."""
     torch.manual_seed(0)
-    xs = [torch.randn(*s, dtype=torch.float16) for s in shapes]
+    if dtype.is_floating_point:
+        xs = [torch.randn(*s, dtype=dtype) for s in shapes]
+    else:
+        xs = [torch.randint(-100, 100, s, dtype=dtype) for s in shapes]
     ref = fn(*[x.float() for x in xs])
     dev = [x.to("spyre") for x in xs]
     mem = torch.accelerator.memory
@@ -70,7 +73,9 @@ def _compile_and_measure(fn, *shapes):
     with inductor_config.patch(force_disable_caches=True):
         out = torch.compile(fn, dynamic=False)(*dev)
     torch.spyre.synchronize()
-    ratio = (mem.max_memory_allocated() - before) / sum(x.numel() * 2 for x in xs)
+    ratio = (mem.max_memory_allocated() - before) / sum(
+        x.numel() * x.element_size() for x in xs
+    )
     outs = out if isinstance(out, tuple) else (out,)
     refs = ref if isinstance(ref, tuple) else (ref,)
     for o, r in zip(outs, refs):
@@ -337,31 +342,131 @@ class TestStickRelocation(unittest.TestCase):
                 first.fill_(7)
                 self.assertEqual(second.cpu().flatten()[:4].tolist(), [7.0] * 4)
 
-    @expects_raise
-    def test_stick_size_change_is_rejected(self):
-        # TODO(#6557): the cast changes the stick size, and
-        # convert_element_type's layout rule returns no candidates for a read its
-        # input's layout cannot serve -- it returns none before the relocation or
-        # the sparse fallback is consulted, so neither gets to serve the read.
-        # Refused rather than wrong, and refused on main too. The same reshape
-        # without the cast compiles. Make this a positive test when #6557 lands.
+    def test_stick_size_change_after_reshape(self):
+        # #6557: a conversion that changes the elements per stick reads a reshape
+        # that cuts the stick dim. convert_element_type's layout rule returned no
+        # candidate before the relocation or the sparse fallback was consulted,
+        # so the cast failed with "no supported output layout" where the same
+        # reshape without the cast compiled. It now takes the dense relocation,
+        # as the reshape alone does. The first case is the issue's reproducer.
         cases = {
-            "aligned target": ((2, 8, 40), lambda t: t.reshape(2, 320).float()),
             "split then float": (
+                [(1, 64, 25600)],
+                lambda x: x.reshape(1, 64, 160, 160).float(),
+            ),
+            # The conversion's output read by another op, which reads the
+            # relocated layout: pointwise, and reductions across and along the
+            # split dims.
+            "split then float then multiply": (
+                [(1, 64, 25600)],
+                lambda x: x.reshape(1, 64, 160, 160).float() * 2,
+            ),
+            "split then float then exp": (
+                [(1, 64, 25600)],
+                lambda x: x.reshape(1, 64, 160, 160).float().exp(),
+            ),
+            "split then float then sum of the last dim": (
+                [(1, 64, 25600)],
+                lambda x: x.reshape(1, 64, 160, 160).float().sum(-1),
+            ),
+            "split then float then sum of the other split dim": (
+                [(1, 64, 25600)],
+                lambda x: x.reshape(1, 64, 160, 160).float().sum(2),
+            ),
+        }
+        self._check_dense(cases)
+
+    def test_stick_size_change_after_reshape_for_other_dtypes(self):
+        # #6557 for the other conversions the rule handles: fp32 down to fp16
+        # (32 to 64 per stick), int32 and int64 to fp16, and bf16, which the
+        # device holds as fp16 (bool, held the same way, is
+        # test_bool_host_reshaped_to_fp32_cpu in test_inductor_ops.py). Each
+        # failed with "no supported output layout". Which layout served the read
+        # is pinned host-side by TestTypecastOfUnservableRead in
+        # tests/tensor/test_coordinates.py; here only the values are checked.
+        f32, i32, bf16 = torch.float32, torch.int32, torch.bfloat16
+        cases = {
+            "fp32 (2,8,40) to (2,320)": (
+                f32,
+                (2, 8, 40),
+                lambda x: x.reshape(2, 320).half(),
+            ),
+            "fp32 (1,32,20,20) to (1,32,400)": (
+                f32,
+                (1, 32, 20, 20),
+                lambda x: x.reshape(1, 32, 400).half(),
+            ),
+            "fp32 (1,64,25000) to (1,64,250,100)": (
+                f32,
+                (1, 64, 25000),
+                lambda x: x.reshape(1, 64, 250, 100).half(),
+            ),
+            "fp32 (1,2,4,8,7) to (1,8,56), no free dim": (
+                f32,
+                (1, 2, 4, 8, 7),
+                lambda x: x.reshape(1, 8, 56).half(),
+            ),
+            "int32 (2,8,40) to (2,320)": (
+                i32,
+                (2, 8, 40),
+                lambda x: x.reshape(2, 320).half(),
+            ),
+            # int64 is held as int32 on the device.
+            "int64 (2,8,40) to (2,320)": (
+                torch.int64,
+                (2, 8, 40),
+                lambda x: x.reshape(2, 320).half(),
+            ),
+            "bf16 (1,64,25600) to (1,64,160,160)": (
+                bf16,
                 (1, 64, 25600),
-                lambda t: t.reshape(1, 64, 160, 160).float(),
+                lambda x: x.reshape(1, 64, 160, 160).float(),
+            ),
+        }
+        for name, (dtype, shape, fn) in cases.items():
+            with self.subTest(name):
+                _compile_and_measure(fn, shape, dtype=dtype)
+
+    @expects_raise
+    def test_stick_size_change_after_reshape_onto_a_sub_stick_dim(self):
+        # #6557 where the only dim the reshape leaves alone has at most 32
+        # elements (the issue's other reproducer is the first case). The
+        # conversion now compiles; it raised "no supported output layout". Its
+        # fp32 result then fits in a single fp32 stick, which the DL16_TO_FP32
+        # read-back rejects, as it does for an unreshaped 4x32 .float() in
+        # test_inductor_ops.py. Which layout served the read is pinned host-side
+        # by TestTypecastOfUnservableRead in tests/tensor/test_coordinates.py.
+        cases = {
+            "(2,8,40) to (2,320)": ((2, 8, 40), lambda x: x.reshape(2, 320).float()),
+            "(1,32,20,20) to (1,32,400)": (
+                (1, 32, 20, 20),
+                lambda x: x.reshape(1, 32, 400).float(),
             ),
         }
         for name, (shape, fn) in cases.items():
             with self.subTest(name):
+                x = torch.randn(*shape, dtype=torch.float16)
                 torch.compiler.reset()
-                with (
-                    inductor_config.patch(force_disable_caches=True),
-                    pytest.raises(InductorError, match="no supported output layout"),
-                ):
-                    torch.compile(fn, dynamic=False)(
-                        torch.randn(*shape, dtype=torch.float16).to("spyre")
-                    )
+                with inductor_config.patch(force_disable_caches=True):
+                    out = torch.compile(fn, dynamic=False)(x.to("spyre"))
+                torch.spyre.synchronize()
+                self.assertEqual(out.dtype, torch.float32)
+                self.assertEqual(out.shape, fn(x).shape)
+                with pytest.raises(RuntimeError, match="requires whole stick pairs"):
+                    out.cpu()
+
+    def test_stick_size_change_after_reshape_with_no_free_dim(self):
+        # #6557 for a reshape that leaves no dim alone: no dim can take the
+        # stick, so the conversion reads the sparse layout, as the reshape alone
+        # does in test_no_free_dim_uses_the_sparse_layout.
+        cases = {
+            "1x2x4x8x7": ([(1, 2, 4, 8, 7)], lambda x: x.reshape(1, 8, 56).float()),
+            "flatten [8,65]": ([(8, 65)], lambda x: x.reshape(-1).float()),
+        }
+        for name, (shapes, fn) in cases.items():
+            with self.subTest(name):
+                ratio = _compile_and_measure(fn, *shapes)
+                self.assertGreater(ratio, SPARSE_MIN_MEMORY_RATIO)
 
     @expects_raise
     def test_cat_of_sparse_reads_along_the_stick_dim_is_rejected(self):
@@ -411,3 +516,63 @@ class TestStickRelocation(unittest.TestCase):
                             for s in shapes
                         ]
                     )
+
+
+def _check_values_on_host(fn, shape, dtype):
+    """Compare a compiled ``fn`` with the fp32 CPU reference, holding no device
+    tensor once the comparison runs: a failing test's kept traceback then keeps
+    no device memory alive into the peak-memory checks of later tests."""
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=dtype)
+    ref = fn(x.float())
+    torch.compiler.reset()
+    with inductor_config.patch(force_disable_caches=True):
+        got = torch.compile(fn, dynamic=False)(x.to("spyre")).cpu()
+    torch.compiler.reset()
+    torch.testing.assert_close(got.float(), ref.float(), atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+class TestFp32StickSplitValues(unittest.TestCase):
+    """#6657: an fp32 value whose stick dim a reshape splits (25600 into 160 x 160:
+    5 fp32 sticks, 2.5 fp16 sticks) reads back wrong once a cast or pointwise op
+    consumes the reshape; the reshape alone is correct. Found while validating
+    #6557, whose fix does not reach these reads. One test per spelling, as each
+    may take a different kernel and a fix may cover only some of them. Kept out
+    of TestStickRelocation so they run after its peak-memory checks.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="fp32 input split by a reshape, then .half(): wrong values, #6657",
+    )
+    def test_fp32_stick_split_then_half(self):
+        _check_values_on_host(
+            lambda x: x.reshape(1, 64, 160, 160).half(), (1, 64, 25600), torch.float32
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="in-graph .float() split by a reshape, then .half(): wrong values, "
+        "#6657",
+    )
+    def test_fp32_stick_split_then_half_of_an_in_graph_float(self):
+        _check_values_on_host(
+            lambda x: x.float().reshape(1, 64, 160, 160).half(),
+            (1, 64, 25600),
+            torch.float16,
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="in-graph .float() split by a reshape, then * 2: wrong values, #6657",
+    )
+    def test_fp32_stick_split_then_multiply(self):
+        _check_values_on_host(
+            lambda x: x.float().reshape(1, 64, 160, 160) * 2,
+            (1, 64, 25600),
+            torch.float16,
+        )

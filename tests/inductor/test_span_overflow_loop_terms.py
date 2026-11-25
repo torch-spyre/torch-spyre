@@ -385,14 +385,6 @@ _STEP_SYMBOLS = (
     (r"_tile_adv_\w+?_lvl\d+", "SYM"),
     (r"\bu\d+\b", "SYM"),
     (r"floor\(([^()]*SYM)\)", r"\1"),
-    # A comment in the generated file: the fused kernel's list of fx placeholders. The
-    # full output buffer the copy-out mutates (``empty_default``) is listed as an input
-    # of the flat loop, and not of the LoopSchedulerNode, which orders itself after the
-    # allocation through a dependency it carries itself. No kernel code differs.
-    (
-        r"(?m)^#\s+%empty_default\w* : Tensor .*PlaceHolder\[target=empty_default\w*\]\n",
-        "",
-    ),
 )
 
 

@@ -1628,6 +1628,49 @@ def lower_keep_by_index(values, indices, dim, fill_value):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.mask_by_index)
+def lower_mask_by_index(values, indices, dim, fill_value):
+    from .pass_utils import concretize_expr
+
+    x_size = values.get_size()
+    ndim = len(x_size)
+
+    # Concretize dim if symbolic
+    if isinstance(dim, sympy.Basic):
+        norm_dim = int(concretize_expr(dim)) % ndim
+    else:
+        norm_dim = dim % ndim
+
+    indices_size = indices.get_size()
+    values_loader = values.make_loader()
+    indices_loader = indices.make_loader()
+
+    ranges = list(x_size)
+    reduction_ranges = [indices_size[norm_dim]]
+
+    def inner_fn(index, rindex):
+        values_index = list(index)
+        # indices has K at norm_dim position
+        indices_index = list(index)
+        indices_index[norm_dim] = rindex[0]
+        return (values_loader(values_index), indices_loader(indices_index))
+
+    op_info = {"constants": {"maskval": fill_value}}
+    result = SpyreReduction.create(
+        reduction_type="maskbyindex",
+        input_node=[values, indices],
+        device=values.get_device(),
+        dst_dtype=values.get_dtype(),
+        src_dtype=values.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+        op_info=op_info,
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
 def clone(x, *, memory_format=None):
     result = lowering.clone(x, memory_format=memory_format)
@@ -2439,11 +2482,7 @@ def lower_where(condition, self, other):
     )
 
     converted_condition = condition if skip_cast else to_dtype(condition, val_dtype)
-    if (
-        not skip_cast
-        and condition.get_dtype() != val_dtype
-        and result_dtype != torch.bool
-    ):
+    if not skip_cast and condition.get_dtype() != val_dtype:
         # The cast is realized under this where, so its only origin is
         # aten.where.self. Layout propagation finds a dtype conversion, and the
         # element arrangement it creates (e.g. dl16tofp32 -> DL16_TO_FP32), by the

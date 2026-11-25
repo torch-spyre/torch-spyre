@@ -52,6 +52,8 @@ from .constants import (
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
+    SHUFFLE_OP,
+    STAGGERED_EAS,
 )
 from . import config as _spyre_config
 from .core_mapping import (
@@ -118,6 +120,8 @@ from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
+
+_ALL_EAS = frozenset({ElementArrangement.STANDARD, *STAGGERED_EAS})
 
 
 class RValue(ABC):
@@ -282,6 +286,10 @@ class SpyreOpFuncs:
     @staticmethod
     def keep_by_index(x, indices):
         return ReductionOp("keepbyindex", [x, indices])
+
+    @staticmethod
+    def mask_by_index(x, indices):
+        return ReductionOp("maskbyindex", [x, indices])
 
     @staticmethod
     def layernormnorm(*args):
@@ -665,6 +673,10 @@ def _matching_read_deps(
         for i, dep in enumerate(read_deps)
         if mutation_real_name.get(dep.name, dep.name) == name
     ]
+
+
+def _is_shuffle(in_ea, out_ea) -> bool:
+    return in_ea != out_ea and {in_ea, out_ea} <= _ALL_EAS
 
 
 class SpyreKernel(Kernel[CSEVariable]):
@@ -1142,7 +1154,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 continue
             # Check if operation supports the argument's dtype
             if not (
-                op == IDENTITY_OP
+                op in (IDENTITY_OP, SHUFFLE_OP)
                 or (
                     op == RESTICKIFY_OP
                     and arg.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
@@ -1521,8 +1533,12 @@ class SpyreKernel(Kernel[CSEVariable]):
 
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
+            in_ea = args[-2].element_arrangement
+            out_ea = args[-1].element_arrangement
             if is_restickify_coords(in_coords, out_coords):
                 op = RESTICKIFY_OP
+            elif _is_shuffle(in_ea, out_ea) and not indirect_syms_used:
+                op = SHUFFLE_OP
             else:
                 op = IDENTITY_OP
             op_spec = self.create_op_spec(
@@ -1997,6 +2013,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                     buf.writeline(
                         "count_symbol_sources="
                         f"{_serialize_value(op_spec.count_symbol_sources)},"
+                    )
+                if op_spec.count_from_buffer is not None:
+                    buf.writeline(
+                        "count_from_buffer="
+                        f"{_serialize_value(op_spec.count_from_buffer)},"
                     )
                 buf.writeline("body=[")
                 with buf.indent():

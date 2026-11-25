@@ -1228,4 +1228,63 @@ def spyre__copy_from(self, dst, non_blocking=False):
         return dst
 
 
+@torch.library.register_kernel("aten::_to_copy", ["spyre"])
+def spyre__to_copy(
+    self,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+    non_blocking=False,
+    memory_format=None,
+):
+    """``aten::_to_copy`` for Spyre, so ``.float()``/``.half()``/``.bfloat16()``
+    and ``.to(dtype)`` agree on the element arrangement.
+
+    ``Tensor.to`` is patched in Python (``spyre_to``) and sends a same-device
+    dtype change to the compiled ``spyre::to_dtype_d2d``, whose layout
+    propagation stamps the conversion's staggered element arrangement
+    (``DL16_TO_FP32`` / ``FP32_TO_DL16``) on the result. ``.float()`` and friends
+    are C++ methods that never reach ``spyre_to``; they land here. The stock
+    ``_to_copy`` allocates a fresh STANDARD buffer and ``copy_``s into it, which
+    drops the arrangement the compiled path produces, so every later eager op
+    sees STANDARD data where the compiled graph sees a staggered one (e.g. the
+    trailing ``(normed * (1 + w.float())).to(fp16)`` of GemmaRMSNorm).
+
+    Only a plain same-device dtype change is rerouted. Everything else keeps the
+    stock behaviour: allocate with ``empty_like`` and ``copy_``.
+    """
+    target_device = self.device if device is None else torch.device(device)
+    same_device_dtype_change = (
+        dtype is not None
+        and dtype != self.dtype
+        and target_device.type == "spyre"
+        and target_device.index in (None, self.device.index)
+        and layout in (None, torch.strided)
+        and not pin_memory
+        and memory_format in (None, torch.preserve_format)
+        and self.numel() != 0
+        # Same guard as ``spyre_to``: while tracing, the conversion must stay a
+        # graph op that Inductor lowers, not a nested compiled call.
+        and not torch.compiler.is_compiling()
+        and not isinstance(self, torch._subclasses.FakeTensor)
+        and not torch._is_functional_tensor(self)
+    )
+    if same_device_dtype_change:
+        return torch.ops.spyre.to_dtype_d2d(self, dtype, self.storage_offset())
+
+    result = torch.empty_like(
+        self,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        memory_format=(
+            torch.preserve_format if memory_format is None else memory_format
+        ),
+    )
+    return result.copy_(self, non_blocking)
+
+
 # INSERT_CODEGEN_HERE

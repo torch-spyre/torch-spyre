@@ -34,6 +34,7 @@ from torch_spyre._C import (
 )
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.op_spec import (
+    CountSource,
     DebugHandle,
     IndirectAccess,
     LoopSpec,
@@ -158,6 +159,19 @@ class TestKernelProvenanceDescriptor:
         )
 
         assert result.completed_producer_cores == producers
+
+    def test_device_read_count_changes_bundle_identity(self):
+        def key(source):
+            loop = LoopSpec(
+                count=Integer(4), body=[_op(None)], count_from_buffer=source
+            )
+            return build_kernel_provenance_descriptor([_op(None), loop]).key
+
+        plain = key(None)
+        at_0 = key(CountSource(pool_offset=0, max_value=4))
+        at_128 = key(CountSource(pool_offset=128, max_value=4))
+
+        assert len({plain, at_0, at_128}) == 3
 
     def test_builds_bundle_identity_without_handles(self):
         specs = [
