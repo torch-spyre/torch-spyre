@@ -258,13 +258,14 @@ def _input_traffic(name: str):
 
 
 def _loop_features(op):
-    """(loop_trip, tiles_reduction_dim, tiles_output_dim) from the coarse-tiling
-    ``loop_member`` (loop_node.LoopMember). ``loop_trip`` = product of
-    loop_count (1 if not tiled). tiles_reduction_dim = loop_tiled_reduction_dims is
-    non-empty (reduction-dim tiling); tiles_output_dim = loop_tiled_dims is non-empty
-    (output / pointwise-dim tiling). NOTE the fill/combine ops carry the same loop_member
-    but tile NEITHER (both lists empty), so their accumulators stay fixed (factor L); a
-    genuinely tiled op's args advance (factor 1)."""
+    """(loop_trip, tiles_reduction_dim, tiles_output_dim) from the op's enclosing
+    loops (``loop_facts.enclosing_loops``). ``loop_trip`` = product of the levels'
+    trip counts (1 if not tiled). tiles_reduction_dim = some level's
+    ``tiled_reduction_dims`` is non-empty (reduction-dim tiling); tiles_output_dim =
+    some level's ``tiled_dims`` is non-empty (output / pointwise-dim tiling). NOTE the
+    fill/combine ops are in the same loops but tile NEITHER (both empty), so their
+    accumulators stay fixed (factor L); a genuinely tiled op's args advance (factor
+    1)."""
     levels = enclosing_loops(op)
     if not levels:
         return 1, False, False
@@ -442,7 +443,7 @@ def _loop_factor_for_index(index, levels, advances=None) -> int:
         # An arg REPEATS at a level whenever that level's tiled symbols are absent from
         # its index -- for EITHER reason:
         # * the level tiles nothing this op has (`coarse_tile_fill` / `_combine`, whose
-        # loop_member names a dim they do not iterate), or * the level tiles a dim this
+        # level names a dim they do not iterate), or * the level tiles a dim this
         # arg's address does not depend on (matmul B under M-tiling). Both mean the same
         # physical thing: the op re-enters the same address each iteration of that
         # level. An earlier version guarded this with `if syms`, which silently dropped
@@ -479,7 +480,7 @@ def _candidate_tiling(op, tiling: Mapping):
     flags are conditions rather than bools when a count is symbolic, since the
     candidate the solver picks may leave that axis untiled (count 1).
 
-    The op must not already be coarse-tiled: its ``loop_member`` would describe a
+    The op must not already be coarse-tiled: its enclosing loops would describe a
     second loop nest this cannot compose with.
     """
     if is_looped(op):
@@ -1383,7 +1384,7 @@ def extract_op_features(
     ``sym_tiling`` is a candidate coarse tiling of the (untiled) op during LX
     planning: loop variable -> trip count, concrete or the solver's symbols, as
     ``work_slices`` is for the core split (see :func:`_candidate_tiling`).
-    Otherwise the op's committed ``loop_member`` supplies the tiling. The op's
+    Otherwise the op's committed loops (``enclosing_loops``) supply the tiling. The op's
     sizes are then the whole loop's, not one tile's, so each LX arg is cut to
     its per-tile size, as a committed tiling allocates it; an HBM arg keeps
     its full extent either way.
@@ -1443,7 +1444,7 @@ def extract_op_features(
 
     # Per-level loop structure, shared by the output's loop factor (which also scales a
     # matmul's work) and every read's (see the PER-ARG comment below). ``_levels`` is
-    # set above, from the committed loop_member or the candidate tiling.
+    # set above, from the committed loops or the candidate tiling.
     _loop_vars = _level_loop_vars(op, _levels) if _levels else []
     _rw = None
     try:
@@ -1454,7 +1455,7 @@ def extract_op_features(
     if _levels and _write_index is not None:
         _write_advances = _loop_var_advances(_write_index, _loop_vars)
         out_factor = _loop_factor_for_index(_write_index, _levels, _write_advances)
-    else:  # no loop_member (or unreadable index) -> the pre-existing behaviour
+    else:  # in no loop (or unreadable index) -> the pre-existing behaviour
         out_factor = _select(tiles_out_dim, 1, loop_trip)
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull

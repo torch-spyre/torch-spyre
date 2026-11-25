@@ -47,14 +47,14 @@ _MASKED_FILL_FP32 = rejection(
     r"Multi-arg pointwise with mixed EA",
 )
 _IR_DUP_EAGER = (
-    4634,
+    6638,
     "index_reduce_ with a repeated index returns wrong values: the decomposition "
     "overwrites, so only one source row per destination row is kept (unique indices "
     "are a documented precondition).",
     r"eager spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _IR_DUP_COMPILED = (
-    4634,
+    6638,
     "compile index_reduce_ with a repeated index returns wrong values: the "
     "decomposition overwrites, so only one source row per destination row is kept "
     "(unique indices are a documented precondition).",
@@ -115,7 +115,7 @@ class TestIndexReduceEagerCompile:
         torch.manual_seed(0xBEEF)
 
     def _xfail_duplicates(self, execution_mode):
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4634
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6638
         _xfail_existing(execution_mode, eager=_IR_DUP_EAGER, compiled=_IR_DUP_COMPILED)
 
     def _run(self, execution_mode, dst, src, idx, reduce_op, tol):
@@ -131,7 +131,7 @@ class TestIndexReduceEagerCompile:
 
         PyTorch index_reduce_ does not accept reduce='sum' (use scatter_add for sum).
         The index repeats row 2, and the decomposition overwrites, so the result is wrong
-        in eager and compiled (#4634).
+        in eager and compiled (#6638).
         """
         self._xfail_duplicates(execution_mode)
         dst = cached_randn((4, 8), differentiation="irdc_mean01", dtype=torch.float16)

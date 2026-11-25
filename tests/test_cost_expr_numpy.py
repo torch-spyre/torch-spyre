@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 import sympy
 from sympy.logic.boolalg import Boolean
+from sympy.utilities.lambdify import implemented_function
 
 from torch_spyre._inductor.scratchpad import cpsat_expr_printer
 from torch_spyre._inductor.scratchpad.cost_expr_numpy import NUMPY_FUNC_MAP, numpy_eval
@@ -194,6 +195,15 @@ def test_a_subclass_is_evaluated_as_its_class():
     assert list(numpy_eval(lazy, [column, 4])) == [1, 4, 4]
 
 
+def test_an_implemented_function_is_its_imp_at_each_entry():
+    """Its ``_imp_`` takes scalars only, as the cost model's decode price does."""
+    step = implemented_function("step", lambda v, w: 3 if v > w else 1)
+    column = np.asarray([1, 5, 9], dtype=object)
+    got = numpy_eval(step(x, y), [column, 4])
+    assert list(got) == [1, 3, 3]
+    assert all(type(value) is int for value in got)
+
+
 def test_a_class_with_no_function_raises():
     with pytest.raises(NotImplementedError, match="no numpy function for sinc"):
         numpy_eval(sympy.sinc(x), [np.asarray([1.0, 2.0])])
@@ -261,6 +271,8 @@ def test_the_printer_evaluates_every_class_the_core_has_a_function_for():
     assert printer._candidate_values(sympy.Mod(x, 3) + y) is None
     assert printer._candidate_values(x * resident) is None
     assert printer._candidate_values(x * y) is not None
+    step = implemented_function("step", lambda v: v)
+    assert printer._candidate_values(step(x)) is None
 
 
 def test_the_printer_lowers_the_same_costs_through_the_core():

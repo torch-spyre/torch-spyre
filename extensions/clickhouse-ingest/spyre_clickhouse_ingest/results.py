@@ -511,18 +511,34 @@ def classify_run_quality(version_info: str | None) -> tuple[str, int]:
     return "valid", 1
 
 
-def _exit_if_perf_zero(trigger_type: str, parsed_benchmarks: int) -> None:
-    """Perf ingest with 0 parsed perf_benchmarks rows is a failed validation.
+def _exit_if_perf_zero(
+    trigger_type: str, parsed_benchmarks: int, expected: bool = True
+) -> None:
+    """Perf ingest that was handed benchmark XML and parsed none of it is a failed validation.
 
     `parsed_benchmarks` is records the XML produced, including files skipped as
     already ingested. Using the insert counter would fail an idempotent retry.
+
+    `expected` is whether this invocation had benchmark XML to parse at all. The tier
+    name alone does not imply it: a perf tier whose measuring leg writes its benchmark
+    rows inline (spyre-inference's vLLM legs, which must not publish numbers as
+    world-readable artifacts) uploads only test-result XML, so 0 records is that tier's
+    steady state rather than lost data. Keyed on the tier, this refused every such
+    ingest -- 100% of spyre-inference's perf tier -- after its verdict rows had landed.
     """
-    if (trigger_type or "").strip() == "perf" and parsed_benchmarks == 0:
+    if (trigger_type or "").strip() != "perf" or parsed_benchmarks:
+        return
+    if not expected:
         print(
-            "[error] trigger-type=perf parsed 0 benchmark records — refusing ingest=ok",
-            file=sys.stderr,
+            "  trigger-type=perf parsed 0 benchmark records, and no benchmark XML "
+            "reached this ingest (the measuring leg writes those rows inline) — not a refusal"
         )
-        sys.exit(1)
+        return
+    print(
+        "[error] trigger-type=perf parsed 0 benchmark records — refusing ingest=ok",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -2023,7 +2039,9 @@ def main(argv=None, assigned_trust=""):
 
     if not xml_files:
         print("No XML files found — nothing to ingest.")
-        _exit_if_perf_zero(args.trigger_type, 0)
+        # Stays a refusal: a perf run with no XML at all has lost its artifact, whereas
+        # the narrowed guard below only forgives XML that was never benchmark-shaped.
+        _exit_if_perf_zero(args.trigger_type, 0, expected=True)
         sys.exit(0)
 
     print(
@@ -2075,6 +2093,10 @@ def main(argv=None, assigned_trust=""):
     total_cases = 0
     total_benchmarks = 0
     parsed_benchmarks = 0
+    # Files that dispatched as benchmark or kernel XML, i.e. that the perf-zero guard
+    # below had something to measure. Counted at dispatch, not after parsing, so a
+    # benchmark XML that yields no rows still counts as a refusal.
+    benchmark_xmls = 0
     total_kernels = 0
     v2_failed_files = []
     v2_parked_files: list = []
@@ -2108,6 +2130,7 @@ def main(argv=None, assigned_trust=""):
         # Kernel first: is_benchmark_xml() also matches these.
         if is_kernel_benchmark_xml(root):
             print("  Detected: per-kernel breakdown XML")
+            benchmark_xmls += 1
             # The v1 kernel tables are a precondition only for the v1 write; checked before
             # anything is written, so the skip stays retryable (no source_file is recorded).
             missing = []
@@ -2233,6 +2256,7 @@ def main(argv=None, assigned_trust=""):
 
         elif is_benchmark_xml(root, xml_path):
             print("  Detected: performance benchmark XML")
+            benchmark_xmls += 1
             run_meta, benchmarks = parse_benchmark_xml(
                 xml_path, args.workflow, args.run_id, args.platform
             )
@@ -2567,7 +2591,7 @@ def main(argv=None, assigned_trust=""):
     if args.strict and getattr(args, "misc_tags", None):
         print(f"  [error] v2: --strict, and tag(s) {args.misc_tags} fell back to misc")
         sys.exit(1)
-    _exit_if_perf_zero(args.trigger_type, parsed_benchmarks)
+    _exit_if_perf_zero(args.trigger_type, parsed_benchmarks, bool(benchmark_xmls))
 
 
 if __name__ == "__main__":

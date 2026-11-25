@@ -811,8 +811,8 @@ SpanOverflowTilePlan(
 ```
 
 Levels are emitted outer-to-inner by host dimension.  The adapter creates one
-synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
-`CoarseTileInfo` and scheduler/codegen lower it as nested counted loops.
+synthetic `DimHint` per level.  The loop-tiling lowering then gives the ops a multi-level `LoopMember`, and
+scheduler/codegen lower the resulting nested `LoopNode`s as nested counted loops.
 
 ## Adapter and Coarse Tiling
 
@@ -875,13 +875,13 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    `span_overflow_groups` itself never assigns `op.dim_hints`: it is a pure
    planning step, and the caller (`_maybe_coarse_tile_span_overflow` in
    `passes.py`) applies the assignments immediately before
-   `validate_coarse_tile_groups`/`coarse_tile_post_stickify` run.
+   `validate_coarse_tile_groups` and `tile_groups` run.
 
-From `coarse_tile` onward, automatic span-overflow groups and `for_each_tile` loops share the same path:
+From the lowering onward, automatic span-overflow groups and `for_each_tile` loops share the same path:
 
 - rewrite `op.data.ranges` and `op.layout.size` per tile;
-- stamp `CoarseTileInfo`;
-- wrap scheduled nodes in `CountedLoopSchedulerNode`;
+- build a `LoopNode` for the group;
+- schedule it as one `LoopSchedulerNode` (a `CountedLoopSchedulerNode`);
 - emit `LoopSpec` in codegen.
 
 ## Configuration
@@ -1172,7 +1172,7 @@ terminating its group.
 |---|---|
 | `torch_spyre/_inductor/wsr/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
 | `torch_spyre/_inductor/wsr/coarse_tile_span_overflow.py` | `span_overflow_groups`: adapter from tile plans to synthetic `DimHint`s |
-| `torch_spyre/_inductor/wsr/coarse_tile.py` | Coarse-tile IR stamping (`coarse_tile`, `CoarseTileInfo`) |
+| `torch_spyre/_inductor/wsr/loop_tiling_lowering.py` | The loop-tiling lowering (`tile_groups`, `lower_loop_tiling`) |
 | `torch_spyre/_inductor/passes.py` | Wires `splice_while_loops` (`for_each_tile`) and automatic span-overflow tiling into the pipeline |
 | `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
 | `torch_spyre/_inductor/ir.py` | Spyre layout resize/reconstruction helpers |

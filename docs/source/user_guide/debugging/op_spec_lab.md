@@ -346,7 +346,7 @@ capture time, so `KERNEL ARGS` shows them in the frozen header but not under
 
 Wraps a body of specs in a `count` trip count. Only coarse tiling produces
 these: a `for_each_tile` loop, or the automatic span-overflow tiling — see
-[Coarse Tiling Loops](../../compiler/coarse_tiling_loops.md).
+[Counted Loops](../../compiler/loop_nodes.md).
 
 ## Walkthrough: four worked examples
 
@@ -709,5 +709,5 @@ that looks wrong.
 - [Debugging overview](index.md) — the outer workflow this plugs into
 - [Inductor artifacts](inductor_artifacts.md) — the stages upstream of the OpSpec
 - [Tensors and layouts](../tensors_and_layouts.md) — sticks, tiling, `device_size`
-- [Coarse tiling loops](../../compiler/coarse_tiling_loops.md) — what produces a `LoopSpec`
+- [Counted loops](../../compiler/loop_nodes.md) — what produces a `LoopSpec`
 - [Indirect access](../../compiler/indirect_access.md) — how a gather becomes coordinates
