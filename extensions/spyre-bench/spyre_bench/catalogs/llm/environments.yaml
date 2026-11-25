@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+# An Environment is a request, not a place: how many cards a case needs, not which host runs it. The
+# launcher picks the host. `device.count` is a series label, so a one-card and a four-card run of the
+# same benchmark stay separate trend lines instead of being averaged together.
+#
+# These are the public names a Benchmark refers to. A deployment's own `ci-*` Environments come from
+# its central catalog and compose with these; a run names one with BENCH_ENVIRONMENT to put a whole
+# plan on a particular node class.
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-1card, description: one Spyre card}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 1}]
+  labels: {device.count: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-2card, description: "two Spyre cards, for a tensor-parallel-2 case"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 2}]
+  labels: {device.count: 2}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-4card, description: "four Spyre cards, for a tensor-parallel-4 case"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 4}]
+  labels: {device.count: 4}

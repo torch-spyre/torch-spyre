@@ -51,7 +51,7 @@ from .constants import (
     BATCH_MATMUL_FP8_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
     POOL_OPS,
     STAGGERED_EAS,
     _MAX_K_PER_CORE,
@@ -446,7 +446,7 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
 # *independent* per-op choosers -- see that function -- on the same ground as
 # the user ``work_div`` hint exemption there. Keyed on the op rather than a
 # config flag: the greedy passes run on the same graph and stay pinned, and an
-# op the hint pass tiled carries ``loop_member`` before the menu is enumerated, so
+# op the hint pass tiled is in its loop before the menu is enumerated, so
 # its candidates respect the pin. Written by ``coarse_tiling.apply_tilings`` on
 # each op it tiles or adds to a nest, and never cleared: nothing
 # after scratchpad planning re-derives a work division, so its lifetime is the
@@ -505,9 +505,10 @@ def coarse_tile_local_dim_split_domains(
     by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
     data when that happened.
 
-    ``coarse_tile.py`` stamps ``op.loop_member`` (a ``LoopMember``) on every
-    op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
-    dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
+    ``coarse_tile.py`` records, for every op it tiles, which dims each loop level
+    tiles (``LoopMember``, held by the loop nodes once they are built and read
+    through ``enclosing_loops``). ``loop_tiled_dims``/``loop_tiled_reduction_dims``
+    name tiled dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
     ``loop_tiled_dims`` is the source: an access's per-trip advance (the index's
     loop-variable coefficient) says nothing about whether the op's own dim is
     tiled, so it could not be used to keep a tiled dim whole.
@@ -808,10 +809,10 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
 
 def _keep_by_index_axes(ctx: WorkDivConstraintContext) -> set[Symbol] | None:
-    """Return the index-only K axes of a keep_by_index op."""
+    """Return the index-only K axes of a keep_by_index / mask_by_index op."""
     if not (
         isinstance(ctx.op.data, Reduction)
-        and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+        and ctx.op.data.reduction_type in INDEX_MASKING_OPS
     ):
         return None
     writes = op_read_writes(ctx.op).writes
@@ -865,18 +866,18 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
 
 
 def _keep_by_index_search_axis(ctx: WorkDivConstraintContext) -> Symbol | None:
-    """The iteration symbol of the keep_by_index full-search output axis.
+    """The iteration symbol of the keep/mask_by_index full-search output axis.
 
     The search axis is the simplest output device coordinate absent from the
     semantic indices operand. A broadcast indices input can omit unrelated
     output/batch axes, so select one simplest such coordinate rather than every
-    absent symbol. Returns ``None`` for a non-keep_by_index op or when no such
+    absent symbol. Returns ``None`` for a non-index-masking op or when no such
     axis exists.
     """
     if (
         not (
             isinstance(ctx.op.data, Reduction)
-            and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+            and ctx.op.data.reduction_type in INDEX_MASKING_OPS
         )
         or len(ctx.input_tds) < 2
     ):
@@ -972,7 +973,7 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
         BATCH_MATMUL_FP8_OP,
         CONV2D_FWD_OP,
         DEPTHWISE_CONV2D_OP,
-        KEEP_BY_INDEX_OP,
+        *INDEX_MASKING_OPS,
         *TOPK_OPS,
         *POOL_OPS,
     }

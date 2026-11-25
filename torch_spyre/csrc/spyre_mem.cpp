@@ -2130,13 +2130,14 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               " at storage offset ", sharded.storage_offset(), ")");
   TORCH_CHECK(host.sizes() == sharded.sizes(),
               "copy shape mismatch: ", host.sizes(), " vs ", sharded.sizes());
-  // Dtype-converting DMA is rejected: converting shard copies are untested
-  // against the D2H conversion path, which bounds its host output by the
-  // host_capacity the DMA factories set.
-  TORCH_CHECK(host.dtype() == sharded.dtype(),
-              "sharded Spyre tensors can only be copied without a dtype "
-              "change (got ",
-              sharded.dtype(), " -> ", host.dtype(), ")");
+  // Copies to the CPU may change the dtype (#5824): each shard's staging
+  // buffer below is allocated in the host dtype, and the D2H conversion is
+  // bounded by that buffer's size (the host_capacity the DMA factories take).
+  // Converting copies to the device are untested and stay rejected.
+  TORCH_CHECK(!host2device || host.dtype() == sharded.dtype(),
+              "sharded Spyre tensors can only be copied to the device "
+              "without a dtype change (got ",
+              host.dtype(), " -> ", sharded.dtype(), ")");
   const auto& info = *sharding_of(sharded)->sharding;
   // A same-size view(dtype) passes the view checks but leaves a tensor whose
   // dtype disagrees with the recorded shard layout; reject it before the copy

@@ -734,6 +734,7 @@ class TestSpliceWhileLoop(unittest.TestCase):
         before.inputs = []
 
         while_op = mock.Mock()
+        while_op.mutation_outputs = []
         while_op.carried_inputs = []
         while_op.inputs = []
         while_op.body_subgraph.graph.graph_outputs = []
@@ -755,6 +756,40 @@ class TestSpliceWhileLoop(unittest.TestCase):
         self.assertIn(body_op_a, graph.operations)
         self.assertIn(body_op_b, graph.operations)
 
+    def test_drops_the_while_ops_mutation_outputs(self):
+        """A MutationOutput naming the removed while_op as producer is unregistered.
+
+        It declares the body's write to an additional input, e.g.
+        for_each_tile(out=...)'s destination; after the splice the body's own write
+        declares it, and a buffer whose producer is gone must not stay behind.
+        """
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        body_op = mock.Mock(name="body_op", spec=["get_operation_name"])
+        mutation = mock.Mock(name="mutation")
+        kept = mock.Mock(name="kept")
+
+        while_op = mock.Mock()
+        while_op.mutation_outputs = [mutation]
+        while_op.carried_inputs = []
+        while_op.inputs = []
+        while_op.body_subgraph.graph.graph_outputs = []
+        while_op.body_subgraph.graph.graph_inputs = {}
+        while_op.body_subgraph.graph.operations = [body_op]
+        while_op.body_subgraph.graph.name_to_op = {}
+        while_op.body_subgraph.graph.name_to_buffer = {}
+
+        graph = mock.Mock()
+        graph.operations = [while_op]
+        graph.name_to_op = {}
+        graph.name_to_buffer = {"buf9": mutation, "buf1": kept}
+        graph.buffers = [kept, mutation]
+
+        bridge.splice_while_loop(graph, while_op, carries=[])
+
+        self.assertEqual(graph.name_to_buffer, {"buf1": kept})
+        self.assertEqual(graph.buffers, [kept])
+
     def test_splices_at_while_op_position(self):
         import torch_spyre._inductor.wsr.while_loop_bridge as bridge
 
@@ -765,6 +800,7 @@ class TestSpliceWhileLoop(unittest.TestCase):
         after.inputs = []
 
         while_op = mock.Mock()
+        while_op.mutation_outputs = []
         while_op.carried_inputs = []
         while_op.inputs = []
         while_op.body_subgraph.graph.graph_outputs = []
@@ -835,6 +871,7 @@ class TestSpliceWhileLoop(unittest.TestCase):
         producer_op.inputs = []
 
         while_op = mock.Mock()
+        while_op.mutation_outputs = []
         while_op.carried_inputs = [real_carry_init]
         while_op.inputs = [real_carry_init, real_xs_input]
         while_op.body_subgraph.graph.graph_outputs = [carry_placeholder]
