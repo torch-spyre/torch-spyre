@@ -687,6 +687,30 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
 
+    # TODO(#6683): becomes a positive test when integer sums are exact above 2**24.
+    # Integer sums accumulate in fp32 (_lower_sum_impl), so 2**24 + 1 rounds to
+    # 2**24 + 2 (CPU 16777217, device 16777218). 64 elements keep the input
+    # aligned, so the #4014 guard is not involved.
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "int32 sum accumulates in fp32, so a sum above 2**24 that fp32 cannot "
+            "represent is rounded: [2**24, 1, 0...] gives 16777218, not 16777217 "
+            "(#6683)"
+        ),
+    )
+    def test_sum_int32_above_2p24_exact(self):
+        """torch.sum(int32) with a sum above 2**24 must match CPU exactly."""
+        x = torch.zeros(64, dtype=torch.int32)
+        x[0] = 2**24
+        x[1] = 1
+
+        def fn(t):
+            return torch.sum(t)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
+
     # TODO(#4014): becomes a positive test when the unaligned staggered reduction
     # is fixed. The fp32 -> fp16 cast gives an FP32_TO_DL16 input, so this covers
     # the other staggered arrangement than the DL16_TO_FP32 bool sums in

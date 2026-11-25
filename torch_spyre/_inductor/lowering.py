@@ -1457,6 +1457,13 @@ def lower_mean_default(x, *, dtype=None):
 
 
 def _lower_sum_impl(x, axis, keepdim, dtype=None):
+    """Lower sum over ``axis``, accumulating in ``comp_dtype``.
+
+    bool/int32/int64 inputs accumulate in fp32 (INT_TO_FLOAT). fp32 holds integers
+    exactly only up to 2**24, so an int32/int64 input with an element or a running
+    sum above 2**24 that fp32 cannot represent gives an inexact result (#6683).
+    A bool sum is a count, so it is exact while the element count stays below 2**24.
+    """
     comp_dtype = _promoted_dtype(x, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT)
     # When the caller requests a wider float output dtype (e.g. fp16.sum(dtype=fp32)),
     # widen comp_dtype so the accumulation runs in that wider type rather than reducing
