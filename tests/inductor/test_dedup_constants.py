@@ -1439,7 +1439,7 @@ class TestDedupConstantsWithLoopNodes(_PassLevelBase):
                 chain.append(inner[0])
 
         def cb(graph: GraphLowering) -> None:
-            from torch_spyre._inductor.loop_node import LoopNode
+            from torch_spyre._inductor.loop_node import LoopNode, all_ops
 
             real = graph.operations
             constants = [op for op in real if isinstance(op, SpyreConstantFallback)]
@@ -1457,9 +1457,23 @@ class TestDedupConstantsWithLoopNodes(_PassLevelBase):
             const._loop_chain = tuple(chain)  # type: ignore[attr-defined]
             depths = {n: d for n, d, _ in self._tree_constants(real)}
             assert depths[const.get_operation_name()] == len(chain), depths
+            # The pass keeps the first constant of each key (in flat program
+            # order) and hoists the survivors, in that order, to the head of the
+            # top-level list. ``const`` has no duplicate, so it survives, and its
+            # slot is the number of keys first seen before it in flat order.
+            keys_before: list[tuple] = []
+            for op in all_ops(real):
+                if op is const:
+                    break
+                if isinstance(op, SpyreConstantFallback):
+                    key = (op.constant_args[0], op.layout.dtype)
+                    if key not in keys_before:
+                        keys_before.append(key)
 
             after_real = self._run_pass_on_view(graph)
-            seen["name"] = const.get_operation_name()
+            seen["expected_index"] = len(keys_before)
+            seen["index"] = next(i for i, op in enumerate(after_real) if op is const)
+            seen["head"] = [isinstance(op, SpyreConstantFallback) for op in after_real]
             seen["after"] = self._tree_constants(after_real)
             seen["chain"] = const._loop_chain  # type: ignore[attr-defined]
             raise _TestStopSignal()
@@ -1467,8 +1481,18 @@ class TestDedupConstantsWithLoopNodes(_PassLevelBase):
         self._drive(cb, fn, args)
         after = seen["after"]
         self.assertEqual({depth for _, depth, _ in after}, {0}, after)
-        self.assertEqual([i for _, _, i in after], list(range(len(after))), after)
-        self.assertIn(seen["name"], [name for name, _, _ in after])
+        # The top-level list is the constants, then the rest: no constant after
+        # the first non-constant entry.
+        n = len(after)
+        self.assertEqual(seen["head"][:n], [True] * n)
+        self.assertNotIn(True, seen["head"][n:])
+        self.assertLess(
+            n, len(seen["head"]), "PRECONDITION: the graph is all constants"
+        )
+        # The moved constant sits at its exact slot in that head block (its
+        # top-level index), not merely somewhere in the graph.
+        self.assertLess(seen["index"], n)
+        self.assertEqual(seen["index"], seen["expected_index"])
         self.assertEqual(seen["chain"], ())
 
     def test_constants_keep_their_relative_order(self) -> None:
