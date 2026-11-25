@@ -36,6 +36,9 @@ What it checks:
    index uses an enclosing loop's variable must hold a tiling entry in those nodes
    (an op without one reads as "not in the loop", which would drop its advance
    silently).
+7. No body holds an extern kernel that does work (``runs_once_outside_loops``):
+   Spyre cannot run one inside a counted loop, so it runs once, before the loop.
+   An allocation (a no-op extern kernel) may stay in a body.
 
 A loop no node covers is not checked: a loop-tiling lowering requests its
 nodes and the pass loop builds them once the pass has returned. So rule 4 fires
@@ -51,12 +54,6 @@ Rule 6 skips nodes the pipeline did not build.
 What it cannot check: that a read which SHOULD advance carries the induction
 variable. That was the padding bug (#5573); only a comparison against the
 kernel finds it.
-
-What it does not check, and why. A once-only op (an extern kernel that keeps
-its ``loop_member``, such as a ``SpyreConstantFallback`` created in a body)
-stays in the body until the scheduler hoists it (``loop_scheduler``), so
-"once-ops are outside the node" is not an invariant before that. On the loop
-tests, a check for it fired on every graph that creates a constant in a body.
 
 A carry's STORAGE is not required to be in the body either: it is the
 carry's initial buffer, which is written before the loop.
@@ -79,7 +76,7 @@ from torch._inductor.dependencies import MemoryDep
 
 from .logging_utils import get_inductor_logger
 from .loop_facts import counted_loop_path
-from .loop_node import LoopNode, all_ops, in_building_loop
+from .loop_node import LoopNode, all_ops, in_building_loop, runs_once_outside_loops
 
 logger = get_inductor_logger("loop_checker")
 
@@ -251,8 +248,7 @@ def _non_members(entries: list[ir.Operation], depth: int, problems: list[str]) -
     body. (Before stage 8.5 an op at the head or tail was allowed, because the
     flat view put an op inserted "before the loop" there and ``peel_non_members``
     moved it out at the hand-off; every edit now names its position, and that
-    repair is gone.) An ``ExternKernel`` is allowed anywhere: a once-op stays in
-    the body until the scheduler hoists it.
+    repair is gone.) An ``ExternKernel`` is skipped here: rule 7 reports it.
     """
     for entry in entries:
         if not isinstance(entry, LoopNode):
@@ -310,6 +306,11 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
         if id(op) in seen:
             problems.append(f"{op.get_name()} appears more than once in the tree")
         seen.add(id(op))
+        if enclosing and runs_once_outside_loops(op):
+            problems.append(
+                f"{op.get_name()} is an extern kernel in the body of "
+                f"{enclosing[-1].get_name()}; it runs once, before the loop"
+            )
         if not all_inductions:
             # No loop has an induction variable, so no index can use a stray
             # one: skip tracing every op's dependencies.

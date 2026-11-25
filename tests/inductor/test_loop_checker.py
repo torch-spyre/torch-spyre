@@ -98,6 +98,16 @@ class _ExternLoopOp(_LoopOp, ExternKernel):
     runs once, so it has no loop path. Only the base class matters to the checker;
     ``ExternKernel.__init__`` is not run."""
 
+    def is_no_op(self):
+        return False
+
+
+class _AllocationLoopOp(_ExternLoopOp):
+    """An extern kernel that does no work (an allocation): it may stay in a body."""
+
+    def is_no_op(self):
+        return True
+
 
 class _SpyreLoopOp(_LoopOp, _SpyreOp):
     """A Spyre-device op with a ``loop_member``, so the pass pipeline runs on it."""
@@ -237,24 +247,36 @@ class TestMembership(unittest.TestCase):
         self.assertIn("head is in the body of n0", problems[0])
         self.assertIn("tail is in the body of n0", problems[1])
 
-    def test_an_extern_kernel_at_the_head_or_tail_is_allowed(self):
+    def test_an_extern_kernel_in_a_body_is_a_violation(self):
+        """An extern kernel runs once, before the loop: in a body it is wrong at
+        the head, between two members and at the tail alike."""
+        for label, body in (
+            ("head", [_ExternLoopOp("x", (0,)), _LoopOp("a", (0,))]),
+            (
+                "middle",
+                [_LoopOp("a", (0,)), _ExternLoopOp("x", (0,)), _LoopOp("b", (0,))],
+            ),
+            ("tail", [_LoopOp("a", (0,)), _ExternLoopOp("x", (0,))]),
+        ):
+            with self.subTest(label):
+                problems = find_violations([_node("n0", body)])
+                self.assertEqual(
+                    problems,
+                    [
+                        "x is an extern kernel in the body of n0; "
+                        "it runs once, before the loop"
+                    ],
+                )
+
+    def test_an_allocation_in_a_body_is_allowed(self):
         tree = [
             _node(
                 "n0",
                 [
-                    _ExternLoopOp("head", (0,)),
                     _LoopOp("a", (0,)),
-                    _ExternLoopOp("t", (0,)),
+                    _AllocationLoopOp("buf", (0,)),
+                    _LoopOp("b", (0,)),
                 ],
-            )
-        ]
-        self.assertEqual(find_violations(tree), [])
-
-    def test_an_extern_kernel_between_two_members_is_allowed(self):
-        tree = [
-            _node(
-                "n0",
-                [_LoopOp("a", (0,)), _ExternLoopOp("const", (0,)), _LoopOp("b", (0,))],
             )
         ]
         self.assertEqual(find_violations(tree), [])
