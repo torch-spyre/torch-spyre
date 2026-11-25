@@ -14,6 +14,7 @@
 
 import dataclasses
 import types
+import unittest.mock as mock
 
 import pytest
 import sympy
@@ -28,11 +29,13 @@ from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Scatter
 from torch._inductor.sizevars import SizeVarAllocator
+from torch._inductor.utils import sympy_index_symbol
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_device_dtype
 
 import torch_spyre._inductor.pass_utils as pass_utils
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_layouts import PropArg
 from torch_spyre._inductor.patches import _unique_operation_names
 from torch_spyre._inductor.pass_utils import (
@@ -42,7 +45,10 @@ from torch_spyre._inductor.pass_utils import (
     reorder_valid_elements,
     restickify_valid_elements,
 )
-from torch_spyre._inductor.propagate_layouts import _compact_broadcast_device_dims
+from torch_spyre._inductor.propagate_layouts import (
+    _compact_broadcast_device_dims,
+    _prune_unaligned_staggered_inputs,
+)
 from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 from utils_inductor import DEVICE
 
@@ -852,3 +858,35 @@ def test_compute_size1_restickify_layout_indirect_access():
     # maps to no host stride.
     assert list(result.device_size) == [512, 64]
     assert list(result.stride_map) == [1, 0]
+
+
+@pytest.mark.parametrize(
+    "ea, device_size, stride_map, dtype",
+    [
+        (ElementArrangement.DL16_TO_FP32, [4, 4, 32], [32, 100, 1], torch.float32),
+        (ElementArrangement.FP32_TO_DL16, [2, 4, 64], [64, 100, 1], torch.float16),
+    ],
+)
+@pytest.mark.parametrize("outer_name, stick_name", [("c0", "c1"), ("c1", "c0")])
+def test_unaligned_staggered_guard_considers_every_reduction_var(
+    ea, device_size, stride_map, dtype, outer_name, stick_name
+):
+    """A full sum() of an unaligned (4, 100) staggered input reduces two variables.
+
+    The guard must raise whichever of them carries the stick. Swapping which
+    symbol name is the stick variable exercises both set iteration orders, so a
+    guard that picks one reduction variable arbitrarily fails for one of them.
+    """
+    outer = sympy_index_symbol(outer_name)
+    stick = sympy_index_symbol(stick_name)
+    valid = dict(SpyreTensorLayout([4, 100], dtype).valid_elements)
+    stl = SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype), valid, ea)
+    host = FixedLayout(torch.device("cpu"), dtype, [4, 100], [100, 1])
+    dep = MemoryDep("x", 100 * outer + stick, (outer, stick), (4, 100))
+    scalar_out = MemoryDep("y", sympy.S.Zero, (), ())
+    op = mock.MagicMock()
+    op.get_name.return_value = "buf1"
+    op.data.reduction_type = "sum"
+
+    with pytest.raises(Unsupported, match="issue #4014"):
+        _prune_unaligned_staggered_inputs(op, PropArg(dep, host, [stl]), scalar_out)

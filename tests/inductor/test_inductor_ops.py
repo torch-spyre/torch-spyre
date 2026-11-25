@@ -7053,10 +7053,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "bool_1d": (cached_randint((64,), high=2) > 0,),
                 "bool_2d": (cached_randint((67, 256), high=2) > 0,),
                 # Unaligned bool: the bool→fp32 upcast produces a staggered
-                # DL16_TO_FP32 tensor; the backend cannot reduce a staggered
-                # input whose stick-dim size is not a multiple of 64 (#4014).
+                # DL16_TO_FP32 tensor; the compiler rejects (Unsupported) a
+                # reduction of a staggered input whose stick-dim size is not a
+                # multiple of 64, because the backend returns a wrong result
+                # (#4014).
                 "bool_1d_unaligned": (cached_randint((100,), high=2) > 0,),
                 "bool_2d_unaligned": (cached_randint((1, 855), high=2) > 0,),
+                # Full sum() of a 2-D tensor has two reduction variables, so
+                # this checks the guard considers all of them, not one.
+                "bool_2d_unaligned_multi": (cached_randint((4, 100), high=2) > 0,),
                 # Same problem from an fp16 compare intermediate (not a host
                 # bool, but still fp16-backed → DL16_TO_FP32 after upcast).
                 "bool_2d_unaligned_cmp": (
@@ -7067,11 +7072,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int64_1d": (cached_randint((64,), dtype=torch.int64),),
                 "int64_2d": (cached_randint((67, 256), dtype=torch.int64),),
             },
-            # Unaligned staggered inputs raise Unsupported until #4014 is fixed.
-            "expect_fail": {
-                "sum_bool_1d_unaligned": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
-                "sum_bool_2d_unaligned": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
-                "sum_bool_2d_unaligned_cmp": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
+            # TODO(#4014): unaligned staggered inputs raise Unsupported until the
+            # backend masking bug is fixed; then these become positive tests.
+            "expect_raise": {
+                "sum_bool_1d_unaligned": "issue #4014",
+                "sum_bool_2d_unaligned": "issue #4014",
+                "sum_bool_2d_unaligned_cmp": "issue #4014",
+                "sum_bool_2d_unaligned_multi": "issue #4014",
             },
         },
         # Float sums use default tolerance (fp16/fp32 results are not exact).

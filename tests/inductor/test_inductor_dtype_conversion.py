@@ -633,6 +633,37 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    # TODO(#4014): becomes a positive test when the unaligned staggered reduction
+    # is fixed. The fp32 -> fp16 cast gives an FP32_TO_DL16 input, so this covers
+    # the other staggered arrangement than the DL16_TO_FP32 bool sums in
+    # test_inductor_ops.py.
+    @_rejected("issue #4014", "#4014")
+    def test_sum_unaligned_fp32_to_fp16_1d_rejected(self):
+        """sum of an unaligned fp32 -> fp16 cast, (100,): FP32_TO_DL16 guard."""
+        # Integer-valued, so a wrong count would show as a wrong sum.
+        x = utils_inductor.cached_randint(
+            (100,), differentiation="fp32dl16_1d", low=1, high=5, dtype=torch.float32
+        )
+
+        def fn(t):
+            return torch.sum(t.to(torch.float16))
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
+    # TODO(#4014): as above. (4, 100) has two reduction variables, so this also
+    # checks that the guard considers all of them for FP32_TO_DL16.
+    @_rejected("issue #4014", "#4014")
+    def test_sum_unaligned_fp32_to_fp16_2d_rejected(self):
+        """sum of an unaligned fp32 -> fp16 cast, (4, 100): two reduction vars."""
+        x = utils_inductor.cached_randint(
+            (4, 100), differentiation="fp32dl16_2d", low=1, high=5, dtype=torch.float32
+        )
+
+        def fn(t):
+            return torch.sum(t.to(torch.float16))
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
     def test_sum_bf16_dtype_fp32(self):
         """torch.sum(bf16, dtype=fp32) — same issue as fp16 variant."""
         x = cached_randn((4, 64), dtype=torch.bfloat16, differentiation="spe03bf16_sum")

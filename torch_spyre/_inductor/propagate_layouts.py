@@ -2521,30 +2521,36 @@ def _prune_unaligned_staggered_inputs(
     op: Operation, arg: "PropArg", output_dep: MemoryDep
 ) -> None:
     """Remove staggered STL candidates where the reduction is over the stick
-    and the stick dimension is not aligned to the fp16 stick width (64 elements).
+    and the stick dimension is not a multiple of the stagger unit (64 elements).
 
     Issue #4014: for a staggered (``DL16_TO_FP32`` or ``FP32_TO_DL16``) input,
-    when the reduction variable lives on the stick dimension and that dimension's
-    size is not a multiple of 64 (the fp16 elements-per-stick), the backend's
-    coordinate masking emits a single tail-interval which covers the wrong lanes
-    and silently returns an incorrect result.
+    when a reduction variable lives on the stick dimension and that dimension's
+    size is not a multiple of 64 (the stagger unit), the backend's coordinate
+    masking emits a single tail-interval which covers the wrong lanes and
+    silently returns an incorrect result.
 
-    The guard fires only when the **stick carries the reduction variable**.  When
-    the reduction is over a non-stick dimension the stagger does not affect
-    coordinate masking and the candidate is safe.
+    Every reduced variable is considered: a reduction can have several (a full
+    ``sum()`` of a 2-D tensor reduces both dims), and the guard fires when any
+    of them is carried by the stick.  When the reduction is over non-stick
+    dimensions only, the stagger does not affect coordinate masking and the
+    candidate is safe.
 
     If every candidate is unsafe, ``Unsupported`` is raised immediately (no
     restickify attempt — staggered STLs cannot be restickified).
     """
-    # Identify the reduction variable: present in input dep, absent in output.
-    reduction_var = next(
-        iter(arg.dep.index.free_symbols - output_dep.index.free_symbols), None
-    )
-    if reduction_var is None:
+    # Identify the reduction variables: present in input dep, absent in output.
+    reduction_vars = arg.dep.index.free_symbols - output_dep.index.free_symbols
+    if not reduction_vars:
         return
 
     in_coords = host_coordinates(arg.layout, arg.dep, None)
-    fp16_eps = get_elem_in_stick(torch.float16)  # 64
+    # The stagger unit is 64 elements for both staggered arrangements, whatever
+    # the host dtype, so it is the fp16 stick width and not elems_per_stick():
+    #  - FP32_TO_DL16 is fp16 on device (64 elements per stick).
+    #  - DL16_TO_FP32 is fp32 on device (32 elements per stick) but is staggered
+    #    in pairs of fp32 sticks, so its unit is also 64.  Using 32 would accept
+    #    sizes such as 96 that have no room for the last stick pair.
+    stagger_unit = get_elem_in_stick(torch.float16)
 
     bad: dict[int, int] = {}  # id(stl) -> stick-dim size for unsafe candidates
     for stl in arg.layouts:
@@ -2553,14 +2559,14 @@ def _prune_unaligned_staggered_inputs(
         dev_coords = try_device_coordinates(stl, arg.dep, None)
         if dev_coords is None:
             continue
-        # Only unsafe when the reduction variable lives on the stick.
-        if reduction_var not in dev_coords[-1].free_symbols:
+        # Only unsafe when a reduction variable lives on the stick.
+        if not reduction_vars & dev_coords[-1].free_symbols:
             continue
         stick_dim = matching_dim(in_coords, dev_coords[-1])
         if stick_dim is None:
             continue
         n = concretize_expr(arg.layout.size[stick_dim])
-        if n % fp16_eps != 0:
+        if n % stagger_unit != 0:
             bad[id(stl)] = n
 
     if not bad:
@@ -2573,7 +2579,7 @@ def _prune_unaligned_staggered_inputs(
         raise Unsupported(
             f"{op.get_name()} ({op.data.reduction_type}): reduction of a staggered "
             f"({stl.element_arrangement}) input whose stick-dim size {n} is not a "
-            f"multiple of {fp16_eps} (issue #4014)"
+            f"multiple of {stagger_unit} (issue #4014)"
         )
     arg.layouts[:] = kept
 
