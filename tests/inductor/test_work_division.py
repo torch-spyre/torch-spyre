@@ -6023,8 +6023,9 @@ def _host_tiled_layout(size, stride, dim_order=None):
     )
 
 
-def _with_gap_dim(layout):
-    """``layout`` with the gap dim the padding pass gives a size-1 restickify."""
+def _with_gap_dim(layout, outermost=True):
+    """``layout`` with the gap dim the padding pass gives a size-1 restickify:
+    just outside the stick dim, or outermost as for a graph output."""
     from torch_spyre._inductor import padding
 
     class _Buf:
@@ -6034,8 +6035,17 @@ def _with_gap_dim(layout):
         def get_layout(self):
             return self.layout
 
+        def get_name(self):
+            return "buf_y"
+
+    class _Graph:
+        operations = []
+
+        def get_output_names(self):
+            return ["buf_y"] if outermost else []
+
     buf = _Buf(layout)
-    padding._pad_elided_dim(buf)
+    padding._pad_elided_dim(buf, None, _Graph())
     return buf.layout
 
 
@@ -6165,26 +6175,18 @@ class TestRestickifySweepSpan(unittest.TestCase):
         )
         self.assertTrue(all(s == 1 for s in splits.values()), splits)
 
-    def test_inner_size64_dim_is_not_a_sweep_dim(self):
-        # Only the outermost position is a gap dim: an inner size-64 dim with
-        # coordinate 0 sits inside the split dim, so the coordinate span covers it.
+    def test_inner_gap_dim_sweep_shrinks_with_the_split(self):
+        # The gap dim just outside the stick dim is swept one stick apart, inside
+        # each core's share of the split dim: 32 cores cut the span 32 ways.
         rows = 2**21 + 2048
-        sticks = rows // 64
-        inner = SpyreTensorLayout(
-            [sticks, 64, 64],
-            [64, 0, 1],
-            DataFormats.SEN169_FP16,
-            {(0, 2): rows, (1,): 1},
-        )
-        intact_layout = FixedTiledLayout(
-            torch.device("spyre:0"), torch.float16, [rows], [1], inner
-        )
+        intact_layout = _with_gap_dim(_host_tiled_layout([rows], [1]), outermost=False)
         intact, _, it_space, d0 = self._restickify_tds(rows, intact_layout)
-        self.assertIsNone(intact.sweep_dim)
-        self.assertEqual(
-            work_division_module.get_per_core_span(intact, {d0: 32}, it_space, {}),
-            work_division_module._coordinate_span(intact, {d0: 32}, it_space, {}),
-        )
+        self.assertEqual(intact.sweep_dim, 1)
+        whole = 64 * (rows // 64) * 64 * 2
+        span = work_division_module.get_per_core_span
+        self.assertEqual(span(intact, {d0: 1}, it_space, {}), whole)
+        self.assertEqual(span(intact, {d0: 32}, it_space, {}), whole // 32)
+        self.assertLessEqual(whole // 32, work_division_module.MAX_SPAN_BYTES)
 
     def test_size64_dim_holding_data_is_not_a_sweep_dim(self):
         # The gap dim holds no data (stride map 0). An outermost size-64 dim with
