@@ -143,7 +143,7 @@ BUFFER_RESIDENCY_RULES = (
         ("fixed LX address",),
         (
             "LX addresses cannot use affine.apply symbols. The write or read "
-            "advances per tile; loop_info supplies the tile geometry."
+            "advances per tile; the loop node supplies the tile geometry."
         ),
         (
             "TestLoopCarryLxEligibility",
@@ -418,7 +418,10 @@ TRANSFER_CERTIFICATES = (
             "test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected",
             "test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access",
         ),
-        ("test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition",),
+        (
+            "test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition",
+            "test_solver_relayout_e2e.py::test_gate_up_halves_read_the_matmul_output_in_place",
+        ),
     ),
     TransferCertificate(
         "Full-parent copy for local subranges",

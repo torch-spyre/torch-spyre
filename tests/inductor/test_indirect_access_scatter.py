@@ -39,7 +39,6 @@ from indirect_access_common import (  # noqa: E402
     CRASHED,
     GATHER_OP_SPEC,
     SCATTER_OP_SPEC,
-    DIRECT_OP_SPEC,
     register_multicore_variants,
 )
 from utils_inductor import expects_raise  # noqa: E402
@@ -684,6 +683,79 @@ class _ScatterScenarios:
             return z + y
 
         self._assert_compiled_matches_cpu(kernel, y, src_y, idx_y, z, src_z, idx_z)
+
+    def test_index_copy_twice_into_one_destination_e2e(self):
+        """Two in-place index_copy_ calls into one graph input: the second
+        scatter must start from the destination the first one wrote."""
+        dst = torch.zeros(128, 128, dtype=torch.float16).to("spyre")
+        src0 = torch.rand(4, 128, dtype=torch.float16).to("spyre")
+        src1 = torch.rand(4, 128, dtype=torch.float16).to("spyre")
+        idx0 = torch.arange(0, 4, dtype=torch.int64).to("spyre")
+        idx1 = torch.arange(64, 68, dtype=torch.int64).to("spyre")
+
+        def kernel(dst, src0, src1, idx0, idx1):
+            dst.index_copy_(0, idx0, src0)
+            dst.index_copy_(0, idx1, src1)
+            return dst
+
+        self._assert_compiled_matches_cpu(kernel, dst, src0, src1, idx0, idx1)
+
+    def test_substick_index_copy_over_many_outer_entries_e2e(self):
+        """index_copy_ into [T, N, 1] with N >= 64: every outer entry of every
+        row must go to the row its index names. The index is one value per
+        row, repeated over N; it must not be read as an N-long tensor."""
+        for n in (64, 128):
+            with self.subTest(n=n):
+                cache = torch.zeros(8, n, 1, dtype=torch.float16).to("spyre")
+                src = torch.rand(4, n, 1, dtype=torch.float16).to("spyre")
+                idx = torch.tensor([7, 6, 5, 4], dtype=torch.int64).to("spyre")
+
+                def kernel(cache, idx, src):
+                    cache.index_copy_(0, idx, src)
+                    return cache
+
+                self._assert_compiled_matches_cpu(kernel, cache, idx, src)
+
+    @staticmethod
+    def _lx_planner(co_opt):
+        """LX planning on; both planners decide input clones, in separate code."""
+        from torch_spyre._inductor import config
+
+        torch._dynamo.reset()
+        return config.patch(lx_planning=True, co_optimizing_lx_planning=co_opt)
+
+    def _default_layout_pool_operands(self, P=192, D=64, rows=32):
+        """A default-layout pool, which a scatter relayouts, two row sets, a source."""
+        pool = torch.full((P, D), 3.0, dtype=torch.float16)
+        src = torch.rand(rows, D, dtype=torch.float16)
+        perm = torch.randperm(P)
+        idx_a, idx_b = perm[:rows], perm[rows : 2 * rows]
+        return pool.to("spyre"), src.to("spyre"), idx_a.to("spyre"), idx_b.to("spyre")
+
+    def test_index_copy_then_read_default_layout_input_e2e(self):
+        """A later read of a scattered graph input sees the write, not a stale LX clone."""
+
+        def kernel(pool, src, idx):
+            pool.index_copy_(0, idx, src)
+            return pool * 2
+
+        for co_opt in (True, False):
+            with self.subTest(co_opt=co_opt), self._lx_planner(co_opt):
+                pool, src, idx, _ = self._default_layout_pool_operands()
+                self._assert_compiled_matches_cpu(kernel, pool, src, idx)
+
+    def test_index_copy_twice_into_default_layout_input_e2e(self):
+        """Two scatters into one graph input keep both writes."""
+
+        def kernel(pool, src, idx_a, idx_b):
+            pool.index_copy_(0, idx_a, src)
+            pool.index_copy_(0, idx_b, src + 1)
+            return pool
+
+        for co_opt in (True, False):
+            with self.subTest(co_opt=co_opt), self._lx_planner(co_opt):
+                pool, src, idx_a, idx_b = self._default_layout_pool_operands()
+                self._assert_compiled_matches_cpu(kernel, pool, src, idx_a, idx_b)
 
     def test_index_put_3d_scatter_dim1_e2e(self):
         """3-D tensor [B, H, D] scatter on dim 1 (H): y[:, idx, :] = src.
@@ -1600,6 +1672,9 @@ class _ScatterScenarios:
         )
 
     # ------------- Not Detected As Indirect Access Scatter -------------
+    # These modes lower to a mutating fallback rather than an indirect
+    # store, so the backend rejects the form before any op spec.
+    # TODO(issue#4361): stage and run them once they lower on device.
     def test_scatter_reduce_amax(self):
         """out.scatter_reduce_(0, index, src, "amax")"""
         out, src, index = self._full_index_store(dtype=torch.int64)
@@ -1607,10 +1682,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amax")
 
-        # The device result is wrong (#5326); drop the pin once that is fixed.
-        self._stage_and_e2e(
-            kernel, out, src, index, expect=DIRECT_OP_SPEC, expect_close=False
-        )
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     def test_scatter_reduce_amin(self):
         """out.scatter_reduce_(0, index, src, "amin")"""
@@ -1619,7 +1692,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amin")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     def test_scatter_reduce_prod(self):
         """out.scatter_reduce_(0, index, src, "prod")"""
@@ -1628,7 +1702,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "prod")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     # -- Known crashes (separate from the indirect-store path) -------------
     def test_index_fill_crashes(self):

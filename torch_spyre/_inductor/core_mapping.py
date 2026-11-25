@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from itertools import permutations, product
 from typing import Any, Callable
 
@@ -120,55 +120,81 @@ def transfer_edges(
     """Ownership intersections for ordinary and completed-result copies.
 
     Both partitions must describe the same coordinate domain.
+
+    A pair of cores intersects when their slices overlap on every dimension,
+    so the work splits by dimension: for each dimension and each source slot,
+    the destination cores it overlaps form one bitmask (computed once per
+    slot), and a source core's destinations are the AND of its masks.
     """
     all_splits = source_splits.keys() | destination_splits.keys()
+    destination_cores = list(destination_map)
+    per_dim: list[tuple[Any, int, int, dict[int, int], dict[int, int]]] = []
+    for dim in all_splits:
+        cores_by_slot: dict[int, int] = {}
+        for bit, d_slice in enumerate(destination_map.values()):
+            slot = d_slice.get(dim, 0)
+            cores_by_slot[slot] = cores_by_slot.get(slot, 0) | (1 << bit)
+        per_dim.append(
+            (
+                dim,
+                source_splits.get(dim, 1),
+                destination_splits.get(dim, 1),
+                cores_by_slot,
+                {},
+            )
+        )
+    everyone = (1 << len(destination_cores)) - 1
     result = set()
     for s_core, s_slice in source_map.items():
-        for d_core, d_slice in destination_map.items():
-            for dim in all_splits:
-                if not _overlap(
-                    s_slice.get(dim, 0),
-                    source_splits.get(dim, 1),
-                    d_slice.get(dim, 0),
-                    destination_splits.get(dim, 1),
-                ):
-                    break
-            else:
-                result.add((s_core, d_core))
+        mask = everyone
+        for dim, source_split, destination_split, cores_by_slot, reach in per_dim:
+            a = s_slice.get(dim, 0)
+            cores = reach.get(a)
+            if cores is None:
+                cores = 0
+                for b, holders in cores_by_slot.items():
+                    if _overlap(a, source_split, b, destination_split):
+                        cores |= holders
+                reach[a] = cores
+            mask &= cores
+            if not mask:
+                break
+        while mask:
+            low = mask & -mask
+            result.add((s_core, destination_cores[low.bit_length() - 1]))
+            mask ^= low
     return result
 
 
-def same_owner_maps(
-    left_splits: Mapping[Any, int],
-    left_slots: Mapping[Any, Expr],
-    left_cores: int,
-    right_splits: Mapping[Any, int],
-    right_slots: Mapping[Any, Expr],
-    right_cores: int,
-) -> bool:
-    """Whether two owner maps give every physical core the same slice.
+def ownership_key(
+    splits: Mapping[Any, int], slots: Mapping[Any, Expr], num_cores: int
+) -> tuple | None:
+    """The physical ownership an owner map describes, as a hashable value.
 
-    Unsplit dimensions describe no ownership and are ignored. Equivalent SymPy
-    spellings compare equal; a missing owner formula is a mismatch.
+    Two owner maps give every physical core the same slice exactly when their
+    keys are equal and not ``None``. The key is the core count and, for each
+    split dimension (split > 1), its split and the slot every core owns along
+    it, so equivalent SymPy spellings share a key and unsplit dimensions are
+    ignored. ``None`` stands for a map that matches nothing, not even itself:
+    no cores, a split dimension without an owner formula, or a formula that is
+    not an integer on some core.
     """
-    if left_cores <= 0:
-        return False
-    if left_cores != right_cores:
-        return False
-    left = {dim: split for dim, split in left_splits.items() if split > 1}
-    right = {dim: split for dim, split in right_splits.items() if split > 1}
-    if not left and not right:
-        return True
-    if left != right:
-        return False
-    try:
-        return core_mappings_equal(
-            {dim: left_slots[dim] for dim in left},
-            {dim: right_slots[dim] for dim in right},
-            left_cores,
-        )
-    except KeyError:
-        return False
+    if num_cores <= 0:
+        return None
+    entries = []
+    for dim, split in splits.items():
+        if split <= 1:
+            continue
+        if dim not in slots:
+            return None
+        try:
+            values = _owner_values(sympify(slots[dim]), num_cores)
+        except (TypeError, ValueError):
+            return None
+        if values is None:
+            return None
+        entries.append((dim, split, values))
+    return (num_cores, frozenset(entries))
 
 
 @lru_cache(maxsize=256)
@@ -1003,10 +1029,6 @@ def partition_lx_size_bytes(
     return get_device_size_in_bytes(per_core_size, device_dtype)
 
 
-def _comparable(expr):
-    return expr if not isinstance(expr, Expr) else str(expr)
-
-
 def core_mappings_equal(
     left: Mapping[Any, Expr],
     right: Mapping[Any, Expr],
@@ -1014,55 +1036,37 @@ def core_mappings_equal(
 ) -> bool:
     """Return whether two symbolic mappings assign every core identically.
 
-    Memoized on the two mappings: the planner compares the same handful of
-    owner formulas thousands of times (view interning, the slicing-match gate
-    and the movement gate all go through here, and structurally identical ops
-    such as attention's unrolled KV blocks induce identical views). Profiled
-    on a 304-op graph this was 5 million ``sympify`` calls.
+    Compares each dimension's per-core slot values, which :func:`_owner_values`
+    caches per formula: the planner compares the same handful of owner formulas
+    many times (structurally identical ops such as attention's unrolled KV
+    blocks induce identical mappings). A formula that is not an integer on some
+    core matches nothing.
     """
 
     if num_cores <= 0:
         return False
     if left.keys() != right.keys():
         return False
-
-    try:
-        key_left = tuple(
-            sorted(
-                ((_comparable(d), sympify(e)) for d, e in left.items()),
-                key=lambda kv: kv[0],
-            )
-        )
-        key_right = tuple(
-            sorted(
-                ((_comparable(d), sympify(e)) for d, e in right.items()),
-                key=lambda kv: kv[0],
-            )
-        )
-    except (TypeError, ValueError):
-        return False
-    return _core_mappings_equal_cached(key_left, key_right, num_cores)
+    for dim, formula in left.items():
+        try:
+            values = _owner_values(sympify(formula), num_cores)
+            if values is None or values != _owner_values(
+                sympify(right[dim]), num_cores
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 @lru_cache(maxsize=65536)
-def _core_mappings_equal_cached(
-    left: tuple[tuple[Any, Expr], ...],
-    right: tuple[tuple[Any, Expr], ...],
-    num_cores: int,
-) -> bool:
+def _owner_values(formula: Expr, num_cores: int) -> tuple[int, ...] | None:
+    """The slot ``formula`` gives each core ``0 .. num_cores - 1``, or ``None``
+    when it is not an integer on some core. Few distinct formulas recur."""
     try:
-        for (_, lf), (_, rf) in zip(left, right):
-            for core in range(num_cores):
-                try:
-                    l_val = as_int(_owner_at_core(lf, core))
-                    r_val = as_int(_owner_at_core(rf, core))
-                    if l_val != r_val:
-                        return False
-                except ValueError:
-                    return False
-        return True
+        return tuple(as_int(_owner_at_core(formula, core)) for core in range(num_cores))
     except (TypeError, ValueError):
-        return False
+        return None
 
 
 @dataclass(frozen=True)
@@ -1108,17 +1112,24 @@ class PerCoreView:
         )
         object.__setattr__(self, "num_cores", num_cores)
 
-    def same_partition(self, other: "PerCoreView") -> bool:
-        """Whether both views assign every physical core the same buffer slice."""
+    @cached_property
+    def partition_key(self) -> "tuple | None":
+        """This view's :func:`ownership_key`, computed once per view.
 
-        return same_owner_maps(
+        Two views have the same partition exactly when their keys are equal and
+        not ``None``.
+        """
+        return ownership_key(
             dict(self.work_slice_dims),
             dict(self.core_to_slot),
             self.num_cores if self.num_cores is not None else self.split_product,
-            dict(other.work_slice_dims),
-            dict(other.core_to_slot),
-            other.num_cores if other.num_cores is not None else other.split_product,
         )
+
+    def same_partition(self, other: "PerCoreView") -> bool:
+        """Whether both views assign every physical core the same buffer slice."""
+
+        key = self.partition_key
+        return key is not None and key == other.partition_key
 
 
 def core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]:
@@ -1129,8 +1140,17 @@ def core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]:
             "ownership core count differs from the communication domain: "
             f"{view.num_cores} != {num_cores}"
         )
-    rows = owner_slots(dict(view.core_to_slot), dict(view.work_slice_dims), num_cores)
-    return dict(enumerate(rows))
+    rows = _view_owner_rows(view, num_cores)
+    # Copies: the cached rows are shared between callers.
+    return {core: dict(row) for core, row in enumerate(rows)}
+
+
+# A view's per-core slots, reused across the many pairs one view takes part in
+# (relayout candidates price each producer view against every consumer view).
+# Errors are not cached, so an invalid view raises on every call.
+@lru_cache(maxsize=8192)
+def _view_owner_rows(view: PerCoreView, num_cores: int) -> tuple[dict[Any, int], ...]:
+    return owner_slots(dict(view.core_to_slot), dict(view.work_slice_dims), num_cores)
 
 
 def work_division_from_view(

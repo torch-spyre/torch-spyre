@@ -35,8 +35,13 @@ def test_result_kind_and_test_type_match_artifact_results():
 
 
 def test_format_matches_the_bundle_kinds():
+    """Every bundle kind that records a run is an allowed upload format; `reference` is the references kind's."""
     kinds = offline.schema()["properties"]["kind"]["enum"]
-    assert _check("49-result-uploads.sql", "chk_format") == kinds
+    recorded = {
+        offline.UPLOAD_FORMAT.get(k, k) for k in kinds if k not in offline.ADMIN_KINDS
+    }
+    allowed = set(_check("49-result-uploads.sql", "chk_format"))
+    assert recorded <= allowed and allowed - recorded <= {"reference"}
 
 
 NIL = "00000000-0000-0000-0000-000000000000"
@@ -263,4 +268,57 @@ def test_rbac_keeps_the_newest_version_and_logs_every_one():
     )
     assert (
         s.query("SELECT count() FROM rbac_role_versions", "CSV").data().strip() == "2"
+    )
+
+
+def test_a_retracted_round_no_longer_counts_toward_the_runs_trust():
+    """artifact_results is append-only MergeTree, so the published view alone decides which
+    earlier verdicts a later round sees."""
+    from spyre_clickhouse_ingest.bundle import prior_trust
+
+    session = pytest.importorskip("chdb.session")
+    s = session.Session()
+    for name in (
+        "10-functional-tests.sql",
+        "20-artifacts.sql",
+        "49-result-uploads.sql",
+    ):
+        for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text()):
+            s.query(stmt)
+
+    class Client:
+        def query(self, sql, parameters=None):
+            for k, v in (parameters or {}).items():
+                sql = re.sub(r"\{" + k + r":\w+\}", "'" + v + "'", sql)
+            out = s.query(sql, "TabSeparated").data()
+            return type(
+                "R", (), {"result_rows": [r.split("\t") for r in out.splitlines()]}
+            )
+
+    ids = [f"01a13151-2096-79bf-bd9c-3{n}1b8c8bc729" for n in "123"]
+
+    def event(upload_id, state, second):
+        row = _upload(upload_id=upload_id, state=state, props={"append_to_run": "1"})
+        row["ts"] = f"2026-01-01 00:00:0{second}.000"
+        s.query("INSERT INTO result_uploads FORMAT JSONEachRow\n" + json.dumps(row))
+
+    for n, (uid, trust) in enumerate(zip(ids, ("ci", "external", "lab"))):
+        s.query(
+            "INSERT INTO artifact_results (artifact_id, run_id, result_kind, test_type, state, arch, props) "
+            f"VALUES ('{AID}', '{RUN}', 'functional', 'unit', 'passed', 'x86_64', "
+            f"map('upload_id', '{uid}', 'run.trust', '{trust}'))"
+        )
+        event(uid, "published", n)
+    assert prior_trust(Client(), "default", AID, RUN, "unit") == "external"
+    event(ids[1], "retracted", 5)
+    assert prior_trust(Client(), "default", AID, RUN, "unit") == "lab"
+
+
+def test_migration_026_adds_the_ddl_format_list():
+    sql = (
+        SCHEMA_DIR / "migrations" / "026_result_uploads_bench_reference_formats.sql"
+    ).read_text()
+    m = re.search(r"ADD CONSTRAINT chk_format CHECK format IN \(([^)]*)\)", sql)
+    assert re.findall(r"'([^']+)'", m.group(1)) == _check(
+        "49-result-uploads.sql", "chk_format"
     )

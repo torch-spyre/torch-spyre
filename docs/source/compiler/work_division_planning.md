@@ -461,21 +461,24 @@ compiler raises an error.
 
 TopK reductions use constraint-based work division:
 
-1. **k is split, capped at 4 rows per core.** The legal splits are divisors
-   `d` of `k` with `k / d <= 4`. The planner uses the smallest legal divisor:
-   larger factors are not supported because they can produce incorrect output
-   mapping for 4D TopK results. If no valid divisor exists within max_cores, the compiler
-   raises `Unsupported`.
+1. **k is split, capped at 4 rows per core.** Every divisor `d` of `k` with
+   `k / d <= 4` is admitted as a candidate, subject to the core budget. For
+   example, `k=8` admits splits 2, 4, and 8; the planner can choose a larger
+   factor when it benefits work distribution. If no valid divisor exists within
+   max_cores, the compiler raises `Unsupported`.
 2. **The search-space dimension is never split.** The dimension being
    searched (the `dim` argument to `torch.topk`) must stay whole on one core.
 
 Other output/batch dimensions are distributed across the remaining core budget
 under the constraint that total cores used is `k_cores * product(other_dims) <= max_cores`.
 
-## Keep-by-index work division
+## Keep-by-index and mask-by-index work division
 
-`keep_by_index` applies an index-selected mask while preserving the values
-shape. Its index tensor adds a K axis that is absent from the output. One output
+`keep_by_index` and `mask_by_index` apply an index-selected mask while
+preserving the values shape. `keep_by_index` keeps the selected elements and
+replaces the rest with `fill_value`; `mask_by_index` replaces the selected
+elements with `fill_value` and keeps the rest. Both share the same work division
+rules. Their index tensor adds a K axis that is absent from the output. One output
 coordinate absent from the semantic indices operand is selected as the full
 search axis; other absent coordinates can be broadcast batch/output axes.
 

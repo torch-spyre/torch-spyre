@@ -675,6 +675,16 @@ PYBIND11_MODULE(_C, m) {
         "stored on the tensor for the runtime resize_ guard to check. "
         "Backs tensor.to(\"spyre\", dynamic={dim: {min, max, "
         "granularity}}).");
+  m.def("spyre_empty_reserved_with_layout",
+        &spyre::spyre_empty_reserved_with_layout, py::arg("size"),
+        py::arg("stride"), py::arg("dtype"), py::arg("device_layout"),
+        py::arg("dim"), py::arg("min_size"), py::arg("max_size"),
+        py::arg("granularity"),
+        "spyre_empty_reserved with an explicit device layout. The layout "
+        "describes the buffer at `max_size`: the reserved host dimension must "
+        "occupy one whole device dimension, not the stick-elements one, with "
+        "extent `max_size`. Backs tensor.to(\"spyre\", dynamic={...}, "
+        "device_layout=...).");
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
@@ -769,8 +779,10 @@ PYBIND11_MODULE(_C, m) {
   // of the time goes to turning the host data into the device format.
   // spyre_copy_from does not use any Python object.
   m.def("copy_tensor", &spyre::spyre_copy_from,
-        "Copy tensor between host and device using DMA", py::arg("self"),
-        py::arg("dst"), py::arg("non_blocking") = false,
+        "Copy tensor between host and device using DMA. A non_blocking H2D "
+        "copy returns before the DMA completes: a pageable source may be "
+        "modified at once, a pinned one only after synchronize().",
+        py::arg("self"), py::arg("dst"), py::arg("non_blocking") = false,
         py::call_guard<py::gil_scoped_release>());
 
   // Single KV page copy
@@ -1189,6 +1201,9 @@ PYBIND11_MODULE(_C, m) {
         result["num_shards"] = info.num_shards;
         result["shard_device_bytes"] = info.shard_device_bytes;
         result["total_bytes"] = ctx->composite_addr.total_size();
+        // The shape the storage was allocated for; a view of it has a
+        // different shape.
+        result["global_shape"] = info.global_shape;
         py::list entries;
         // The shard table is indexed by shard ordinal; shard i backs core i.
         // logical_core_id and is_device_addressable are asserted by

@@ -23,8 +23,9 @@ import sympy
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import FixedLayout
+from torch._inductor.dependencies import MemoryDep, ReadWrites
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout, InputBuffer, MutationLayoutSHOULDREMOVE
 from torch._inductor.virtualized import V
 from torch_spyre._C import (
     DataFormats,
@@ -39,9 +40,13 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     _check_stick_expr_supported,
+    _former_stick_dim_outermost,
     compute_restickify_needed,
+    dense_relocation_serves_read,
     device_coordinates,
     is_stick_expr_offset_free,
+    non_stick_reduction_vars,
+    output_is_indirectly_mutated,
     restickify_dense_stl_to_sparse,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
@@ -52,6 +57,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
+    _typecast_layouts,
     generate_stl_with_required_stick,
 )
 from torch_spyre._inductor import views as views_module
@@ -1164,7 +1170,7 @@ class TestTilingExprToDeviceExpr(TestCase):
         # sympy.Integer(1)) rather than the usual sympy numeric type -- the
         # degenerate case that used to make the function's second .xreplace
         # call crash with AttributeError: 'int' object has no attribute
-        # 'xreplace'. This mirrors the real _general_tile_advance call shape
+        # 'xreplace'. This mirrors the real _tile_advance call shape
         # when a tiled dim's extent is 1 and no other term survives
         # substitution.
         index = p0
@@ -1343,6 +1349,44 @@ class TestNormalizeCoordinatesFusion(TestCase):
             ],
         )
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
+
+    def test_constant_stick_coordinate_keeps_hbm_base_offset(self):
+        """A constant coordinate on the stick dim is an HBM base address, not an error.
+
+        A sub-stick indirect scatter (``index_copy_`` of ``[T, KV, 1]`` rows) has
+        no loop variable on its last device dim; the layout engine bakes the
+        base offset into that coordinate.  It must survive as the ``offset`` of a
+        variable-free term instead of tripping ``assert offset == 0``.
+        """
+        k = sympy.Symbol("c1")
+        terms = self._normalize(
+            {k: 4},
+            [4, 64],
+            [k, sympy.Integer(5)],
+        )
+        self.assertEqual(len(terms), 2)
+        stick = terms[-1]
+        self.assertIsNone(stick.var)
+        self.assertEqual(stick.dim_size, 64)
+        self.assertEqual(stick.offset, 5)
+        # The base offset is part of the flat device address.
+        addr = self._addr(terms)
+        for val in range(4):
+            self.assertEqual(int(addr.subs({k: val})), val * 64 + 5)
+
+    def test_constant_offset_on_non_stick_size_one_dim_is_rejected(self):
+        """Only the stick dim may carry a constant offset.
+
+        A size-1 non-stick dim without variables is dropped when terms are
+        fused, so a nonzero offset on it would silently be lost.
+        """
+        k = sympy.Symbol("c1")
+        with self.assertRaises(AssertionError):
+            self._normalize(
+                {k: 4},
+                [4, 1, 64],
+                [k, sympy.Integer(3), sympy.Mod(k, 64)],
+            )
 
 
 class TestFlatDenseProjectionLayout(TestCase):
@@ -1692,6 +1736,329 @@ class TestRestickifyDenseStlToSparse(TestCase):
             self.assertEqual(offset, flat, f"c0={flat}")
 
 
+class TestDenseRelocationServesRead(TestCase):
+    """``dense_relocation_serves_read`` moves the stick to a dim the read leaves
+    alone, keeping the tensor dense, and puts the former stick dim outermost so
+    the restickify's padding lands at the end of the buffer rather than between
+    another dim's slices."""
+
+    @staticmethod
+    def _split_row_read(outer, row, inner):
+        """``[outer, row]`` read as ``[outer, row // inner, inner]``: the row is
+        split at a point that cuts the stick, and dim 0 is left alone."""
+        d0, d1, d2 = (
+            sympy.Symbol(n, integer=True, nonnegative=True) for n in ("d0", "d1", "d2")
+        )
+        index = row * d0 + inner * d1 + d2
+        return MemoryDep("arg0_1", index, (d0, d1, d2), (outer, row // inner, inner))
+
+    def test_former_stick_dim_is_outermost(self):
+        # [4, 100] split to [4, 20, 5]. The stick moves to dim 0, and the former
+        # stick dim (100, padded to 128) must come first in the device layout.
+        host = _contiguous_host([4, 100])
+        stl = SpyreTensorLayout([4, 100], torch.float16)
+        target = dense_relocation_serves_read(
+            stl, host, self._split_row_read(4, 100, 5)
+        )
+        self.assertIsNotNone(target)
+        self.assertEqual(list(target.device_size), [100, 1, 64])
+        self.assertEqual(list(target.stride_map), [1, 400, 100])
+        # Dense, not sparse: the former stick dim still holds its own elements.
+        self.assertEqual(target.device_size[0], 100)
+
+    def test_a_flatten_has_no_dim_to_take_the_stick(self):
+        # Every dim is merged, so nothing is left alone and the read falls through
+        # to the sparse layout instead (issue #5872's flatten cases).
+        for shape in ([8, 65], [4, 100], [2, 3, 65]):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                stl = SpyreTensorLayout(list(shape), torch.float16)
+                _, dep = _flat_read(math.prod(shape))
+                self.assertIsNone(dense_relocation_serves_read(stl, host, dep))
+
+    @staticmethod
+    def _prod_read():
+        """``x[8, 32, 20, 20]`` read as ``[8, 32, 400]`` and reduced over dim 1.
+
+        Merging dims 2 and 3 cuts the stick, and dims 0 and 1 are left alone. The
+        widest of them is dim 1, the one the ``prod`` reduces, which cannot carry
+        the stick (backend #4409). Returns the read, the write, and dim 1's symbol.
+        """
+        d0, d1, d2 = (
+            sympy.Symbol(n, integer=True, nonnegative=True) for n in ("d0", "d1", "d2")
+        )
+        read = MemoryDep(
+            "arg0_1", 12800 * d0 + 400 * d1 + d2, (d0, d1, d2), (8, 32, 400)
+        )
+        write = MemoryDep("buf0", 400 * d0 + d2, (d0, d2), (8, 400))
+        return read, write, d1
+
+    def test_the_reduced_dim_is_skipped_for_the_next_candidate(self):
+        # The device half of test_prod_does_not_relocate_onto_the_reduced_dim: on
+        # device the shapes without a second real dim only prove the relocation
+        # declines, which the sparse fallback would also do. This pins the dim the
+        # stick actually lands on.
+        read, write, reduced = self._prod_read()
+        self.assertEqual(non_stick_reduction_vars("prod", read, write), {reduced})
+        # Only REDUCTIONS_NON_STICK_DIM_ONLY reductions constrain the stick.
+        self.assertIsNone(non_stick_reduction_vars("sum", read, write))
+
+        host = _contiguous_host([8, 32, 20, 20])
+        stl = SpyreTensorLayout([8, 32, 20, 20], torch.float16)
+        # Unconstrained, the widest dim left alone wins: dim 1, host stride 400.
+        unguarded = dense_relocation_serves_read(stl, host, read)
+        self.assertEqual(unguarded.stride_map[-1], 400)
+        # Forbidding the reduced variable moves on to the next candidate, dim 0
+        # (host stride 12800), and leaves dim 1's 32 elements a real device dim.
+        guarded = dense_relocation_serves_read(
+            stl, host, read, forbidden_stick_syms={reduced}
+        )
+        self.assertEqual(guarded.stride_map[-1], 12800)
+        self.assertIn((32, 400), _non_unit_dims(guarded))
+
+    def test_a_reduction_over_the_only_candidate_dim_relocates_nowhere(self):
+        # [1, 32, 20, 20]: dim 0 is size 1, so skipping dim 1 leaves no candidate
+        # and the read falls through to the sparse layout.
+        d0, d1, d2 = (
+            sympy.Symbol(n, integer=True, nonnegative=True) for n in ("d0", "d1", "d2")
+        )
+        read = MemoryDep("arg0_1", 400 * d1 + d2, (d0, d1, d2), (1, 32, 400))
+        reduced = d1
+        host = _contiguous_host([1, 32, 20, 20])
+        stl = SpyreTensorLayout([1, 32, 20, 20], torch.float16)
+        self.assertIsNotNone(dense_relocation_serves_read(stl, host, read))
+        self.assertIsNone(
+            dense_relocation_serves_read(
+                stl, host, read, forbidden_stick_syms={reduced}
+            )
+        )
+
+    def test_an_already_relocated_input_keeps_its_own_dims(self):
+        # Defensive, by design: this test cannot fail for the wrong reason,
+        # because both the stride_map-based pick of the current stick dim and the
+        # host-stride one return None here. No input reaching this helper has been
+        # found where the two differ, so the stride_map pick is a guard against a
+        # caller that hands over an input whose stick has already moved, not a fix
+        # for an observed bug. What is pinned is the contract: the stick is a
+        # property of the layout, not of the host strides -- this input's stick is
+        # on host dim 0, not its smallest-stride dim -- and a read that cannot be
+        # served by moving it again gets the sparse layout.
+        host = _contiguous_host([4, 100])
+        moved = SpyreTensorLayout([4, 100], [100, 1], torch.float16, [1, 0])
+        self.assertEqual(list(moved.stride_map), [400, 1, 100])
+        self.assertIsNone(
+            dense_relocation_serves_read(moved, host, self._split_row_read(4, 100, 5))
+        )
+
+
+class TestTypecastOfUnservableRead(TestCase):
+    """A cast that changes the elements per stick, reading a reshape that cuts the
+    stick dim off a stick boundary (#6557).
+
+    ``_typecast_layouts`` used to return no candidates for such a read, before the
+    dense relocation or the sparse layout was consulted. It now handles the read as
+    ``_default_pointwise_layout`` does. Each candidate it returns must be one the
+    optimizer can feed: ``compute_restickify_needed`` must plan a feasible
+    restickify of the input into it. Needs no device.
+    """
+
+    @staticmethod
+    def _reshape_read(
+        in_shape, out_shape, out_dtype=torch.float32, in_dtype=torch.float16
+    ):
+        """The ``in_dtype`` input, its read as ``out_shape``, and the cast's output.
+
+        Both shapes are contiguous, so the read and the write index the same flat
+        offset; Inductor drops a size-1 dim's loop variable, as here.
+        """
+        live = [s for s in out_shape if s != 1]
+        out_vars = tuple(
+            sympy.Symbol(f"d{i}", integer=True, nonnegative=True)
+            for i in range(len(live))
+        )
+        strides = [math.prod(live[i + 1 :]) for i in range(len(live))]
+        index = sum((st * v for st, v in zip(strides, out_vars)), sympy.Integer(0))
+        host = _contiguous_host(in_shape, in_dtype)
+        output = _contiguous_host(out_shape, out_dtype)
+        dep = MemoryDep("arg0_1", index, out_vars, tuple(live))
+        output_dep = MemoryDep("buf0", index, out_vars, tuple(live))
+        stl = SpyreTensorLayout(list(in_shape), in_dtype)
+        # The premise of #6557: the input's own layout cannot serve the read.
+        assert try_device_coordinates(stl, dep, None) is None, (in_shape, out_shape)
+        return stl, host, dep, output, output_dep
+
+    def test_a_read_a_dim_is_left_alone_for_takes_the_dense_relocation(self):
+        # The two reproducers of #6557 and the merge, then the other widths the
+        # rule converts between: fp32 down to fp16 (32 to 64 per stick; the
+        # 25600 split is not used, as 160 is a whole number of fp32 sticks),
+        # int32 to fp16, and bf16, which the device holds as fp16. The cases
+        # of the test_stick_size_change_after_reshape* tests on the device.
+        f16, f32, bf16, i32 = torch.float16, torch.float32, torch.bfloat16, torch.int32
+        cases = [
+            ((2, 8, 40), (2, 320), f16, f32),
+            ((1, 64, 25600), (1, 64, 160, 160), f16, f32),
+            ((1, 32, 20, 20), (1, 32, 400), f16, f32),
+            ((2, 8, 40), (2, 320), f32, f16),
+            ((1, 64, 25000), (1, 64, 250, 100), f32, f16),
+            ((1, 32, 20, 20), (1, 32, 400), f32, f16),
+            ((2, 8, 40), (2, 320), i32, f16),
+            ((1, 64, 25600), (1, 64, 160, 160), bf16, f32),
+        ]
+        elems_per_stick = {f16: 64, f32: 32}
+        for in_shape, out_shape, in_dtype, out_dtype in cases:
+            with self.subTest(
+                in_shape=in_shape, out_shape=out_shape, cast=(in_dtype, out_dtype)
+            ):
+                stl, host, dep, output, output_dep = self._reshape_read(
+                    in_shape, out_shape, out_dtype, in_dtype
+                )
+                relocated = dense_relocation_serves_read(stl, host, dep)
+                self.assertIsNotNone(relocated)
+                relocated_stick = try_device_coordinates(relocated, dep, None)[-1]
+
+                layouts = _typecast_layouts(output, output_dep, dep, host, stl)
+
+                self.assertTrue(layouts, "no candidate for the cast (#6557)")
+                for out_stl in layouts:
+                    self.assertEqual(out_stl.device_dtype, get_device_dtype(out_dtype))
+                    self.assertEqual(
+                        out_stl.elems_per_stick(), elems_per_stick[out_dtype]
+                    )
+                    out_coords = try_device_coordinates(out_stl, output_dep, None)
+                    self.assertIsNotNone(out_coords)
+                    # Every candidate keeps the relocated stick: the input edge
+                    # is restickified to the relocation, so an output with its
+                    # stick on any other dim could not be fed.
+                    self.assertEqual(
+                        out_coords[-1].free_symbols, relocated_stick.free_symbols
+                    )
+                    self.assertEqual(
+                        compute_restickify_needed(stl, host, dep, out_stl, output_dep),
+                        (True, relocated),
+                    )
+
+    def test_a_reshape_merging_every_dim_takes_the_sparse_layout(self):
+        # No dim is left alone, so there is nowhere to relocate the stick. The
+        # cases of test_stick_size_change_after_reshape_with_no_free_dim, and
+        # the first again from fp32 down to fp16.
+        cases = [
+            ((1, 2, 4, 8, 7), (1, 8, 56), torch.float16, torch.float32),
+            ((8, 65), (520,), torch.float16, torch.float32),
+            ((1, 2, 4, 8, 7), (1, 8, 56), torch.float32, torch.float16),
+        ]
+        for in_shape, out_shape, in_dtype, out_dtype in cases:
+            with self.subTest(
+                in_shape=in_shape, out_shape=out_shape, cast=(in_dtype, out_dtype)
+            ):
+                stl, host, dep, output, output_dep = self._reshape_read(
+                    in_shape, out_shape, out_dtype, in_dtype
+                )
+                self.assertIsNone(dense_relocation_serves_read(stl, host, dep))
+                self.assertIsNotNone(sparse_target_for_unservable_read(stl, host, dep))
+
+                layouts = _typecast_layouts(output, output_dep, dep, host, stl)
+
+                self.assertEqual(layouts, [sparse_stl_from_host(output, out_dtype)])
+                needed, target = compute_restickify_needed(
+                    stl, host, dep, layouts[0], output_dep
+                )
+                self.assertTrue(needed)
+                self.assertIsNotNone(target, "the sparse restickify is infeasible")
+
+    def test_an_fp8_output_does_not_take_the_sparse_layout(self):
+        # A sparse layout carries the STANDARD arrangement, not QFP8CH, so an fp8
+        # cast of such a read is left without a candidate, as before #6557.
+        stl, host, dep, output, output_dep = self._reshape_read(
+            (1, 2, 4, 8, 7), (1, 8, 56), torch.float8_e4m3fn
+        )
+        self.assertEqual(_typecast_layouts(output, output_dep, dep, host, stl), [])
+
+    def test_a_read_the_input_serves_never_consults_the_fallbacks(self):
+        # The fallbacks run only where the rule used to return no candidates: a
+        # cast its input's layout can address, whole or reshaped on a stick
+        # boundary, is laid out exactly as before #6557.
+        import torch_spyre._inductor.propagate_layouts as propagate_layouts
+
+        cases = [((4, 64), (4, 64)), ((2, 8, 64), (2, 512)), ((4, 128), (4, 2, 64))]
+        for in_shape, out_shape in cases:
+            with self.subTest(in_shape=in_shape, out_shape=out_shape):
+                live = [s for s in out_shape if s != 1]
+                out_vars = tuple(
+                    sympy.Symbol(f"d{i}", integer=True, nonnegative=True)
+                    for i in range(len(live))
+                )
+                strides = [math.prod(live[i + 1 :]) for i in range(len(live))]
+                index = sum(
+                    (st * v for st, v in zip(strides, out_vars)), sympy.Integer(0)
+                )
+                dep = MemoryDep("arg0_1", index, out_vars, tuple(live))
+                output_dep = MemoryDep("buf0", index, out_vars, tuple(live))
+                stl = SpyreTensorLayout(list(in_shape), torch.float16)
+                self.assertIsNotNone(try_device_coordinates(stl, dep, None))
+                with (
+                    mock.patch.object(
+                        propagate_layouts, "dense_relocation_serves_read"
+                    ) as relocate,
+                    mock.patch.object(
+                        propagate_layouts, "sparse_target_for_unservable_read"
+                    ) as sparse,
+                ):
+                    layouts = _typecast_layouts(
+                        _contiguous_host(out_shape, torch.float32),
+                        output_dep,
+                        dep,
+                        _contiguous_host(in_shape),
+                        stl,
+                    )
+                self.assertTrue(layouts)
+                relocate.assert_not_called()
+                sparse.assert_not_called()
+
+
+class TestFormerStickDimOutermost(TestCase):
+    """Where the former stick dim lands, which decides where the padding lands.
+
+    The restickify into the relocated layout pads that dim up to whole sticks.
+    Outermost, the padding sits at the end of the buffer; anywhere else it falls
+    between another dim's slices, where a merge reads it as data.
+    """
+
+    @staticmethod
+    def _inner_stick():
+        """[4, 100] with the stick on the 100, so the 4 keeps a device dim."""
+        return SpyreTensorLayout([4, 100], [100, 1], torch.float16, [0, 1])
+
+    @staticmethod
+    def _relocated():
+        """[4, 100] with the stick already moved onto the 4."""
+        return SpyreTensorLayout([4, 100], [100, 1], torch.float16, [1, 0])
+
+    def test_an_inner_dim_moves_to_the_front(self):
+        stl = self._inner_stick()
+        self.assertEqual(list(stl.device_size), [2, 4, 64])
+        moved = _former_stick_dim_outermost(stl, 4, 100)
+        self.assertEqual(list(moved.device_size), [4, 2, 64])
+        self.assertEqual(list(moved.stride_map), [100, 64, 1])
+
+    def test_a_dim_already_outermost_is_returned_as_it_is(self):
+        """Idempotent, so a second pass cannot rotate the layout again."""
+        moved = _former_stick_dim_outermost(self._inner_stick(), 4, 100)
+        self.assertIs(_former_stick_dim_outermost(moved, 4, 100), moved)
+
+    def test_a_dim_the_layout_does_not_have_declines(self):
+        """Fails closed: the caller skips the candidate and the read goes sparse.
+
+        Returning the layout unchanged would leave the padding wherever it sits,
+        which is the wrong-values case this helper exists to prevent, and it would
+        do so with no error.
+        """
+        # The 4 has no device dim of its own once the stick is on it.
+        self.assertEqual(list(self._relocated().device_size), [1, 100, 64])
+        self.assertIsNone(_former_stick_dim_outermost(self._relocated(), 4, 100))
+        # Nor does a size and stride belonging to no dim at all.
+        self.assertIsNone(_former_stick_dim_outermost(self._inner_stick(), 7, 999))
+
+
 class TestStickExprOffsetFree(TestCase):
     def test_stick_split_by_a_row_boundary_is_not_a_stick(self):
         c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
@@ -1972,6 +2339,73 @@ class TestReshapeReadCoordinates(TestCase):
             r for r, (exact, ok) in default.items() if exact and ok and not whole[r][1]
         ]
         self.assertGreater(len(lost), 0)
+
+
+class TestOutputIsIndirectlyMutated(TestCase):
+    """``output_is_indirectly_mutated``: the scatter destination gate.
+
+    A relocation must not put the stick on the dim a scatter indexes: the
+    indirect-access pass then re-tiles the destination to one entry per stick,
+    and that re-tile cannot be built from a relocated layout -- ``(8, 32, 32)``
+    written as ``(8, 1024)`` by ``index_put_`` raised "cannot re-tile buf1: no
+    size-1 stick target" where main compiles through the sparse layout
+    (``test_index_put_view_n_32_32``). The mutating op is already in the graph
+    when its target's layout is chosen, which is what this reads; pinned here
+    because a device test cannot tell a declined relocation from a read the
+    relocation never served.
+    """
+
+    # `d1 + 1024*tmp0` is the write index index_put_ lowers to on an [8, 1024]
+    # view: `tmp0` selects the row, so the row dim must stay off the stick.
+    _INDIRECT = sympy.Symbol("d1") + 1024 * sympy.Symbol("tmp0")
+    _DIRECT = sympy.Symbol("d1") + 1024 * sympy.Symbol("d0")
+
+    def setUp(self):
+        # A real GraphLowering, because MutationLayoutSHOULDREMOVE's constructor
+        # calls V.graph.mark_buffer_mutated.
+        ctx = V.set_graph_handler(GraphLowering(torch.fx.symbolic_trace(lambda: None)))
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        V.graph.operations = []
+
+    @staticmethod
+    def _op(name):
+        return SimpleNamespace(get_name=lambda: name)
+
+    def _add_mutation(self, target_name, index):
+        """Put an op mutating ``target_name`` at ``index`` in the graph."""
+        target = InputBuffer(
+            name=target_name,
+            layout=FixedLayout(
+                torch.device("cpu"), torch.float16, [8, 1024], [1024, 1]
+            ),
+        )
+        write = MemoryDep("buf1", index, (sympy.Symbol("d1"),), (sympy.Integer(1024),))
+        V.graph.operations.append(
+            SimpleNamespace(
+                layout=MutationLayoutSHOULDREMOVE(target),
+                get_read_writes=lambda: ReadWrites(set(), {write}, set()),
+            )
+        )
+
+    def test_an_indirect_write_into_the_output_is_seen(self):
+        self._add_mutation("buf0", self._INDIRECT)
+        self.assertTrue(output_is_indirectly_mutated(self._op("buf0")))
+
+    def test_a_direct_write_into_the_output_is_not(self):
+        """Only an indirect index needs the re-tile; a plain view write does not."""
+        self._add_mutation("buf0", self._DIRECT)
+        self.assertFalse(output_is_indirectly_mutated(self._op("buf0")))
+
+    def test_a_scatter_into_another_buffer_is_not(self):
+        """The gate is per output: it must not decline every op in the graph."""
+        self._add_mutation("buf7", self._INDIRECT)
+        self.assertFalse(output_is_indirectly_mutated(self._op("buf0")))
+
+    def test_no_op_and_no_mutation_decline_nothing(self):
+        """The host-only callers pass no op, and must still get a relocation."""
+        self.assertFalse(output_is_indirectly_mutated(None))
+        self.assertFalse(output_is_indirectly_mutated(self._op("buf0")))
 
 
 if __name__ == "__main__":

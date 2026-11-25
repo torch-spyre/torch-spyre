@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Analysis
+metadata: {name: pinning-effect, owner: example-team}
+spec:
+  select: {benchmarks: [op-scale]}
+  metric: kernel.time.mean
+  hold: ["case.*", "system.*", "subject.id"]
+  vary: [run.exec.cpu_pinning]
+  derive:
+    name: kernel.time.per_element
+    op: slope
+    cases: {first: op_scale_n4096, second: op_scale_n1024}
+    x: {first: 4096, second: 1024}
+  compare:
+    by: run.exec.cpu_pinning
+    across: [env.label.node.class]
+    metric: kernel.time.per_element
+    baseline: none
+  output: {noise: series_floor}

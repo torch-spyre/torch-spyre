@@ -79,6 +79,9 @@ def test_rows_are_validated_and_the_view_keeps_the_first_requester(chdb_session)
     for bad in ({"request_id": NIL}, {"state": "dry_run"}, {"channel": "slack"}):
         with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
             insert(_request(**bad))
+    insert(
+        _request(request_id="018f0000-0000-7000-8000-000000000002", channel="comment")
+    )
     insert(_request())
     insert(
         _request(
@@ -89,11 +92,57 @@ def test_rows_are_validated_and_the_view_keeps_the_first_requester(chdb_session)
         )
     )
     got = s.query(
-        "SELECT state, requested_by, job_run, build_url FROM v_ci_requests",
+        f"SELECT state, requested_by, job_run, build_url FROM v_ci_requests WHERE request_id = '{RID}'",
         "JSONEachRow",
     ).data()
     assert json.loads(got) == {"state": "launched", "requested_by": "alice@ibm.com",
                                "job_run": "https://j/1", "build_url": "https://j/2"}  # fmt: skip
+
+
+def test_migration_028_widens_the_channel_check_and_reruns(chdb_session):
+    s = chdb_session
+    sql = (
+        SCHEMA_DIR / "migrations" / "028_ci_requests_comment_channel.sql"
+    ).read_text()
+    assert "comment" in _in_list("42-ci-requests.sql", "chk_channel")
+    for _ in range(2):  # rerunnable
+        for stmt in SchemaApplier.statements(sql):
+            s.query(stmt)
+    s.query(
+        "INSERT INTO ci_requests FORMAT JSONEachRow\n"
+        + json.dumps(_request(channel="comment"))
+    )
+    with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
+        s.query(
+            "INSERT INTO ci_requests FORMAT JSONEachRow\n"
+            + json.dumps(_request(channel="slack"))
+        )
+
+
+def test_a_migrated_table_formats_like_a_fresh_one():
+    session = pytest.importorskip("chdb.session")
+    ddl = (SCHEMA_DIR / "42-ci-requests.sql").read_text()
+    old = ddl.replace("'api', 'comment')", "'api')")
+    assert old != ddl
+    migration = (
+        SCHEMA_DIR / "migrations" / "028_ci_requests_comment_channel.sql"
+    ).read_text()
+
+    def shown(statements, migrate):
+        s = session.Session()
+        try:
+            for stmt in statements:
+                s.query(stmt)
+            for _ in range(2 if migrate else 0):
+                for stmt in SchemaApplier.statements(migration):
+                    s.query(stmt)
+            return s.query("SHOW CREATE TABLE ci_requests", "TabSeparatedRaw").data()
+        finally:
+            s.close()
+
+    assert shown(SchemaApplier.statements(old), True) == shown(
+        SchemaApplier.statements(ddl), False
+    )
 
 
 def test_cell_durations_use_passed_nonzero_legs_and_one_arch_spelling(chdb_session):

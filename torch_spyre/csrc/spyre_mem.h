@@ -22,6 +22,7 @@
 #include <flex/flex.hpp>
 #include <map>
 #include <optional>
+#include <vector>
 
 #include "module.h"
 #include "spyre_tensor_impl.h"
@@ -83,6 +84,22 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
                                 int64_t min_size, int64_t max_size,
                                 int64_t granularity);
 
+/**
+ * spyre_empty_reserved with the device layout given instead of derived.
+ * `device_layout` describes the buffer at `max_size` along `dim`, so the
+ * reserved host dimension must occupy one whole device dimension (never the
+ * stick-elements dimension) whose extent is `max_size`: that is the dimension
+ * the transfer and resize_ move along, and a dimension folded into another or
+ * split across the stick could not be resized in place. The same reservation
+ * rules as spyre_empty_reserved apply (dim 0 only, min/max/granularity
+ * checked), the layout is stored as given, and the contract is stamped on the
+ * tensor. Backs `tensor.to("spyre", dynamic={dim: {...}}, device_layout=...)`.
+ */
+at::Tensor spyre_empty_reserved_with_layout(
+    c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+    SpyreTensorLayout device_layout, int64_t dim, int64_t min_size,
+    int64_t max_size, int64_t granularity);
+
 at::Tensor empty_with_layout(
     c10::IntArrayRef size, SpyreTensorLayout device_layout,
     std::optional<c10::ScalarType> dtype_opt,
@@ -106,6 +123,17 @@ at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
 
 // Whether `tensor`'s storage is sharded storage.
 bool spyre_is_sharded(const at::Tensor& tensor);
+
+// Where a view with `sizes`, `strides` and `storage_offset` sits in the base
+// tensor of `sharded`'s storage, if it is a box view: a non-empty block of
+// the base in the same dimension order (the base's rank, unit steps, the
+// base's strides). Returns the block's start index in each dimension of the
+// recorded global shape, or nullopt for any other view. The whole tensor is
+// the box that starts at zero. `sharded` must be a sharded tensor.
+std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
+                                                      c10::IntArrayRef sizes,
+                                                      c10::IntArrayRef strides,
+                                                      int64_t storage_offset);
 
 // Device address of shard `shard_index` of a sharded tensor: the start of
 // that shard's own allocation. Resolved per launch for

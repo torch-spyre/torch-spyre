@@ -51,7 +51,7 @@ from .constants import (
     BATCH_MATMUL_FP8_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
     POOL_OPS,
     STAGGERED_EAS,
     _MAX_K_PER_CORE,
@@ -61,7 +61,7 @@ from .constants import (
 from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .loop_facts import enclosing_loops
+from .loop_facts import enclosing_loops, is_looped
 from .pass_utils import (
     AlignmentAccess,
     build_operation_alignment_inputs,
@@ -446,7 +446,7 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
 # *independent* per-op choosers -- see that function -- on the same ground as
 # the user ``work_div`` hint exemption there. Keyed on the op rather than a
 # config flag: the greedy passes run on the same graph and stay pinned, and an
-# op the hint pass tiled carries ``loop_info`` before the menu is enumerated, so
+# op the hint pass tiled is in its loop before the menu is enumerated, so
 # its candidates respect the pin. Written by ``coarse_tiling.apply_tilings`` on
 # each op it tiles or adds to a nest, and never cleared: nothing
 # after scratchpad planning re-derives a work division, so its lifetime is the
@@ -505,15 +505,13 @@ def coarse_tile_local_dim_split_domains(
     by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
     data when that happened.
 
-    ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
-    op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
-    dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
-    ``loop_tiled_dims`` is the primary source (not
-    ``tiled_dims_per_read``/``output_tiled_dims``): those are deliberately
-    zeroed for per-tile scratch that "must not advance", which is correct for building
-    ``device_tile_advance_expr`` but leaves them carrying no "is this op's
-    own dim tiled" signal at all for such an op, exposing its dims to the
-    greedy search's independent, unpinned choice.
+    ``coarse_tile.py`` records, for every op it tiles, which dims each loop level
+    tiles (``LoopMember``, held by the loop nodes once they are built and read
+    through ``enclosing_loops``). ``loop_tiled_dims``/``loop_tiled_reduction_dims``
+    name tiled dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
+    ``loop_tiled_dims`` is the source: an access's per-trip advance (the index's
+    loop-variable coefficient) says nothing about whether the op's own dim is
+    tiled, so it could not be used to keep a tiled dim whole.
     ``loop_tiled_dims`` has no such caveat where it is *computed* (both the
     self-planning path and generated-copy construction derive it from the
     op's own ranges), but it can be *inherited* un-remapped by nodes inserted
@@ -560,7 +558,7 @@ def coarse_tile_local_dim_split_domains(
     into it, rather than assuming a non-empty ``loop_tiled_reduction_dims``
     implies one exists.
     """
-    if getattr(ctx.op, "loop_info", None) is None:
+    if not is_looped(ctx.op):
         return ConstraintResult()
     levels = enclosing_loops(ctx.op)
 
@@ -742,11 +740,7 @@ def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
     (``FP32_TO_DL16`` / ``DL16_TO_FP32``): those layouts reorder elements
     *within a stick* along the contraction (K) axis, so a K-split hands each
     core a strided slice of the staggered operand that the matmul's K-fast
-    cohort accumulation mis-addresses -- silent wrong results. This is the
-    root cause of the co-optimization ``test_stagger_to_standard_ea`` width-128
-    failures, where the balance tie-break splits K of the ``mm(x_staggered, P)``
-    that ``spyre.stagger_to_standard_ea`` lowers to (the non-co-opt matmul cost
-    model never picks that K-split, so the greedy path is unaffected).
+    cohort accumulation mis-addresses -- silent wrong results.
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
@@ -778,13 +772,11 @@ def _topk_output_k_var(ctx: WorkDivConstraintContext) -> Symbol | None:
 
 
 def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict TopK search-space and result dims to supported factors.
+    """Restrict TopK K-splits to factors within the per-core result limit.
 
-    TopK hardware requires at most ``TOPK_MAX_K_PER_CORE`` result rows per
-    core. Although larger divisors also meet that limit, the 4D ``k=32``
-    result-axis regression showed they produce incorrect output mapping. Keep
-    only the smallest sufficient K split until larger factors have codegen
-    support and regression coverage.
+    The reduction/search axes stay unsplit. Expose every divisor of the output
+    K axis that fits within ``SENCORES`` and leaves at most
+    ``TOPK_MAX_K_PER_CORE`` results per core.
     """
     if (
         not isinstance(ctx.op.data, Reduction)
@@ -808,15 +800,15 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
             f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
             f"k_per_core <= {TOPK_MAX_K_PER_CORE}."
         )
-    allowed_splits[k_var] = frozenset({min(legal_k_splits)})
+    allowed_splits[k_var] = legal_k_splits
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
 def _keep_by_index_axes(ctx: WorkDivConstraintContext) -> set[Symbol] | None:
-    """Return the index-only K axes of a keep_by_index op."""
+    """Return the index-only K axes of a keep_by_index / mask_by_index op."""
     if not (
         isinstance(ctx.op.data, Reduction)
-        and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+        and ctx.op.data.reduction_type in INDEX_MASKING_OPS
     ):
         return None
     writes = op_read_writes(ctx.op).writes
@@ -870,18 +862,18 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
 
 
 def _keep_by_index_search_axis(ctx: WorkDivConstraintContext) -> Symbol | None:
-    """The iteration symbol of the keep_by_index full-search output axis.
+    """The iteration symbol of the keep/mask_by_index full-search output axis.
 
     The search axis is the simplest output device coordinate absent from the
     semantic indices operand. A broadcast indices input can omit unrelated
     output/batch axes, so select one simplest such coordinate rather than every
-    absent symbol. Returns ``None`` for a non-keep_by_index op or when no such
+    absent symbol. Returns ``None`` for a non-index-masking op or when no such
     axis exists.
     """
     if (
         not (
             isinstance(ctx.op.data, Reduction)
-            and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+            and ctx.op.data.reduction_type in INDEX_MASKING_OPS
         )
         or len(ctx.input_tds) < 2
     ):
@@ -977,7 +969,7 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
         BATCH_MATMUL_FP8_OP,
         CONV2D_FWD_OP,
         DEPTHWISE_CONV2D_OP,
-        KEEP_BY_INDEX_OP,
+        *INDEX_MASKING_OPS,
         *TOPK_OPS,
         *POOL_OPS,
     }
@@ -1003,6 +995,17 @@ def plain_reduction_k_split_domains(
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
+    # A cross-shard reduction over the ring (sharded_hbm) splits exactly its
+    # pinned shard dim, which is a reduction var, and nothing else. That is
+    # the single split reduction dim the backend supports; keep every other
+    # reduction var unsplit.
+    if getattr(ctx.op, "shard_ring_reduction", False):
+        pinned = set(getattr(ctx.op, "shard_pinned_splits", {}) or {})
+        return ConstraintResult(
+            allowed_splits={
+                v: frozenset({1}) for v in ctx.reduction_vars if v not in pinned
+            }
+        )
     # Multi-axis: backend supports at most one split reduction dim.
     if len(ctx.reduction_vars) > 1:
         return ConstraintResult(
@@ -1016,8 +1019,8 @@ def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
 
     A gather value table and scatter destination have one shared base on every
     core. Their data dims must therefore stay at split=1. A partial index stick
-    also stays unsplit unless gather-output padding made its entry slices
-    stick-aligned. Other index-entry dims remain available for multicore work.
+    also stays unsplit. Other index-entry dims remain available for multicore
+    work.
     """
     return ConstraintResult(
         allowed_splits={

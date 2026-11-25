@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
 import math
 import time
@@ -67,6 +68,7 @@ from torch_spyre._inductor.work_division import (
     work_division_context_for_op,
     work_division_splits_are_legal,
     _core_division,
+    _reduction_syms,
     _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -139,17 +141,19 @@ from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
     DEVICE_NAME,
     KEEP_BY_INDEX_OP,
+    MASK_BY_INDEX_OP,
     POOL_OPS,
 )
 
-from torch_spyre._inductor import config
+from torch_spyre._inductor import config, timing_recorder
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
-from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
-from torch_spyre._inductor.loop_info import (
-    COUNTED_LOOP_INFO,
-    LoopCarryRecord,
-    ReadCopyElisionRecord,
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    enclosing_loops,
+    is_looped,
 )
+from torch_spyre._inductor.loop_node import LoopCarryRecord
+from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 from torch_spyre._inductor.padding import is_restickify_op
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
@@ -248,6 +252,14 @@ def _handoff_parent_end(
     return max(last, lifetime_end_overrides.get(name, last + 1) - 1)
 
 
+def _mutation_target_names(graph: GraphLowering) -> set[str]:
+    return {
+        op.layout.target.get_name()
+        for op in graph.operations
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+    }
+
+
 def _extern_kernel_in_live_range(
     graph: GraphLowering, uses: list[int], *, excluded_op: Operation | None = None
 ) -> bool:
@@ -342,7 +354,7 @@ def _collective_stage_storage_is_private(
 
 
 def _is_coarse_tiled(op: Any) -> bool:
-    return isinstance(getattr(op, "loop_info", None), COUNTED_LOOP_INFO)
+    return is_looped(op)
 
 
 def _sibling_pinned_divisions(
@@ -370,7 +382,7 @@ def _sibling_pinned_divisions(
 def _coarse_tile_loop_trip_count(op: Any) -> int:
     """Total trip count of ``op``'s coarse-tiling loop, or 1 when untiled.
 
-    ``CoarseTileInfo.loop_count`` is one entry per nesting level, outermost
+    ``LoopMember.loop_count`` is one entry per nesting level, outermost
     first; the real total is their product. An entry can be a symbolic
     ``sympy.Expr`` under dynamic shapes
     (``for_each_tile_lowering.py``'s ``_extract_trip_count``) rather than a
@@ -416,7 +428,7 @@ class DrainPlan:
     update_name:
         Its one tagged in-loop mutator (``_loop_carry_record.update_name``).
     loop_group:
-        The update's ``loop_info.loop_group_id`` -- exactly one level.
+        The update's loop group path (``_access_group_path``) -- exactly one level.
     anchor_op:
         The last operation of the loop's group subtree, as an ``Operation``
         object (identity survives other clones; a saved index would not).
@@ -696,17 +708,34 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     ``copy_op_metadata`` copies the storage's (drain) or the first consumer's
     (input clone) attributes onto the clone, but a post-loop drain and a
     hoisted pre-loop input clone are neither loop members nor carries: a
-    surviving ``loop_info`` would re-group the clone into the counted loop at
-    scheduling time (``_loop_group_id``) and give it another op's per-read tile
-    advance in codegen (``_general_tile_advance``), and the records would
+    surviving loop membership would keep the clone in the counted loop at
+    scheduling time and give it another op's per-read tile
+    advance in codegen (``_index_tile_advance``), and the records would
     misclassify it in ``_build_cd_bound_buffers``.  Only the two drain branches
     and the hoisted-input branch of ``_push_allocation`` call this; every other
     clone keeps today's metadata-copy behavior.
     """
 
-    for attr in ("loop_info", "_loop_carry_record"):
+    for attr in ("loop_member", "_loop_carry_record", "_member_like"):
         if hasattr(op, attr):
             delattr(op, attr)
+
+
+def _read_after_mutation(graph: GraphLowering, name: str, uses: list[int]) -> bool:
+    """Whether an op reads graph input ``name`` after another op mutates it.
+
+    An input clone is made once, before the first consumer, and every consumer is
+    pointed at it. A read that follows an in-place write to the input would then
+    see the value from before that write.
+    """
+    mutators = []
+    for i, op in enumerate(graph.operations):
+        try:
+            if name in op.get_mutation_names():
+                mutators.append(i)
+        except (AttributeError, NotImplementedError):
+            continue
+    return bool(mutators) and any(u > mutators[0] and u not in mutators for u in uses)
 
 
 def _hoisted_input_clone_entry(
@@ -1030,6 +1059,66 @@ class _BufferResidencyChecks:
         return None
 
 
+#: ``plan_allocation``'s template hooks, timed as one region each. The per-pass
+#: timer sees the whole pass as a single region, and that region is a significant
+#: fraction of frontend compile -- with nothing to say which part. These are the
+#: finest attribution available without guessing at internals. The measured share
+#: belongs in the pull request, not here, where it would go stale.
+#:
+#: Named rather than wrapped at the call sites, for two reasons: an override is a
+#: different function object and gets timed without touching its call site, and
+#: main reshapes ``plan_allocation``'s skeleton often enough that a block of
+#: ``with`` statements would conflict where this table does not.
+#:
+#: Hook name -> region suffix. The suffix is spelled out rather than derived from
+#: the method name so a rename upstream can keep the metric the sweeps already
+#: hold. ``tests/test_scratchpad_substage_timers.py`` fails if an entry here times
+#: nothing, so a rename is caught by the change that makes it.
+_TIMED_HOOKS = {
+    "_run_passes": "run_passes",
+    "_prepare_buffers": "prepare_buffers",
+    "_build_solver": "build_solver",
+    "_solve": "solve",
+    "_finalize_lx_relayout_allocation": "finalize_relayout",
+    "_post_solve": "post_solve",
+    "_get_spill_reasons": "spill_reasons",
+    "_push_allocation": "push_allocation",
+    "_log_lx_pinning": "log_pinning",
+}
+
+
+def _time_hooks(cls: type) -> type:
+    """Wrap each of ``_TIMED_HOOKS`` the class defines in a timing region.
+
+    Applied to the subclass as well as the base: an override is a different
+    function object, and timing the base's method would miss it entirely.
+    ``timing_recorder.stage`` is inert unless ``TORCH_SPYRE_TIMING=1``, so this
+    costs one Python frame per hook on a production compile.
+    """
+    for name, suffix in _TIMED_HOOKS.items():
+        attr = cls.__dict__.get(name)
+        if attr is None:
+            continue
+        # A hook may be a staticmethod -- _run_passes is -- and wrapping the
+        # function it holds without putting it back in the same descriptor adds
+        # a self argument the original does not take.
+        kind = type(attr) if isinstance(attr, (staticmethod, classmethod)) else None
+        function = attr.__func__ if kind else attr
+        if getattr(function, "_ts_timed", False):
+            continue
+        region = f"stage:Scratchpad:{suffix}"
+
+        @functools.wraps(function)
+        def timed(*args, _f=function, _r=region, **kwargs):
+            with timing_recorder.stage(_r):
+                return _f(*args, **kwargs)
+
+        timed._ts_timed = True  # type: ignore[attr-defined]
+        setattr(cls, name, kind(timed) if kind else timed)
+    return cls
+
+
+@_time_hooks
 class ScratchpadAllocator:
     """
     Class for allocating on scratchpad
@@ -1389,6 +1478,7 @@ class ScratchpadAllocator:
         name: str,
         uses: list[int],
         *,
+        mutated_buffers: Collection[str],
         ncores: Optional[dict[str, int]] = None,
         ncores_reasons: Optional[dict[str, str]] = None,
         division_is_fixed: bool,
@@ -1403,12 +1493,17 @@ class ScratchpadAllocator:
         it saves nothing -- which ``_read_count`` (first use excluded) states
         directly.
 
+        An input the graph writes in place is refused: the write lands in HBM, so
+        the clone would be stale for every later read.
+
         ``ncores``/``ncores_reasons`` are consulted only on the placement path
         (``division_is_fixed``); the joint path defers the core division to the
         solver and passes neither.
         """
         if not clone_at_graph_boundaries():
             return "graph input (no clone)"
+        if name in mutated_buffers:
+            return "mutation target"
         if is_empty_tiled_layout(getattr(graph.try_get_buffer(name), "layout", None)):
             return "empty tensor"
         if self._read_count(uses) == 0:
@@ -1427,6 +1522,8 @@ class ScratchpadAllocator:
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
+        if _read_after_mutation(graph, name, uses):
+            return "read after in-place mutation"
         if division_is_fixed:
             # See the matching comment in _buffer_residency_reason: on the
             # joint path this is redundant with (and less accurate than) the
@@ -1468,11 +1565,7 @@ class ScratchpadAllocator:
         if lifetimes is None:
             lifetimes = calculate_liveness(graph)
         op_by_name = {op.name: op for op in graph.operations}
-        mutated_buffers = {
-            op.layout.target.get_name()
-            for op in graph.operations
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-        }
+        mutated_buffers = _mutation_target_names(graph)
         graph_output_names = set(graph.get_output_names())
         reinterpret_output_names = {
             go.get_name()
@@ -1684,6 +1777,7 @@ class ScratchpadAllocator:
         # parent of its own. The value is letting the consumer that performs that
         # last read reuse the clone's slot for its own output.
         built_by_name = {b.name: b for b in buffers}
+        mutated_buffers = _mutation_target_names(graph)
         for input_name in graph.graph_input_names:
             uses = lifetimes.get(input_name, [])
             if not uses:
@@ -1692,6 +1786,7 @@ class ScratchpadAllocator:
                 graph,
                 input_name,
                 uses,
+                mutated_buffers=mutated_buffers,
                 ncores=ncores,
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=True,
@@ -2189,9 +2284,9 @@ class ScratchpadAllocator:
                     )
                     # Drain-only metadata hygiene: the clone copied the
                     # storage's attributes, but it is neither a loop member nor
-                    # a carry.  The scheduler-level
-                    # ``_loop_group_id(drain_node) is None`` is asserted by the
-                    # captured-order test; here the op-level absence is exact.
+                    # a carry.  That the drain's scheduler node is in no loop is
+                    # asserted by the captured-order test; here the op-level
+                    # absence is exact.
                     _clear_loop_membership_metadata(new_buffer)
                     if drain_plan.collective is not None:
                         # An in-place collective's result is the output: it and
@@ -2374,7 +2469,8 @@ def _fused_layout_group_ops(
     :meth:`CoOptimizingAllocator._seed_aligned_division` aligns to its matmul).
     Two op kinds need this identical treatment:
 
-    * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
+    * ``keepbyindex`` / ``maskbyindex`` reproduce a fragile multi-stick search
+      layout that its
       input restickifies and output clones carry too; an output clone splitting
       the search axis while the reduction keeps it whole drops the second search
       stick's kept values (silently wrong, ~2-3% of a 6x17x4x128 dim-3
@@ -2971,20 +3067,24 @@ def _drop_read_distance_violations(
     return surviving
 
 
-def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int:
+def _intern_view_group(groups: dict[object, int], view: PerCoreView) -> int:
     """Group index of ``view`` among ``groups``, keyed by physical ownership.
 
     A dict keyed on ``PerCoreView`` interns by structural equality, so two slot
     spellings of one partition (``core_id`` and ``core_id % 4`` over four cores)
     would become two groups and the solver would price two shuffles where one
-    copy serves both consumers. Look up by ``same_partition`` instead and only
-    then mint a new index; the first spelling seen stays the dict key.
+    copy serves both consumers. ``groups`` is keyed by the view's
+    :attr:`~PerCoreView.partition_key` instead, which every spelling of one
+    partition shares, so the lookup agrees with ``same_partition``.
     """
-    for known, index in groups.items():
-        if known.same_partition(view):
-            return index
-    index = len(groups)
-    groups[view] = index
+    key: object = view.partition_key
+    if key is None:
+        # Matches no view, not even an identical one: a group of its own.
+        key = object()
+    index = groups.get(key)
+    if index is None:
+        index = len(groups)
+        groups[key] = index
     return index
 
 
@@ -3160,14 +3260,14 @@ def log_solver_decisions(graph: GraphLowering, allocation: Sequence[Any]) -> Non
         chosen = getattr(buf, "chosen_division", None)
         cd = divisions[chosen] if chosen is not None and divisions else None
         op = op_by_name.get(buf.name)
-        info = getattr(op, "loop_info", None)
-        group = getattr(info, "loop_group_id", None)
+        loops = enclosing_loops(op) if op is not None else ()
+        group = loops[-1].group_path if loops else None
         logger.debug(
             "solver_out: %s group=%s loop=%s div=%s tiling=%s lx=%s "
             "size=%s committed=%s",
             buf.name,
             group if group is not None else "-",
-            getattr(info, "loop_count", "-"),
+            [level.trip_count for level in loops] if loops else "-",
             cd.label if cd is not None else "-",
             cd.tiling.label if cd is not None else "-",
             buf.address,
@@ -3193,6 +3293,7 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
+@_time_hooks
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -3530,7 +3631,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         Candidate coarse tilings enter the same way: each tiled axis's
         symbolic count (``sym_tile_counts``) is keyed on the op's own loop
         variable for that axis. With no tiled candidate there are none, and the
-        extractor reads the op's committed tiling (``loop_info``) as before.
+        extractor reads the op's committed tiling (its enclosing loops) as before.
         """
         from torch_spyre._inductor.cost_features import extract_op_features
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -3540,7 +3641,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
-        division = CoreDivision(splits=buffer.sym_core_divs)
+        division = CoreDivision(
+            splits=buffer.sym_core_divs,
+            reduction_syms=_reduction_syms(op, buffer.sym_core_divs),
+        )
         ws = _work_slices(op, division)
         sym_tiling: dict = {}
         if config.auto_coarse_tiling:
@@ -3875,6 +3979,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             graph,
             {
                 KEEP_BY_INDEX_OP: "keep_by_index layout group",
+                MASK_BY_INDEX_OP: "mask_by_index layout group",
                 BATCH_MATMUL_FP8_OP: fp8_group_reason,
             },
         )
@@ -4160,7 +4265,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         differently-shaped consumer -- a separate mechanism, still xfailed, not
         reached by the ordinary M-axis output tiling offered here.)
 
-        An op already tiled (``loop_info`` set -- by the ``spyre_hint`` pass
+        An op already tiled (``is_looped`` -- by the ``spyre_hint`` pass
         pre-stickification, a ``for_each_tile`` loop, or a prior apply) is left
         untouched, so the solve never re-tiles or un-tiles it, and so is every
         other op inside a ``for_each_tile`` region (``_prescribed_ops``): the
@@ -4170,7 +4275,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         untiled = [TileSpec()]
         if not (config.auto_coarse_tiling and self._tilings_from_menu):
             return untiled
-        if getattr(op, "loop_info", None) is not None:
+        if is_looped(op):
             return untiled
         if op.get_operation_name() in getattr(self, "_prescribed_ops", ()):
             return untiled
@@ -4323,7 +4428,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         divisions = division_map.divisions
         # Per-plan interning of relayout destination views (see
         # _cd_parent_relayouts): group ids are only meaningful within one plan.
-        self._relayout_view_groups: dict[str, dict[PerCoreView, int]] = {}
+        self._relayout_view_groups: dict[str, dict[object, int]] = {}
         lifetimes = calculate_liveness(graph)
         lifetime_start_overrides, lifetime_end_overrides = (
             counted_loop_lifetime_overrides(graph)
@@ -4957,11 +5062,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         satisfies all its children. That constraint is enforced by requiring
         each child to match the parent, not by pre-rejecting here.
         """
+        mutated_buffers = _mutation_target_names(graph)
         return [
             name
             for name in graph.graph_input_names
             if self._input_residency_reason(
-                graph, name, lifetimes.get(name, []), division_is_fixed=False
+                graph,
+                name,
+                lifetimes.get(name, []),
+                mutated_buffers=mutated_buffers,
+                division_is_fixed=False,
             )
             is None
         ]
@@ -5050,9 +5160,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                                 sym: split
                                 for sym, split in per_sym.items()
                                 if split > 1 and sym in read_syms
-                            }
+                            },
+                            # A clone op cannot have a reduction split.
+                            reduction_syms=frozenset(),
                         )
-                    )  # a clone op cannot have a reduction split
+                    )
                     clone_views.append(view)
                 # No core-count check here: ``same_partition`` already demands
                 # equal core counts, and the guard above ties each view's count
@@ -5388,7 +5500,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
             # A coarse-tiled CANDIDATE can never host a relayout, for the same
             # reasons a coarse-tiled op cannot in general (a tiled candidate's
-            # buffer is per-tile scratch). The loop_info edge gate covers
+            # buffer is per-tile scratch). The loop-membership edge gate covers
             # hint-materialized tiling decided before the solve; once the
             # unified-tiling work (#3923) makes tiling a per-candidate solver
             # choice, cd.tiling is the only marker. Written via getattr so it

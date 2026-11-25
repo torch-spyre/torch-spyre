@@ -16,7 +16,7 @@
 
 The lowering itself is ``wsr/loop_tiling_lowering.py`` (entry point
 ``tile_groups(graph, groups)``): it divides each tiled op's ranges by the loop's
-trip count and gives every member a ``LoopShim``. This module keeps what that
+trip count and gives every member a ``LoopMember``. This module keeps what that
 lowering shares with the ``for_each_tile`` lowering:
 
   - the range and layout division (``_divide_ranges``, ``_divide_reduction_ranges``),
@@ -29,11 +29,11 @@ Each op resolves its own tiled dimension from its ``loop_var`` in ``dim_hints``.
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 
 Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
-rewiring in this file, read "Appendix: How IR rewiring works, and why it's
-sound" in ``docs/source/compiler/coarse_tiling_loops.md``. It documents the
-wrap-never-reconstruct convention and why ``MutationLayoutSHOULDREMOVE``
-sites must satisfy the single-mutation-target invariant -- the same ground
-this file's rewrite sites depend on.
+rewiring in this file, read "Invariants and failure modes" in
+``docs/source/compiler/loop_nodes.md``. It documents the wrap-never-reconstruct
+convention and why ``MutationLayoutSHOULDREMOVE`` sites must satisfy the
+single-mutation-target invariant -- the same ground this file's rewrite sites
+depend on.
 """
 
 from __future__ import annotations
@@ -66,6 +66,8 @@ from torch_spyre._C import SpyreTensorLayout
 
 from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
+from ..loop_facts import counted_loop_path
+from ..loop_node import move_before
 from ..pass_utils import (
     op_out_coords,
     identify_matmul_inputs,
@@ -236,7 +238,7 @@ def _find_outside_consumers_planned(
     of objects (planning is zero-mutation, so there's no reason to carry
     object references past this stage), and looks up each candidate's outer loop-group key from
     name_to_group_outer_key (built once by the caller from the planned
-    CoarseTileInfo dict) instead of a not-yet-stamped op.loop_info attribute.
+    LoopMember dict) instead of a not-yet-stamped op.loop_member attribute.
     """
     outer_key = group_loop_id[0]
     consumer_names: list[str] = []
@@ -451,7 +453,7 @@ def _check_matmul_broadcast_batch_tiling(
     # Ambiguous: more than one var is absent from x but present in y and the
     # output. Exactly one is the true generated (N) dim; the rest are excess
     # broadcast-batch vars x carries no symbol for at all. broadcast_batch_vars
-    # (issue #3888) resolves this via op.loop_info.loop_tiled_dims, but that
+    # (issue #3888) resolves this via op.loop_member.loop_tiled_dims, but that
     # isn't stamped yet at plan time -- so here we can only tell "ambiguous"
     # from "unambiguous", not which candidate is the real N dim. Treat every
     # candidate whose *tiled* extent exceeds 1 element/tile as excess: the
@@ -793,7 +795,7 @@ def _validate_planned_reduction_tiling(
 
     Called from build_loop_tiling_plan (planning time): tiled_dims /
     tiled_rdims are the op's own per-level lists computed there, before any
-    loop_info is stamped -- this check is a pure function of already-known
+    loop_member is stamped -- this check is a pure function of already-known
     shape data, so it doesn't need to wait for transformation to run.
     """
     # Pad both lists to the same length so zip covers all levels.
@@ -877,8 +879,8 @@ def _find_outside_consumers(
             continue
         if not _reads_buffer(op, buf_name):
             continue
-        li = getattr(op, "loop_info", None)
-        if li is None or li.loop_group_id[0] != outer_key:
+        path = counted_loop_path(op, include_extern=True)
+        if not path or path[0] != outer_key:
             consumers.append(op)
 
     is_graph_output = buf_name in _graph_output_names()
@@ -904,15 +906,15 @@ def _allocate_full_buffer(
     full_ranges: list[Expr],
     full_strides: tuple[Expr, ...],
     operations: list[Operation],
-    insert_at_idx: int,
+    before: Operation,
     device_layout: SpyreTensorLayout | None = None,
 ) -> ComputedBuffer:
     """Allocate a full-sized HBM buffer for the tiled op's original shape.
 
     Creates a spyre.empty FX node, lowers it via V.graph.run_node(), assigns
     a layout matching tiled_op's layout type (FixedLayout pre-stickify,
-    FixedTiledLayout post-stickify), splices it into operations at
-    insert_at_idx, and returns the new ComputedBuffer.
+    FixedTiledLayout post-stickify), splices it into operations
+    immediately before ``before``, and returns the new ComputedBuffer.
 
     ``device_layout`` is the buffer's device layout, required post-stickify:
     the one planning recorded for a full buffer
@@ -1001,9 +1003,8 @@ def _allocate_full_buffer(
         )
     full_buf.layout = layout
 
-    # Splice into operations at the correct position.
-    operations.remove(full_buf)
-    operations.insert(insert_at_idx, full_buf)
+    # Splice in immediately before ``before``; the lowering appended it at the end.
+    move_before(operations, before, full_buf)
 
     return full_buf
 

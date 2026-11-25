@@ -893,7 +893,12 @@ def build_relayout_copy(
         name=relayout_copy_name(parent.name, group),
         size=spans.pop() * num_cores,
         uses=sorted({consumer_ticks[c.consumer] for c in ordered}),
-        core_divisions=[CoreDivision(splits={"relayout_copy": num_cores})],
+        # A copy has no reduction axis.
+        core_divisions=[
+            CoreDivision(
+                splits={"relayout_copy": num_cores}, reduction_syms=frozenset()
+            )
+        ],
         relayout_parent=parent.name,
         group=group,
         candidates=ordered,

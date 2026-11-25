@@ -471,18 +471,110 @@ y.resize_((141, 1024))  # RuntimeError: not a multiple of granularity
 ```
 
 A resize within the reservation never reallocates, and the
-`SpyreTensorLayout` stays identical for every size in range. This is what keeps
-the layout part of a compiled graph's guards from changing as the size changes.
+`SpyreTensorLayout` stays identical for every size in range, whether it was
+derived from `max` or given explicitly (next section). This is what keeps the
+layout part of a compiled graph's guards from changing as the size changes.
 Only the reserved dimension may change; the rank and every other dimension must
 stay the same, otherwise `resize_` raises.
+
+#### Declaring with an explicit device layout
+
+`dynamic=` can be combined with `device_layout=`. The layout then describes the
+reserved buffer, so it is the layout of the tensor at `max`, not at its current
+size:
+
+```python
+from torch_spyre._C import get_device_dtype, SpyreTensorLayout
+
+# 12 rows of 32 page ids today, up to 16 rows over the tensor's life.
+ids = torch.arange(12 * 32, dtype=torch.int32).reshape(12, 32, 1)
+# The layout of the buffer at max: one int32 id per 128-byte stick (32 int32
+# slots per stick, one of them holding data), 16 rows.
+layout = SpyreTensorLayout(
+    device_size=[16, 1, 32, 32],  # rows at max, 1, ids per row, slots per stick
+    stride_map=[32, 0, 1, 0],  # the host stride each device dim walks, 0 = none
+    device_dtype=get_device_dtype(torch.int32),
+    valid_elements={(0,): 16, (2,): 32, (1, 3): 1},  # data-holding extents
+)
+spec = {0: {"min": 8, "max": 16, "granularity": 1}}
+d = ids.to("spyre", device_layout=layout, dynamic=spec)
+d.resize_((9, 32, 1))  # exact, the layout stays the one given
+```
+
+`stride_map` names, for each device dimension, the host stride it walks: 32 is
+host dimension 0 (the rows), 1 is host dimension 1 (the ids), and 0 marks a
+device dimension that carries no host dimension. `valid_elements` maps a group
+of device dimensions to how many of its elements hold data, so `(1, 3): 1` says
+that of the 32 slots in each stick one is an id.
+
+The reserved host dimension must occupy exactly one device dimension of the
+layout, whole: the device dimension whose `stride_map` entry is the host stride
+of the reserved dimension. That dimension's extent must be `max`, and it cannot
+be the stick-elements dimension. A layout that folds the reserved dimension
+into another, splits it across the stick, or sizes it for anything but `max`
+is refused before anything is allocated, with a `RuntimeError` from the native
+allocation that names the rule. The layout's other dimensions are checked only
+as a whole: the layout must hold at least the bytes of the host shape at `max`,
+and beyond that sizing them for the tensor is the caller's responsibility, the
+same contract as `device_layout=` without `dynamic=`. The derived layout
+satisfies these rules by construction, so giving
+`SpyreTensorLayout(max_shape, dtype)` explicitly gives the same layout and
+contract as the call without `device_layout=`.
+
+#### Fast partial transfers
+
+In the derived layout the reserved dimension sits inside the other outer
+device dimensions: `(n, 512, 128)` fp16 with `max=256` is laid out as
+`[512, 2, 256, 64]`. A transfer of fewer than `max` rows leaves a gap at each of
+the 1024 outer positions, and the runtime sends one DMA per position: about
+15 to 17 ms whatever the row count, against about 1.7 ms for a plain `.to()` of
+the same rows. Reading fewer than `max` rows back costs the same.
+
+This is a workaround, and a runtime change that sends a gapped prefix as one DMA
+would make it unnecessary. Until then, a tensor of rank 3, or of rank 4 and up
+whose last dimension is a whole number of sticks (a multiple of 64 at fp16), can
+request a layout with the reserved dimension outermost by giving the dim order
+`[1, 0, 2, ...]`. The first rows are then one contiguous block of the buffer,
+and a partial transfer goes over in one DMA:
+
+```python
+from torch_spyre._C import SpyreTensorLayout
+
+masks = torch.rand(9, 512, 128, dtype=torch.float16)
+spec = {0: {"min": 8, "max": 256, "granularity": 1}}
+# The buffer at max, with host dim 0 placed outermost.
+layout = SpyreTensorLayout(
+    (256, 512, 128), (512 * 128, 128, 1), torch.float16, [1, 0, 2]
+)
+d = masks.to("spyre", device_layout=layout, dynamic=spec)  # [256, 2, 512, 64]
+```
+
+In a measurement of 9 of 256 rows, this took about 1.8 ms each way, against
+about 15 ms with the derived layout.
+
+- A rank-2 tensor cannot be given this layout: no dim order places dimension 0
+  outside the stick-count dimension.
+- With a rank of 4 or more and a last dimension that is not a whole number of
+  sticks, the transfer is still slow, because the remainder stick adds a second
+  set of ranges that the runtime does not merge.
+- The source tensor must be contiguous, because the layout is built from
+  contiguous strides. Call `.contiguous()` on a strided source before `.to()`.
+  A `copy_` from a strided source into a tensor that already has this layout
+  works.
+- Only tensors transferred with this layout benefit. A compiled output over a
+  declared dimension gets its layout from the compiler, and reading it back at
+  fewer than `max` rows is still slow
+  ([#6026](https://github.com/torch-spyre/torch-spyre/issues/6026)).
 
 #### Restrictions
 
 - `dynamic=` applies only to an eager, CPU to `"spyre"` call of `to()`. Make the
-  call before compiling, not inside a compiled function. It cannot be combined
-  with `device_layout=`. `dtype=` is honoured (the conversion happens on the
+  call before compiling, not inside a compiled function. `device_layout=` may be
+  given with it, as a layout for the tensor at `max` (see "Declaring with an
+  explicit device layout"). `dtype=` is honoured (the conversion happens on the
   host before the transfer); a non-default `memory_format` is rejected.
-  `non_blocking=True` is accepted, but the transfer is always synchronous.
+  `non_blocking=True` returns before the transfer completes (see "Non-blocking
+  host-to-device copies" in the runtime docs).
 - Only dimension 0, the outermost dimension, can be reserved, and only one
   dimension per tensor. Negative dimensions are accepted if they resolve to
   dimension 0 (`-2` on a 2-D tensor). Reserving any other dimension raises an
@@ -510,6 +602,13 @@ stay the same, otherwise `resize_` raises.
 - A declared dimension reaches a compiled graph only as a `for_each_tile` loop
   over it. An op whose own iteration space depends on the declared dimension
   outside any loop is refused at compile time, see the next section.
+- Eager ops (`x.clone()`, `x + 1`, `x.copy_(...)`, ...) work on a declared tensor
+  but do not use the declaration: each one runs a fixed-size kernel, compiled
+  once for every distinct size, and returns a regular tensor of the current
+  size. The dimension is dynamic only inside a `torch.compile` function that you
+  write yourself (see the next section). Carrying the declaration over to the
+  result is tracked in
+  [#6490](https://github.com/torch-spyre/torch-spyre/issues/6490).
 
 #### Compiled graphs over a declared dimension
 
@@ -546,6 +645,18 @@ compiled(y)                       # same graph, same kernel, right values
 The three `torch._check` lines restate the declared range inside the traced
 function. They are what give the compiler a finite range in the trace today and
 have to be written by hand.
+
+Code in the compiled function can still split the range without an error: a
+branch such as `if rows > 256` makes the sizes above 256 compile a second
+program. Two checks report this, both warning by default:
+
+- After each compile, a guard that rejects some declared sizes is reported with
+  the sizes and the source line, for example
+  `guard s0 <= 256 causes a recompile for dim values [320, 384, 448, 512]`.
+  Set `TORCH_SPYRE_NARROWING_CHECK` to `error` or `off` to change this.
+- A recompile while a declared input has one of its declared sizes is reported
+  with PyTorch's reason. Set `TORCH_SPYRE_RECOMPILE_CHECK` to `error`, `all` or
+  `off` to change this.
 
 What is refused, with an error naming `for_each_tile`:
 
@@ -596,11 +707,23 @@ declares only dimension 0 today (see the reservation rules above).
 #### Views and In-place Reshapes
 
 The reservation describes a specific dimension of a specific tensor, so it does
-not follow a reshaped view. `detach()` of the full tensor keeps it. Other views
-(`t()`, `view()`, slices) are ordinary Spyre tensors with no reservation. If a
-reserved tensor is reshaped in place (`t_()`, `squeeze_()`, `unsqueeze_()`,
-`as_strided_()`), its reservation is no longer valid: `resize_` raises an error
-instead of resizing the wrong axis.
+not follow a reshaped view. A tensor keeps it while its storage offset, sizes
+and strides still match the allocation. `detach()` of the full tensor does, and
+so does a `view()`, `alias()` or `as_strided()` that reproduces the tensor's own
+size and strides. A view that changes any of them (`t()`, a `view()` to another
+shape, a slice such as `x[1:]`) has no valid reservation: `get_reserved_dims`
+returns `None`. If a reserved tensor is reshaped in place (`t_()`, `squeeze_()`,
+`unsqueeze_()`, `as_strided_()`), or you call `resize_` on a view that changed
+the geometry (`x[1:].resize_(...)`, `x.view(280, 2048).resize_(...)`), its
+reservation is no longer valid: `resize_` raises an error instead of resizing
+the wrong axis.
+
+A view or `detach()` result is a new tensor object, so it does not carry the
+`torch._dynamo.mark_dynamic` that `to(dynamic=...)` placed on the original.
+Without that mark, the first compile treats the tensor as static, even though
+it keeps its reservation; the next distinct size recompiles with the dimension
+dynamic and picks up the declared range. Call `torch._dynamo.mark_dynamic` on
+it yourself to skip that first compile.
 
 To inspect a tensor's reservation, use `get_reserved_dims` (it returns `None`
 when there is no valid reservation):

@@ -210,16 +210,21 @@ class TensorWorkDivision:
 
         if not isinstance(other, TensorWorkDivision):
             return False
-        # core_mapping imports this module's TensorWorkDivision.
-        from .core_mapping import same_owner_maps
+        key = self.ownership_key
+        return key is not None and key == other.ownership_key
 
-        return same_owner_maps(
-            self.work_slices,
-            self.core_id_to_work_slice,
-            self.physical_core_count,
-            other.work_slices,
-            other.core_id_to_work_slice,
-            other.physical_core_count,
+    @functools.cached_property
+    def ownership_key(self) -> "tuple | None":
+        """This division's :func:`~.core_mapping.ownership_key`, computed once.
+
+        Cached on the instance, so ``work_slices`` and ``core_id_to_work_slice``
+        must not be changed after the first ownership comparison.
+        """
+        # core_mapping imports this module's TensorWorkDivision.
+        from .core_mapping import ownership_key
+
+        return ownership_key(
+            self.work_slices, self.core_id_to_work_slice, self.physical_core_count
         )
 
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
@@ -291,12 +296,12 @@ class TensorArg:
                   docs/source/compiler/hbm_pool_planning.md.
         device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
             unit step of each tiled Inductor iteration symbol (d0, d1, ...), built by
-            SpyreKernel._general_tile_advance from CoarseTileInfo.tiled_dims_per_read /
-            output_tiled_dims's per-level (dim, extent) decisions: one term per nesting
-            level, substituted with that level's own minted symbol, reprojected to
+            SpyreKernel._index_tile_advance from the coefficient of each loop's
+            variable in the access's index: one term per nesting level, in that
+            level's own symbol, reprojected to
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
-            ops without loop_info/coarse tiling.
+            ops in no counted loop.
         work_division: Optional tensor-specific ownership used when it differs
             from the operation's work division.
         kernel_local: True when nothing outside the kernel that produced this
@@ -318,6 +323,17 @@ class TensorArg:
             sharded storage (core c reads or writes only chunk c, through its
             own start address, ``nonUnifiedAllocInHBM_``; see sharded_hbm.py);
             0 for ordinary storage. Checked against the real tensor at launch.
+        non_unified_shard_dim: The iteration-space symbol of the shard dim of
+            this tensor's sharding, when the tensor is sharded storage; None
+            otherwise. The sharded planner pins the work split on the shard
+            dim, and the codegen guard (``verify_non_unified_split``) checks
+            the committed split against this symbol, so a later pass that
+            re-divides the op on any other dim is rejected. Derived from the
+            tensor's placement against the same iteration space the SDSC is
+            emitted from (Inductor mints fresh index symbols per trace, so a
+            symbol captured at planning time can be renamed by scheduling);
+            the SDSC layer maps it to the emitted dim label alongside every
+            other symbol.
     """
 
     is_input: bool
@@ -335,6 +351,7 @@ class TensorArg:
     kernel_local: bool = False
     replicated_scalar: bool = False
     non_unified_shard_bytes: int = 0
+    non_unified_shard_dim: Symbol | None = None
     stride_map: list[int] | None = None
 
     @property
@@ -392,7 +409,7 @@ class OpSpec:
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
         tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
-            to its own nesting level's trip count (CoarseTileInfo.loop_count
+            to its own nesting level's trip count (LoopMember.loop_count
             for that level). Used by SDSC codegen to compute each tiled
             tensor's full pre-tiling extent as
             (per-unit-step device element advance) * trip_count, without
@@ -464,6 +481,29 @@ class UnimplementedOp:
     op: str
 
 
+@dataclasses.dataclass(frozen=True)
+class CountSource:
+    """Where a loop reads its trip count from device memory at run time.
+
+    The count stays in device memory, so the host never needs to see it. It is
+    an FP32 value holding a whole number of trips. Only a count stored in the
+    bundle's pool is supported for now, as the first value of a stick, typically
+    written by an earlier op in the same bundle.
+
+    Plain integers only, so the record survives the generated-code round trip.
+
+    Attributes:
+        pool_offset: Byte offset of the count in the bundle's pool.
+        max_value: Largest count that can be read. The loop is planned for this
+            many trips, so it equals the owning ``LoopSpec.count``.
+        granularity: A number the count is always a multiple of.
+    """
+
+    pool_offset: int
+    max_value: int
+    granularity: int = 1
+
+
 @dataclasses.dataclass
 class LoopSpec:
     """A counted loop whose body is a sequence of ops, possibly nested.
@@ -482,6 +522,10 @@ class LoopSpec:
             name. Resolved during kernel codegen, where the launch argument
             ordering is still live. A symbol that cannot be placed is left out,
             and bundle generation then refuses to declare a parameter for it.
+        count_from_buffer: When set, the loop runs as many trips as a count
+            read from device memory right before the loop starts. ``count``
+            then stays the static maximum, so every pass that reads it is
+            unchanged. None for every other loop.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -500,6 +544,7 @@ class LoopSpec:
     count_symbol_sources: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    count_from_buffer: CountSource | None = None
 
 
 def walk_loop_specs(specs):

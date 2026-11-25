@@ -68,12 +68,18 @@ def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
       the same table while keeping the FX graph cache key picklable.
 
     NOTE: We are working on improving this in upstream PyTorch
+
+    Under ``aot_compile`` with ``TORCH_SPYRE_AOT_REUSE_FX=1``, a graph the FX graph
+    cache holds (from a parallel precompile pool or a plain compile) is loaded from
+    there instead of compiled again (see
+    ``parallel_precompile.compile_reusing_pool_graph``).
     """
     from torch._inductor.compile_fx import compile_fx_inner
     from torch_spyre._inductor.decompositions import get_spyre_decomp_table
+    from torch_spyre._inductor.parallel_precompile import compile_reusing_pool_graph
 
     kwargs["get_decomp_fn"] = get_spyre_decomp_table
-    return compile_fx_inner(*args, **kwargs)
+    return compile_reusing_pool_graph(compile_fx_inner, *args, **kwargs)
 
 
 def _declared_dims_of(
@@ -286,7 +292,13 @@ def enable_spyre_compile_fx_wrapper():
                             with enable_spyre_context(
                                 example_inputs, declared_dims=declared
                             ):
-                                return _orig(gm, example_inputs, *args, **kwargs)
+                                compiled = _orig(gm, example_inputs, *args, **kwargs)
+                                from torch_spyre._inductor.narrowing_check import (
+                                    check_declared_ranges,
+                                )
+
+                                check_declared_ranges(declared)
+                                return compiled
                     finally:
                         _compile_state.in_spyre_compile = _prev_in_spyre
 
