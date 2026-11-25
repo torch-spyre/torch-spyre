@@ -15585,6 +15585,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         run_compile=False,
                         run_eager=True,
                     )
+
     @expects_raise
     def test_index_put_bool_mask(self):
         """``out[mask] = values`` with a boolean mask.

@@ -4356,6 +4356,8 @@ def spyre_scatter_value(
     dim = dim % self.dim()
     src = self.new_full(list(index.shape), value)
     return torch.ops.aten.scatter.src(self, dim, index, src)
+
+
 _INDEX_REDUCE_TYPES = ("prod", "mean", "amax", "amin")
 _INDEX_REDUCE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
