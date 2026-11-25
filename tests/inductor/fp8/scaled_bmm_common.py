@@ -597,16 +597,6 @@ _KNOWN_FAILURES = [
     ),
     _KnownFailure(
         "test_shapes",
-        r"3d_moe_bmm_as_captured_8x1408x2816x1-cores1"
-        r"|3d_moe_bmm_as_captured_96x1408x2816x1-cores11",
-        AssertionError,
-        _OUTSIDE_BOUND,
-        "Unstable: #6438: [fp8] scaled_bmm: N=1 MoE expert matmul returns wrong "
-        "values (inf) at some core counts (passes in recent runs)",
-        strict=False,
-    ),
-    _KnownFailure(
-        "test_shapes",
         r"(3d_moe_bmm_weight_as_mat2_8x1x704x2816"
         r"|4d_decode_pv_(1|4)x32x1x64x128)-cores\d+",
         InductorError,

@@ -1400,7 +1400,7 @@ def _is_qfp8wt_2d_stick(arg: TensorArg, op_spec: OpSpec) -> bool:
         return False
     # A plain copy between a QFP8WT tensor and one of another arrangement (the
     # clone of a QFP8WT weight into a fresh tensor) cannot move 2D sticks into
-    # 1D ones: both sides keep a 1D stick, as before this change.
+    # 1D ones: both sides keep a 1D stick, as for any other plain copy.
     return not (
         op_spec.op == IDENTITY_OP
         and not any(is_index_tensor(a, op_spec) for a in op_spec.args)
