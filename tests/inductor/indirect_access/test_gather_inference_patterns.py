@@ -42,11 +42,6 @@ _INDEX_2D_EAGER = rejection(
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
-_FP16_TO_FP32_EAGER = (
-    5856,
-    "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
-)
 _GATHER_OUT_EAGER = rejection(
     4328,
     "aten::gather.out is not registered on Spyre.",
@@ -60,8 +55,18 @@ _GATHER_STICK_MISMATCH = (
 )
 _CAST_STAGGERED_READ = rejection(
     5856,
-    "Eager topk of an fp16 tensor cast to fp32 on device: the fp16 to fp32 copy_from_d2d of a small tensor raises 'staggered read with no unique num-sticks dim'.",
-    r"staggered read with no unique num-sticks dim",
+    "Eager `topk` on device-converted FP32 tensors may produce incorrect indices due to FP16-to-FP32 conversion inaccuracies..",
+    r"eager spyre <-> cpu mismatch",
+)
+_CAST_STICK_INCOMPATIBLE = rejection(
+    5856,
+    "Eager topk of an fp16 tensor cast to fp32 on device: the topk reduction of the small fp32 tensor raises 'no mechanism to resolve stick incompatibility'.",
+    r"no mechanism to resolve stick incompatibility",
+)
+_CAST_WHOLE_STICK_PAIRS = rejection(
+    5856,
+    "Compiled topk of an fp16 tensor cast to fp32: the DL16_TO_FP32 shuffle of a small tensor raises 'requires whole stick pairs' (one stick per core).",
+    r"requires whole stick pairs",
 )
 _TOPK_CAST_EAGER = (
     5856,
@@ -200,8 +205,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_online_softmax(self, execution_mode):
         """K gather + attention scores + softmax."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         kv = cached_randn((512, 8, 64), differentiation="gpa14", dtype=torch.float16)
         q = cached_randn((8, 4, 64), differentiation="gpa14q", dtype=torch.float16)
         idx = torch.randint(0, 512, (64,), dtype=torch.int64)
@@ -219,8 +222,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_full_attention(self, execution_mode):
         """Full paged attention: gather K + V + attention + weighted V sum."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         kv_k = cached_randn((512, 8, 64), differentiation="gpa15k", dtype=torch.float16)
         kv_v = cached_randn((512, 8, 64), differentiation="gpa15v", dtype=torch.float16)
         q = cached_randn((8, 4, 64), differentiation="gpa15q", dtype=torch.float16)
@@ -492,7 +493,11 @@ class TestGatherInferencePatternsEagerCompile:
     def test_topk_moe_routing_top1(self, execution_mode):
         """MoE top-1 routing: softmax → topk(1) → index → gather expert weights."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_CAST_STAGGERED_READ)
+        _xfail_existing(
+            execution_mode,
+            eager=_CAST_STICK_INCOMPATIBLE,
+            compiled=_CAST_WHOLE_STICK_PAIRS,
+        )
         n_experts = 8
         expert_w = cached_randn(
             (n_experts, 64, 32), differentiation="topk01", dtype=torch.float16
@@ -514,7 +519,11 @@ class TestGatherInferencePatternsEagerCompile:
     def test_topk_moe_routing_top2(self, execution_mode):
         """MoE top-2 routing: topk(2) flattened → gather 2 experts per token."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_CAST_STAGGERED_READ)
+        _xfail_existing(
+            execution_mode,
+            eager=_CAST_STICK_INCOMPATIBLE,
+            compiled=_CAST_WHOLE_STICK_PAIRS,
+        )
         n_experts = 8
         expert_w = cached_randn(
             (n_experts, 32, 64), differentiation="topk02", dtype=torch.float16
@@ -538,7 +547,7 @@ class TestGatherInferencePatternsEagerCompile:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6390
         _xfail_existing(
             execution_mode,
-            eager=_CAST_STAGGERED_READ,
+            eager=_CAST_STICK_INCOMPATIBLE,
             compiled=_WEIGHTED_NO_LAYOUT,
         )
         n_experts = 8
@@ -583,7 +592,9 @@ class TestGatherInferencePatternsEagerCompile:
         """Beam search: topk beam scores → gather KV rows for top beams."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
         _xfail_existing(
-            execution_mode, eager=_CAST_STAGGERED_READ, compiled=_TOPK_CAST_COMPILED
+            execution_mode,
+            eager=_CAST_STAGGERED_READ,
+            compiled=_TOPK_CAST_COMPILED,
         )
         kv = cached_randn((8, 8, 64), differentiation="topk05", dtype=torch.float16)
         beam_scores = cached_randn((8,), differentiation="topk05s", dtype=torch.float16)
