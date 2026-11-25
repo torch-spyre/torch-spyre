@@ -12,15 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compiled torch.bmm on batch-sharded tensors (non-unified kernels).
+"""Compiled torch.bmm / torch.mm on sharded tensors (non-unified kernels).
 
-The expert-parallel shape: both operands sharded on the batch dim, so core
-c multiplies input shard c of both operands and writes output shard c. The
-result stays sharded on the batch dim.
+Two shapes, one kernel class:
 
-torch-spyre lowers bmm to one Reduction node with two loaders (a fused
-multiply-accumulate over the contraction dim), so this is a two-read
-shard-local reduction -- the same class as the single-read reductions in
+- batch-sharded bmm (the expert-parallel shape, #6174): both operands
+  sharded on the batch dim, so core c multiplies input shard c of both
+  operands and writes output shard c;
+- row-sharded mm with a plain weight (#6177): x [T, d] Shard(0), the
+  weight an unsharded graph input read whole by every core through
+  ordinary unified addressing, output [T, out] sharded on the row dim.
+
+torch-spyre lowers bmm and mm to one Reduction node with two loaders (a
+fused multiply-accumulate over the contraction dim), so both are two-read
+shard-local reductions -- the same class as the single-read reductions in
 test_sharded_reduction.py, admitted by the same planner.
 
 The device tests need ``SENCORES`` in (8, 16) and a Flex device mode that
@@ -147,31 +152,141 @@ def test_batch_sharded_bmm_feeds_a_sharded_pointwise_op(launched):
 
 @requires_emulation
 @pytest.mark.parametrize(
+    "t, d, out",
+    [
+        (64, 64, 64),
+        (32, 128, 64),  # K spans two sticks
+        (64, 64, 32),  # narrow output
+    ],
+    ids=["square", "two_stick_k", "narrow_out"],
+)
+def test_row_sharded_mm_with_plain_weight_matches_cpu(launched, t, d, out):
+    """The #6177 shape: x [T, d] Shard(0), w [d, out] an unsharded graph input.
+
+    Core c multiplies input rows of shard c against the whole weight --
+    the weight keeps ordinary unified addressing -- and writes output shard
+    c; the result stays sharded on the row dim.
+    """
+    n = num_shards()
+    x_cpu = _small_ints((t * n, d))
+    w_cpu = _small_ints((d, out), seed=3)
+    x = _sharded(x_cpu, 0, n)
+    w = w_cpu.to("spyre")
+
+    y = torch.compile(lambda a, b: torch.mm(a, b), dynamic=False)(x, w)
+
+    assert len(launched) == 1, launched
+    assert torch.spyre.is_sharded(y)
+    info = torch.spyre.sharding_info(y)
+    assert info.placement == Shard(0) and info.num_shards == n
+    assert tuple(y.shape) == (t * n, out)
+    assert torch.equal(y.cpu(), torch.mm(x_cpu, w_cpu))
+
+
+@requires_emulation
+def test_row_sharded_mm_feeds_a_sharded_pointwise_op(launched):
+    """The sharded mm result is a valid input to a later compiled call."""
+    n = num_shards()
+    x_cpu = _small_ints((64 * n, 64))
+    w_cpu = _small_ints((64, 64), seed=3)
+    b_cpu = _small_ints((64 * n, 64), seed=4)
+    x, b = _sharded(x_cpu, 0, n), _sharded(b_cpu, 0, n)
+    w = w_cpu.to("spyre")
+
+    y = torch.compile(lambda a, c: torch.mm(a, c), dynamic=False)(x, w)
+    z = torch.compile(lambda u, v: u + v, dynamic=False)(y, b)
+
+    assert len(launched) == 2, launched
+    assert torch.spyre.is_sharded(z)
+    assert torch.equal(z.cpu(), torch.mm(x_cpu, w_cpu) + b_cpu)
+
+
+@requires_emulation
+@expects_raise
+def test_mm_with_computed_weight_fails_at_compile():
+    """The unsharded weight must be a read-only replica: a weight computed
+    in the graph would be placed by planning passes that know nothing
+    about the shard plan, so it fails closed with the replica-source
+    message."""
+    n = num_shards()
+    x = _sharded(_small_ints((64 * n, 64)), 0, n)
+    w = _small_ints((64, 64), seed=3).to("spyre")
+
+    with pytest.raises(RuntimeError, match="scalar constant or a graph input"):
+        torch.compile(lambda a, b: torch.mm(a, b * 2), dynamic=False)(x, w)
+
+
+@requires_emulation
+@pytest.mark.parametrize(
+    "fn, setup, match",
+    [
+        # Sharding the contraction dim needs cross-shard partials (#6175):
+        # the K dim is reduced, so the shard dim is not kept.
+        (
+            lambda a, b: torch.mm(a, b),
+            "k_sharded",
+            "cross-shard reductions over several operands",
+        ),
+        # A weight sharded on the output dim (#6176): the work division
+        # does not honor a column pin for matmuls, so it fails closed with
+        # the real reason rather than the guard's re-division message.
+        (
+            lambda a, b: torch.mm(a, b),
+            "w_col_sharded",
+            "input sharded on its row dim",
+        ),
+    ],
+    ids=["contraction_dim", "column_sharded_weight"],
+)
+@expects_raise
+def test_mm_rejects_other_shardings(fn, setup, match):
+    n = num_shards()
+    if setup == "k_sharded":
+        x = _sharded(_small_ints((64, 64 * n)), 1, n)
+        w = _small_ints((64 * n, 64), seed=3).to("spyre")
+    else:
+        x = _small_ints((64, 64)).to("spyre")
+        w = _sharded(_small_ints((64, 64 * n), seed=3), 1, n)
+
+    with pytest.raises(RuntimeError, match=match):
+        torch.compile(fn, dynamic=False)(x, w)
+
+
+@requires_emulation
+@pytest.mark.parametrize(
     "w_shard_dim",
     [1, None],
     ids=["different_placement", "unsharded_operand"],
 )
 @expects_raise
 def test_batch_sharded_bmm_rejects_mixed_operands(w_shard_dim):
-    """Fail closed: every operand must be sharded on the same dim.
+    """Fail closed: every operand must be sharded on the same dim, or be a
+    replica the whole kernel can read.
 
     Shard(0) x Shard(1) is a different placement (the contraction dim
-    sharded on one side only); a plain unsharded operand is a mixed read.
-    Both need redistribution, which non-unified kernels do not do.
+    sharded on one side only). A full-size plain weight is not a replica:
+    its read walks the batch dim, so each core would need a different
+    slice of it (row-sharded mm's weight works because nothing of it
+    lives on the split dim). Both need redistribution or slicing, which
+    non-unified kernels do not do.
     """
     n = num_shards()
     x_shape, w_shape = _bmm_shapes(2, 64, 64, 64)
     x_cpu = _small_ints(x_shape)
     w_cpu = _small_ints(w_shape, seed=1)
     x = _sharded(x_cpu, 0, n)
-    w = _sharded(w_cpu, w_shard_dim, n) if w_shard_dim is not None else w_cpu.to("spyre")
+    w = (
+        _sharded(w_cpu, w_shard_dim, n)
+        if w_shard_dim is not None
+        else w_cpu.to("spyre")
+    )
 
     # A different placement hits the placement-agreement check; a plain
-    # unsharded operand hits the reduction's no-unsharded-reads check.
+    # operand that spans the shard dim hits the read-whole check.
     expected = (
         "cannot combine operands sharded"
         if w_shard_dim is not None
-        else "unsharded operand only in pointwise"
+        else "read an unsharded operand"
     )
     with pytest.raises(RuntimeError, match=expected):
         torch.compile(lambda a, b: torch.bmm(a, b), dynamic=False)(x, w)

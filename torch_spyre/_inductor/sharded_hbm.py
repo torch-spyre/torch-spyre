@@ -459,22 +459,29 @@ def _plan_shard_local_reduction(
     graph: GraphLowering,
     op: ComputedBuffer,
     reads: list[MemoryDep],
+    unsharded_reads: list[MemoryDep],
     write: MemoryDep,
     placement: ShardedPlacement,
 ) -> ShardedPlacement | None:
     """Admit a reduction of sharded operands; return the result placement.
 
-    One read is the Phase-2 case (``sum``/``mean``/``max``/``min`` of one
-    sharded operand). Multiple reads are the matmul family (#6174): a fused
+    One sharded read and nothing else is the Phase-2 case
+    (``sum``/``mean``/``max``/``min`` of one sharded operand). More reads
+    than that are the matmul family (#6174, #6177): a fused
     multiply-accumulate whose contraction symbol is shared by every read
-    (torch-spyre lowers ``bmm`` as one ``Reduction`` node with two loaders,
-    not a matmul template). Every read must be sharded on the same dim with
-    the same shard count.
+    (torch-spyre lowers ``bmm``/``mm`` as one ``Reduction`` node with two
+    loaders, not a matmul template). The extra reads are either sharded on
+    the same dim with the same shard count (batch-sharded bmm), or
+    unsharded read-only replicas (row-sharded mm with a plain weight: an
+    unsharded graph input or scalar constant, per
+    ``_require_replica_source``). An unsharded read must not walk the
+    shard dim -- every core reads all of it through ordinary unified
+    addressing while the pinned split divides only the row dim.
 
-    If the shard dim is kept in every read, each core reduces only its own
-    shards, so the result is sharded along the shard dim's position in the
-    output and each output shard is written by the core that read the
-    matching input shards.
+    If the shard dim is kept in every sharded read, each core reduces only
+    its own shards, so the result is sharded along the shard dim's position
+    in the output and each output shard is written by the core that read
+    the matching input shards.
 
     If the shard dim is reduced, the reduction is cross-shard and is planned
     for the ring (``_plan_cross_shard_reduction``); the result is unsharded
@@ -483,13 +490,14 @@ def _plan_shard_local_reduction(
     result over the batch) stays rejected.
     """
     name = op.get_name()
-    allowed = _SHARD_LOCAL_REDUCTIONS if len(reads) == 1 else _MULTI_READ_REDUCTIONS
+    n_reads = len(reads) + len(unsharded_reads)
+    allowed = _SHARD_LOCAL_REDUCTIONS if n_reads == 1 else _MULTI_READ_REDUCTIONS
     if not isinstance(op.data, Reduction) or op.data.reduction_type not in allowed:
         kind = getattr(op.data, "reduction_type", type(op.data).__name__)
         raise Unsupported(
             f"{name}: non-unified kernels support shard-local "
-            f"{', '.join(allowed)} reductions over {len(reads)} sharded "
-            f"operand(s) only; got {kind}"
+            f"{', '.join(allowed)} reductions over {n_reads} operand(s) "
+            f"only; got {kind}"
         )
     s = placement.shard_dim
     out_size = [int(s) for s in op.get_size()]
@@ -519,16 +527,16 @@ def _plan_shard_local_reduction(
             f"have the same extent; got {sorted(shard_extents)}"
         )
     if any(s not in kept for _, _, _, kept, _ in per_read):
-        if len(reads) > 1:
+        if n_reads > 1:
             raise Unsupported(
-                f"{name}: cross-shard reductions over several sharded operands "
+                f"{name}: cross-shard reductions over several operands "
                 "are not supported (only one sharded operand may be reduced "
                 "across the ring)"
             )
         _, in_size, reduced, _, dim_symbol = per_read[0]
         _plan_cross_shard_reduction(op, name, in_size, reduced, dim_symbol, placement)
         return None
-    if len(reads) == 1:
+    if n_reads == 1:
         _, in_size, reduced, _, _ = per_read[0]
         stick_dim = len(in_size) - 1
         if stick_dim in reduced:
@@ -549,6 +557,18 @@ def _plan_shard_local_reduction(
             f"be the same iteration symbol; got {sorted(map(str, shard_syms))}"
         )
     (shard_sym,) = shard_syms
+    # An unsharded read (row-sharded mm's weight) is addressed as in any
+    # unified kernel: the pinned split divides only the row dim, which the
+    # read's index must not walk, so every core reads all of it. Its source
+    # was already checked (graph input or scalar constant,
+    # _require_replica_source in plan_sharded_hbm).
+    for dep in unsharded_reads:
+        if shard_sym in dep.index.free_symbols:
+            raise Unsupported(
+                f"{name}: non-unified reductions read an unsharded operand "
+                f"({dep.name}) only whole; its index walks the shard dim, so "
+                "cores would need different slices of it"
+            )
     _, in_size, reduced, _, _ = per_read[0]
     # Output position of the shard dim: kept dims appear in the write index
     # in input order, and keepdim inserts size-1 dims for reduced ones.
@@ -570,6 +590,20 @@ def _plan_shard_local_reduction(
         raise Unsupported(
             f"{name}: reduction result puts shard dim {s} at {out_shard_dim}, "
             f"expected {expected}"
+        )
+    if unsharded_reads and out_shard_dim != 0:
+        # The mixed matmul shape (#6177): input sharded on its row dim, the
+        # weight an unsharded replica read whole. Sharding a later output
+        # dim (a column-sharded weight) also passes the read-whole check --
+        # the unsharded input does not walk the column symbol -- but the
+        # work division does not honor a column pin for matmuls (it
+        # re-divides, and the codegen guard rejects the result). Fail
+        # closed here with the real reason instead (#6176).
+        raise Unsupported(
+            f"{name}: non-unified matmuls with an unsharded operand are "
+            "supported with the input sharded on its row dim (the output's "
+            f"first dim) only; this one shards output dim {out_shard_dim} "
+            "(column-sharded weights are #6176)"
         )
     out_placement = ShardedPlacement(
         shard_dim=out_shard_dim,
@@ -667,8 +701,11 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
       operands as read-only replicas (see ``_require_replica_source`` and
       ``_require_replica_read``): a scalar constant, or a graph input of the
       op's shape or broadcast to it;
-    - shard-local reductions (see ``_plan_shard_local_reduction``) of one
-      sharded operand; the output gets the remapped placement.
+    - shard-local reductions (see ``_plan_shard_local_reduction``) of sharded
+      operands; the output gets the remapped placement. The matmul family
+      may read several sharded operands (batch-sharded bmm) and unsharded
+      replicas (row-sharded mm with a plain weight, #6177); single-read
+      reductions keep rejecting unsharded reads.
 
     The output is allocated sharded. The split is ``{shard_dim: num_shards}``;
     ``work_distribution`` commits it instead of choosing one, and LX planning
@@ -717,9 +754,6 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
         # reduction may have different shapes, so their per-shard byte sizes
         # legitimately differ. The pointwise path below additionally requires
         # every operand to have the op's shape, which implies equal bytes.
-        # Unsharded reads are admitted only in pointwise ops (with a replica
-        # source) by the checks below; a reduction with an unsharded read is
-        # rejected there.
         if any(
             (p.shard_dim, p.num_shards) != (placement.shard_dim, placement.num_shards)
             for p in sharded
@@ -730,11 +764,11 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
                 "data between placements is not supported"
             )
         unsharded = [dep for dep in reads if dep.name not in placements]
-        if unsharded and is_reduction:
-            raise Unsupported(
-                f"{name}: non-unified kernels admit an unsharded operand only "
-                f"in pointwise ops; this reduction also reads {unsharded[0].name}"
-            )
+        # Unsharded reads (pointwise replicas, or row-sharded mm's weight)
+        # must exist before the kernel runs. Whether a reduction may carry
+        # one is decided by the matmul-family gate in
+        # _plan_shard_local_reduction; single-read reductions reject them
+        # there with their own message.
         for dep in unsharded:
             _require_replica_source(graph, name, dep)
         if any(not isinstance(dep, MemoryDep) for dep in rw.reads):
@@ -752,13 +786,14 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
         _check_core_match(placement)
         if is_reduction:
             write = next(iter(rw.writes))
-            if not reads or not isinstance(write, MemoryDep):
+            sharded_reads = [dep for dep in reads if dep.name in placements]
+            if not sharded_reads or not isinstance(write, MemoryDep):
                 raise Unsupported(
                     f"{name}: non-unified reductions need a plain write of a "
                     "plain buffer"
                 )
             out_placement = _plan_shard_local_reduction(
-                graph, op, reads, write, placement
+                graph, op, sharded_reads, unsharded, write, placement
             )
             if out_placement is not None:
                 placements[name] = out_placement

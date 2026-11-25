@@ -923,20 +923,21 @@ def test_dynamic_shapes_fail_at_compile():
 @requires_emulation
 @expects_raise
 def test_unsharded_operand_read_by_reduction_fails_at_compile():
-    """An unsharded operand is admitted only in a pointwise op, so a reduction
-    that reads one is rejected at compile, not at launch with an error that
-    names neither the op nor the sharding. cumsum decomposes to a matmul (a
-    reduction) over the sharded operand and an unsharded triu mask. The
-    computed-operand path is covered by
+    """An unsharded operand of a reduction must be a read-only replica: a
+    scalar constant or a graph input, so a reduction reading anything else
+    is rejected at compile, not at launch with an error that names neither
+    the op nor the sharding. cumsum decomposes to a matmul (a reduction)
+    over the sharded operand and an unsharded triu mask; matmul-family
+    reductions admit graph-input replicas (row-sharded mm), but the mask is
+    computed in the graph, so the replica-source check fires. The
+    pointwise-path variant of the computed-operand case is covered by
     test_scaled_unsharded_operand_fails_at_compile."""
     n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
     b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(
-        RuntimeError, match="admit an unsharded operand only in pointwise ops"
-    ):
+    with pytest.raises(RuntimeError, match="scalar constant or a graph input"):
         torch.compile(lambda x, y: torch.cumsum(x, dim=1) + 0 * y, dynamic=False)(a, b)
 
 
