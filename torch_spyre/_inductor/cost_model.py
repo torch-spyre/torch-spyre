@@ -184,12 +184,14 @@ Parameters live in :class:`CostParams`, calibrated from device measurements
 """
 
 import dataclasses
+import itertools
 import math
 from collections.abc import Mapping, Sequence
 
 import regex
 import sympy
 from sympy.utilities.lambdify import implemented_function
+from sympy.logic.boolalg import SOPform
 
 from .work_division import (
     _DECODE_MAX_ROWS,
@@ -1955,8 +1957,8 @@ def transport_bw(o, p, kind):
 def _reduction_rows(o):
     """ROWS of a reduction's input (governs its read rate), from the largest HBM input."""
     # An UNDECIDED `is_lx` counts as HBM. `a.mem` would reject it, and this is reached
-    # unconditionally on the standalone-reduction branch -- exactly where the
-    # co-optimizing path lands, since `_eff_bw` returns None for symbolic args. Picking
+    # unconditionally on the standalone-reduction branch, which the co-optimizing path
+    # reaches with residency undecided (no effective-BW override applies). Picking
     # a row count cannot be scaled by `(1 - is_lx)` the way `_loop_reread_bytes`' bytes
     # can, and HBM is the baseline the rest of the model prices against, so this keeps
     # the governing rows non-zero rather than reporting no input at all.
@@ -2686,6 +2688,95 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
     return total
 
 
+def _eff_bw(o, p: CostParams):
+    """``o``'s per-op effective-BW override, or None for the default turnaround
+    model. Every arg's ``is_lx`` must be decided (see :func:`_eff_bw_cases`)."""
+    pat = getattr(o, "hbm_pattern", "")
+    if pat == "stick_scatter":  # cat0: strided stick-plane gather (tagged)
+        return transport_bw(o, p, "cat0")
+    if pat == "restickify":  # transpose
+        return p.bw_restickify_gbps
+    if pat == "reduce_outer":  # sumcol
+        return p.bw_reduce_outer_gbps
+    if _is_broadcast_op(o):
+        return broadcast_bw(o, p)
+    kind = _transport_kind(
+        o
+    )  # cat1 / transpose_outer -- untagged, detected structurally
+    if kind:
+        return transport_bw(o, p, kind)
+    return None
+
+
+# Past this many undecided residencies on one op, :func:`_eff_bw_cases` gives up on
+# enumerating them and leaves the op on the default model.
+_EFF_BW_MAX_UNDECIDED = 8
+
+
+def _eff_bw_cases(o, p: CostParams) -> list[tuple]:
+    """:func:`_eff_bw` as ``(bw or None, condition)`` cases over ``o``'s undecided
+    residencies, the conditions disjoint and covering every 0/1 assignment.
+
+    The override reads residency only to ask which args are in HBM (``a.mem``), so it
+    is evaluated at each assignment of the undecided ``is_lx`` values, and the
+    assignments that agree are merged into one minimized condition. A decided op, or
+    a tagged pattern whose rate ignores residency, is one case with condition True.
+    """
+    pat = getattr(o, "hbm_pattern", "")
+    if pat == "restickify" or pat == "reduce_outer":
+        return [(_eff_bw(o, p), sympy.true)]
+    undecided = list(dict.fromkeys(a.is_lx for a in o.args if _is_sym(a.is_lx)))
+    if not undecided:
+        decided = [
+            dataclasses.replace(a, is_lx=bool(a.is_lx))
+            if isinstance(a.is_lx, sympy.Basic)
+            else a
+            for a in o.args
+        ]
+        return [(_eff_bw(dataclasses.replace(o, args=decided), p), sympy.true)]
+    if len(undecided) > _EFF_BW_MAX_UNDECIDED:
+        return [(None, sympy.true)]
+    groups: dict = {}
+    for bits in itertools.product((0, 1), repeat=len(undecided)):
+        value = dict(zip(undecided, bits))
+        args = [
+            dataclasses.replace(
+                a,
+                is_lx=bool(value[a.is_lx]) if _is_sym(a.is_lx) else bool(a.is_lx),
+            )
+            for a in o.args
+        ]
+        groups.setdefault(_eff_bw(dataclasses.replace(o, args=args), p), []).append(
+            list(bits)
+        )
+    if len(groups) == 1:
+        return [(next(iter(groups)), sympy.true)]
+    # Minimize each group's assignments over sympy placeholders (SOPform is
+    # sympy's), then spell the result in the active algebra: a placeholder is
+    # its residency at 1, its negation the residency at 0.
+    flags = [sympy.Dummy(f"lx{i}") for i in range(len(undecided))]
+    residency = dict(zip(flags, undecided))
+
+    def spelled(cond):
+        if isinstance(cond, sympy.And):
+            return sympy.And(*(spelled(c) for c in cond.args))
+        if isinstance(cond, sympy.Or):
+            return sympy.Or(*(spelled(c) for c in cond.args))
+        if isinstance(cond, sympy.Not):
+            return sympy.Eq(residency[cond.args[0]], 0)
+        return sympy.Eq(residency[cond], 1)
+
+    return [(bw, spelled(SOPform(flags, minterms))) for bw, minterms in groups.items()]
+
+
+def _cases_piecewise(cases: list[tuple]):
+    """The value of disjoint, covering ``(value, condition)`` cases: the value itself
+    for one case, else a Piecewise whose last arm is the default."""
+    if len(cases) == 1:
+        return cases[0][0]
+    return sympy.Piecewise(*cases[:-1], (cases[-1][0], True))
+
+
 def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """Predicted device latency (ns) for a bundle of ops (one fused kernel).
 
@@ -2713,48 +2804,35 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     rep_bytes, rep_ns = _replicated_operand_reads(ops, p)
     r = r - rep_bytes
     # HBM. Pointwise/reduction/transport keep the single-BW turnaround model.
-    _pat_bw = {
-        "restickify": p.bw_restickify_gbps,
-        "reduce_outer": p.bw_reduce_outer_gbps,
-    }
-
-    def _eff_bw(o):  # per-op effective-BW override, or None -> default turnaround
-        if any(isinstance(a.is_lx, sympy.Basic) for a in o.args):
-            # TODO: make symbolic
-            return None
-        pat = getattr(o, "hbm_pattern", "")
-        if pat == "stick_scatter":  # cat0: strided stick-plane gather (tagged)
-            return transport_bw(o, p, "cat0")
-        if pat in _pat_bw:  # restickify (transpose), reduce_outer (sumcol)
-            return _pat_bw[pat]
-        if _is_broadcast_op(o):
-            return broadcast_bw(o, p)
-        kind = _transport_kind(
-            o
-        )  # cat1 / transpose_outer -- untagged, detected structurally
-        if kind:
-            return transport_bw(o, p, kind)
-        return None
-
-    # Only the fused-reduction branch below raises this; every other path leaves it at 0
-    # so the `max()` at `mem_t` is a no-op for them.
-    if any(_eff_bw(o) is not None for o in ops):
+    # Each op's effective-BW override as (bw or None, condition) cases; one case
+    # with condition True unless the override depends on an undecided residency.
+    bw_cases = [_eff_bw_cases(o, p) for o in ops]
+    override = [cond for cases in bw_cases for bw, cond in cases if bw]
+    per_op_mem = None
+    if override:
         # Per-op effective BW (access-pattern transports OR a broadcast operand); these
         # fold turnaround into the rate. Ops without an override keep the default
         # single-BW + turnaround.
-        mem = 0.0
-        for o in ops:
+        per_op_mem = 0.0
+        for o, cases in zip(ops, bw_cases):
             ro, wo = o.read_bytes(), o.write_bytes()
             ro = (
                 ro
                 - sum(a.replicated_hbm_elems() for a in o.args if a.role == "input")
                 * o.dtype_bytes
             )
-            bw = _eff_bw(o)
-            if bw:
-                mem += (ro + wo) / bw
-            else:
-                mem += _peak_mem_ns(ro, wo, p)
+            priced = [
+                ((ro + wo) / bw if bw else _peak_mem_ns(ro, wo, p), cond)
+                for bw, cond in cases
+            ]
+            per_op_mem += _cases_piecewise(priced)
+    # The override, when it applies, replaces the whole bundle-level model below,
+    # so a residency-dependent override selects between the two.
+    override_always = any(cond == sympy.true for cond in override)
+    # Only the fused-reduction branch below raises this; every other path leaves it at 0
+    # so the `max()` at `mem_t` is a no-op for them.
+    if override_always:
+        mem = per_op_mem
     elif (
         len(ops) == 1
         and ops[0].is_reduction
@@ -2805,6 +2883,8 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         mem = _peak_mem_ns(r, w, p)
     else:
         mem = _peak_mem_ns(r, w, p)
+    if override and not override_always:
+        mem = sympy.Piecewise((per_op_mem, sympy.Or(*override)), (mem, True))
     # Replace the stores' peak-rate charge with the writing cores' limited rate.
     mem = mem + _store_core_excess_ns(ops, p)
     # Sharing slows delivery of these same reads; it does not add HBM bytes.

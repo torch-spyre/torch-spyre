@@ -26,6 +26,8 @@ and the clone's one load is priced separately, outside the readers' bundle turna
 No Spyre device or backend compiler is required; features are built directly.
 """
 
+import dataclasses
+import itertools
 import logging
 from types import SimpleNamespace
 
@@ -1038,3 +1040,121 @@ def test_an_unresolvable_target_falls_back_rather_than_raising(monkeypatch, capl
     assert "buf_gone" in caplog.text
     # Keyed on the target, so the second helper's identical failure stays quiet.
     assert len(caplog.records) == 1
+
+
+# ------------------------------------------- effective bandwidth under residency
+
+
+def _bw_arg(name, role, logical, *, broadcast=False):
+    elems = 1
+    for size in logical:
+        elems *= size
+    return ArgTraffic(
+        name=name,
+        role=role,
+        is_lx=False,
+        elems=elems,
+        broadcast=broadcast,
+        dims=list(logical),
+        logical=list(logical),
+        is_boundary=False,
+    )
+
+
+def _bw_op(name, args, **kwargs):
+    out = next(a for a in args if a.role == "output")
+    return OpFeatures(
+        name=name,
+        is_reduction=False,
+        out_elems=out.elems,
+        cores=32,
+        dtype_bytes=DTYPE,
+        args=args,
+        **kwargs,
+    )
+
+
+def _restickify():
+    return [
+        _bw_op(
+            "clone",
+            [_bw_arg("x", "input", [512, 256]), _bw_arg("y", "output", [256, 512])],
+            hbm_pattern="restickify",
+        )
+    ]
+
+
+def _row_broadcast():
+    return [
+        _bw_op(
+            "add",
+            [
+                _bw_arg("x", "input", [256, 512]),
+                _bw_arg("b", "input", [1, 512], broadcast=True),
+                _bw_arg("y", "output", [256, 512]),
+            ],
+        )
+    ]
+
+
+def _cat1():
+    return [
+        _bw_op(
+            "cat",
+            [_bw_arg("x", "input", [256, 512]), _bw_arg("y", "output", [256, 4, 512])],
+        )
+    ]
+
+
+def _broadcast_then_pointwise():
+    # The broadcast op's override replaces the whole bundle's model, so whether it
+    # applies decides between the per-op and the fused bundle-level pricing.
+    return _row_broadcast() + [
+        _bw_op(
+            "mul",
+            [
+                _bw_arg("y", "input", [256, 512]),
+                _bw_arg("z", "input", [256, 512]),
+                _bw_arg("w", "output", [256, 512]),
+            ],
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "bundle", [_restickify, _row_broadcast, _cat1, _broadcast_then_pointwise]
+)
+def test_effective_bandwidth_under_symbolic_residency_matches_every_placement(bundle):
+    """An undecided residency must price exactly what the decided one does.
+
+    The per-op bandwidth overrides (a restickify's, a broadcast operand's, a stick-plane
+    transport's) once gave up on any symbolic ``is_lx`` and fell back to the peak-rate
+    model, so the solver's objective priced these ops differently from the concrete
+    model. Some overrides only apply while particular args are in HBM, so every 0/1
+    placement is checked, not just one."""
+    _check_every_placement(bundle())
+
+
+def _check_every_placement(ops):
+    params = CostParams()
+    names = list(dict.fromkeys(a.name for op in ops for a in op.args))
+    symbols = {
+        n: sympy.Symbol(f"is_lx_{n}", integer=True, nonnegative=True) for n in names
+    }
+
+    def placed(residency):
+        return [
+            dataclasses.replace(
+                op,
+                args=[dataclasses.replace(a, is_lx=residency[a.name]) for a in op.args],
+            )
+            for op in ops
+        ]
+
+    symbolic = sympy.sympify(cost_model.predict_ops(placed(symbols), params=params))
+    assert symbolic.free_symbols, "residency should stay a decision in the price"
+    for bits in itertools.product((False, True), repeat=len(names)):
+        residency = dict(zip(names, bits))
+        concrete = cost_model.predict_ops(placed(residency), params=params)
+        value = float(symbolic.subs({symbols[n]: int(v) for n, v in residency.items()}))
+        assert value == pytest.approx(concrete, rel=1e-12), residency
