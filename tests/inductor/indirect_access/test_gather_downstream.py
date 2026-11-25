@@ -45,11 +45,6 @@ _NUMERICAL_MISMATCH = (
     "Eager fp32 exp (after a gather) mismatches CPU at atol=rtol=1e-5.",
     r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_FP16_TO_FP32_EAGER = (
-    5856,
-    "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
-)
 _CLIP_FP32 = (
     6391,
     "Compiled fp32 exp (after a gather) mismatches CPU at atol=rtol=1e-5.",
@@ -200,8 +195,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_cos_cpu_fallback(self, execution_mode):
         """cos has no Spyre kernel; gather on Spyre, cos falls back to CPU."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         x = cached_randn((32, 64), differentiation="gds11", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -215,8 +208,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_log_cpu_fallback(self, execution_mode):
         """log unsupported on Spyre; gather on Spyre, log on CPU."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         x = cached_randn(
             (32, 64), differentiation="gds12", dtype=torch.float16, abs=True
         )
@@ -232,8 +223,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_softmax(self, execution_mode):
         """gather + softmax(dim=-1); rows sum to 1.0."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         x = cached_randn((32, 128), differentiation="gds13", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(

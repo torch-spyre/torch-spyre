@@ -57,7 +57,7 @@ and the output must share a stick. The cost is the sum of per-input
 restickify costs for each input/output pair that is not stick compatible.
 
 **`FixedInOutNode`** — used for `matmul`, `conv`, `exx2`, `layernormnorm`,
-`keep_by_index`, and `aten.clone` with a stick offset. Each input and the
+`keep_by_index`, `mask_by_index`, and `aten.clone` with a stick offset. Each input and the
 output have a fixed required stick; any operand that arrives with the wrong
 stick triggers a restickify. `matmul`'s two inputs, for example, require
 different stick variables.

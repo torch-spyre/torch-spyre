@@ -87,6 +87,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "kernel_local": "bool",
     "replicated_scalar": "bool",
     "non_unified_shard_bytes": "int",
+    "non_unified_shard_dim": "Symbol | None",
     "stride_map": "list[int] | None",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
@@ -99,6 +100,7 @@ _EXPECTED_LOOP_SPEC_SCHEMA = {
     "body": "list[Any]",
     "count_symbol_bounds": "dict[str, tuple[int, int]]",
     "count_symbol_sources": "dict[str, tuple[int, int]]",
+    "count_from_buffer": "CountSource | None",
 }
 
 
@@ -306,6 +308,11 @@ def _canonical_spec(spec: object) -> object:
             result["count_symbol_bounds"] = _canonical_value(spec.count_symbol_bounds)
         if spec.count_symbol_sources:
             result["count_symbol_sources"] = _canonical_value(spec.count_symbol_sources)
+        # Same rule: absent for a loop without one, so existing keys are kept.
+        if spec.count_from_buffer is not None:
+            result["count_from_buffer"] = _canonical_value(
+                dataclasses.asdict(spec.count_from_buffer)
+            )
         return result
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
 
@@ -358,6 +365,11 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
         result["replicated_scalar"] = True
     if arg.non_unified_shard_bytes:
         result["non_unified_shard_bytes"] = arg.non_unified_shard_bytes
+    # Same rule as shard_bytes: sharded kernels only.  The shard dim changes
+    # the emitted SDSC (which dim the split lands on), so it belongs in the
+    # identity; ordinary tensors keep their exact pre-field key.
+    if arg.non_unified_shard_dim is not None:
+        result["non_unified_shard_dim"] = _canonical_value(arg.non_unified_shard_dim)
     # stride_map is left out: it only guides binding the coordinates, so its
     # effect is already in device_coordinates.
     return result
