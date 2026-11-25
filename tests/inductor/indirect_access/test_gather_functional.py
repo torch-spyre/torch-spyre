@@ -35,11 +35,6 @@ _GATHER_EAGER = rejection(
     "aten::gather.out is not registered on Spyre.",
     r"Could not run 'aten::gather.out'",
 )
-_REMAINDER_EAGER = rejection(
-    4416,
-    "aten::remainder.Tensor_out is not registered on Spyre.",
-    r"Could not run 'aten::remainder.Tensor_out'",
-)
 _DXP_STANDALONE_FAIL = (
     4321,
     "compile gather dxp_standalone returned non-zero exit status 1.",
@@ -55,11 +50,6 @@ _TAKE_ALONG_DIM_FLAT_RESTICKIFY = rejection(
     4327,
     "compile flat take_along_dim: AssertionError restickify op_spec has 3 args.",
     r"restickify op_spec has 3 args",
-)
-_REMAINDER_COMPILED = rejection(
-    4416,
-    "compile take_along_dim: fused gather kernel contains the unimplemented operation remainder.",
-    r"unimplemented operation remainder",
 )
 _MULTIPLE_INDIRECT_SYMBOLS = rejection(
     4471,
@@ -182,11 +172,12 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_take_along_dim(self, execution_mode):
         """torch.take_along_dim(x, idx, dim=0), same-rank index (16,64)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
         _xfail_existing(
             execution_mode,
-            eager=_REMAINDER_EAGER,
-            compiled=_REMAINDER_COMPILED,
+            eager=_GATHER_EAGER,
+            compiled=_DXP_STANDALONE_FAIL,
         )
         x = cached_randn((32, 64), differentiation="gfc17", dtype=torch.float16)
         idx = torch.randint(0, 32, (16, 64), dtype=torch.int64)
@@ -360,11 +351,12 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_take_along_dim_dim1(self, execution_mode):
         """torch.take_along_dim at dim=1; selects sequence positions per batch head."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
         _xfail_existing(
             execution_mode,
-            eager=_REMAINDER_EAGER,
-            compiled=_REMAINDER_COMPILED,
+            eager=_GATHER_EAGER,
+            compiled=_DXP_STANDALONE_FAIL,
         )
         x = cached_randn((4, 32, 64), differentiation="gfc_tad1", dtype=torch.float16)
         idx = torch.randint(0, 32, (4, 16, 64), dtype=torch.int64)
@@ -379,11 +371,11 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_take_along_dim_none_flat(self, execution_mode):
         """take_along_dim(x_flat, idx, dim=0): flatten-then-gather (dim=None mode); API gap closure."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
             execution_mode,
-            eager=_REMAINDER_EAGER,
+            eager=_GATHER_EAGER,
             compiled=_TAKE_ALONG_DIM_FLAT_RESTICKIFY,
         )
         x = cached_randn((16, 32), differentiation="gfc_tad_none", dtype=torch.float16)
@@ -399,11 +391,12 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_take_along_dim_float32(self, execution_mode):
         """take_along_dim at dim=1 on float32 source; selects 16 positions per head from (4,32,64)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
         _xfail_existing(
             execution_mode,
-            eager=_REMAINDER_EAGER,
-            compiled=_REMAINDER_COMPILED,
+            eager=_GATHER_EAGER,
+            compiled=_DXP_STANDALONE_FAIL,
         )
         x = cached_randn((4, 32, 64), differentiation="tad_f32_01", dtype=torch.float32)
         idx = torch.randint(0, 32, (4, 16, 64), dtype=torch.int64)
@@ -418,11 +411,12 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_take_along_dim_bfloat16(self, execution_mode):
         """take_along_dim at dim=1 on bfloat16 source; same shape as float32 variant for dtype parity."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
         _xfail_existing(
             execution_mode,
-            eager=_REMAINDER_EAGER,
-            compiled=_REMAINDER_COMPILED,
+            eager=_GATHER_EAGER,
+            compiled=_DXP_STANDALONE_FAIL,
         )
         x = cached_randn(
             (4, 32, 64), differentiation="tad_bf16_01", dtype=torch.bfloat16
@@ -561,11 +555,12 @@ class TestGatherNonLeadingDimEagerCompile:
 
     def test_take_along_dim_dim2(self, execution_mode):
         """torch.take_along_dim(x, idx, dim=2): channel selection via take_along_dim."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
             execution_mode,
-            eager=_REMAINDER_EAGER,
-            compiled=_REMAINDER_COMPILED,
+            eager=_GATHER_EAGER,
+            compiled=_GATHER_STICK_MISMATCH,
         )
         B, H, F, K = 2, 8, 128, 32
         x = cached_randn((B, H, F), differentiation="ndl07", dtype=torch.float16)
