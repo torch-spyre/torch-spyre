@@ -131,8 +131,9 @@ class TestPlaceClone(unittest.TestCase):
     def test_an_output_clone_of_a_buffer_written_in_a_loop_stays_beside_its_writer(
         self,
     ):
-        """It carries the buffer's ``loop_member``, so it is a member of the loop its
-        writer is in (a drain, which clears that, is the post-loop case)."""
+        """It takes its writer's loop membership (``copy_op_metadata``), so it is a
+        member of the loop its writer is in (a drain, which clears that, is the
+        post-loop case)."""
         x, w = _Op("x"), _Op("w")
         node = _node("loop", [x, w])
         z = _Op("z")

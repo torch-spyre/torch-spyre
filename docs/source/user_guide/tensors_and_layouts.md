@@ -521,6 +521,51 @@ satisfies these rules by construction, so giving
 `SpyreTensorLayout(max_shape, dtype)` explicitly gives the same layout and
 contract as the call without `device_layout=`.
 
+#### Fast partial transfers
+
+In the derived layout the reserved dimension sits inside the other outer
+device dimensions: `(n, 512, 128)` fp16 with `max=256` is laid out as
+`[512, 2, 256, 64]`. A transfer of fewer than `max` rows leaves a gap at each of
+the 1024 outer positions, and the runtime sends one DMA per position: about
+15 to 17 ms whatever the row count, against about 1.7 ms for a plain `.to()` of
+the same rows. Reading fewer than `max` rows back costs the same.
+
+This is a workaround, and a runtime change that sends a gapped prefix as one DMA
+would make it unnecessary. Until then, a tensor of rank 3, or of rank 4 and up
+whose last dimension is a whole number of sticks (a multiple of 64 at fp16), can
+request a layout with the reserved dimension outermost by giving the dim order
+`[1, 0, 2, ...]`. The first rows are then one contiguous block of the buffer,
+and a partial transfer goes over in one DMA:
+
+```python
+from torch_spyre._C import SpyreTensorLayout
+
+masks = torch.rand(9, 512, 128, dtype=torch.float16)
+spec = {0: {"min": 8, "max": 256, "granularity": 1}}
+# The buffer at max, with host dim 0 placed outermost.
+layout = SpyreTensorLayout(
+    (256, 512, 128), (512 * 128, 128, 1), torch.float16, [1, 0, 2]
+)
+d = masks.to("spyre", device_layout=layout, dynamic=spec)  # [256, 2, 512, 64]
+```
+
+In a measurement of 9 of 256 rows, this took about 1.8 ms each way, against
+about 15 ms with the derived layout.
+
+- A rank-2 tensor cannot be given this layout: no dim order places dimension 0
+  outside the stick-count dimension.
+- With a rank of 4 or more and a last dimension that is not a whole number of
+  sticks, the transfer is still slow, because the remainder stick adds a second
+  set of ranges that the runtime does not merge.
+- The source tensor must be contiguous, because the layout is built from
+  contiguous strides. Call `.contiguous()` on a strided source before `.to()`.
+  A `copy_` from a strided source into a tensor that already has this layout
+  works.
+- Only tensors transferred with this layout benefit. A compiled output over a
+  declared dimension gets its layout from the compiler, and reading it back at
+  fewer than `max` rows is still slow
+  ([#6026](https://github.com/torch-spyre/torch-spyre/issues/6026)).
+
 #### Restrictions
 
 - `dynamic=` applies only to an eager, CPU to `"spyre"` call of `to()`. Make the
