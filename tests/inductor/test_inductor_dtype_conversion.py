@@ -633,6 +633,60 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    # bool and integer inputs sum in fp32 (_lower_sum_impl), so dtype=float32 skips the
+    # cast back. Aligned shapes and sums far below 2**24, so the result is an exact
+    # count: compare with no tolerance. (An unaligned bool is rejected, #4014; see
+    # test_inductor_ops.py.)
+    def test_sum_bool_with_dtype_fp32(self):
+        """torch.sum(bool, dtype=fp32) — exact count."""
+        x = (
+            utils_inductor.cached_randint(
+                (67, 256), differentiation="spe05_bool", high=2, dtype=torch.int32
+            )
+            > 0
+        )
+
+        def fn(t):
+            return torch.sum(t, dtype=torch.float32)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
+
+    def test_sum_bool_dim_with_dtype_fp32(self):
+        """torch.sum(bool, dim=1, dtype=fp32) — exact per-row count."""
+        x = (
+            utils_inductor.cached_randint(
+                (67, 256), differentiation="spe05_bool_dim", high=2, dtype=torch.int32
+            )
+            > 0
+        )
+
+        def fn(t):
+            return torch.sum(t, dim=1, dtype=torch.float32)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
+
+    def test_sum_int32_with_dtype_fp32(self):
+        """torch.sum(int32, dtype=fp32) — exact below 2**24."""
+        x = utils_inductor.cached_randint(
+            (67, 256), differentiation="spe05_i32", dtype=torch.int32
+        )
+
+        def fn(t):
+            return torch.sum(t, dtype=torch.float32)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
+
+    def test_sum_int64_with_dtype_fp32(self):
+        """torch.sum(int64, dtype=fp32) — exact below 2**24."""
+        x = utils_inductor.cached_randint(
+            (67, 256), differentiation="spe05_i64", dtype=torch.int64
+        )
+
+        def fn(t):
+            return torch.sum(t, dtype=torch.float32)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
+
     # TODO(#4014): becomes a positive test when the unaligned staggered reduction
     # is fixed. The fp32 -> fp16 cast gives an FP32_TO_DL16 input, so this covers
     # the other staggered arrangement than the DL16_TO_FP32 bool sums in

@@ -20,6 +20,10 @@ test_suite_config:
             - TestImplicitPromotion::test_wa_stack_both_fp16
             - TestImplicitPromotion::test_wa_cat_both_fp16
             - TestImplicitPromotion::test_sum_fp16_with_dtype_fp32
+            - TestImplicitPromotion::test_sum_bool_with_dtype_fp32
+            - TestImplicitPromotion::test_sum_bool_dim_with_dtype_fp32
+            - TestImplicitPromotion::test_sum_int32_with_dtype_fp32
+            - TestImplicitPromotion::test_sum_int64_with_dtype_fp32
             - TestImplicitPromotion::test_sum_bf16_dtype_fp32
             - TestImplicitPromotion::test_sum_unaligned_fp32_to_fp16_1d_rejected
             - TestImplicitPromotion::test_sum_unaligned_fp32_to_fp16_2d_rejected
