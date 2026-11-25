@@ -448,11 +448,21 @@ def strided_stick_slice_to_index_select(graph: torch.fx.Graph) -> None:
             # A view folds other dims into the stick's host dim (``[T, H*D]`` viewed
             # ``[T, H, D]``), which the transpose's restickify cannot pad; copy it out.
             cols = contiguous(permute(view(contiguous(src), [*lead, size])))
+            # A node added after decompositions skips the arange decomposition, so
+            # emit what it produces: the cached device ramp, scaled and shifted.
+            ramp_val = torch.empty(count, dtype=torch.float32, device="meta")
+            ramp = emit(
+                torch.ops.spyre.arange.default,
+                (count, torch.float32, src_val.device),
+                ramp_val,
+            )
+            positions = emit(aten.mul.Tensor, (ramp, float(step)), ramp_val)
+            if start != 0:
+                positions = emit(aten.add.Tensor, (positions, float(start)), ramp_val)
             index = emit(
-                aten.arange.start_step,
-                (start, start + step * count, step),
+                torch.ops.prims.convert_element_type.default,
+                (positions, torch.int64),
                 torch.empty(count, dtype=torch.int64, device="meta"),
-                {"dtype": torch.int64, "device": src_val.device},
             )
             # index_select is already decomposed here; emit what it decomposes to.
             picked = emit(

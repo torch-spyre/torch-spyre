@@ -795,6 +795,57 @@ class RunTests(unittest.TestCase):
         st = json.loads((self.out / case["dir"] / "repeat-001/status.json").read_text())
         self.assertEqual(st["argv"][-1], RUN)
 
+    def _raw_repeat_plan(self, name, body, repeats):
+        """A one-case plan whose command writes into {raw_repeat_dir}."""
+        script = TMP / f"{name}.py"
+        script.write_text(body)
+        doc = json.loads(self.plan.read_text())
+        doc["cases"] = doc["cases"][:1]
+        doc["cases"][0].update(command=["{python}", str(script), "{raw_repeat_dir}"], repeats=repeats)
+        p = TMP / f"{name}.json"
+        p.write_text(json.dumps(doc))
+        return p
+
+    def test_raw_repeat_dir_keeps_each_repeat_apart(self):
+        """A command with a fixed output filename would otherwise overwrite itself per repeat."""
+        plan = self._raw_repeat_plan(
+            "probe_raw_repeat",
+            "import os, sys\n"
+            "open(os.path.join(sys.argv[1], 'result.json'), 'w')"
+            ".write('{\"n\": ' + os.environ['BENCH_REPEAT'] + '}')\n",
+            2,
+        )
+        run_main(plan, self.out)
+        raw = self.out / manifest(self.out)["cases"][0]["dir"] / "raw"
+        # One surviving file per repeat, each holding its own repeat number.
+        self.assertEqual(
+            [json.loads(f.read_text())["n"] for f in sorted(raw.glob("repeat-*/result.json"))],
+            [1, 2],
+        )
+        self.assertEqual(manifest(self.out)["cases"][0]["repeats"]["ok"], 2)
+
+    def test_raw_repeat_dir_exists_before_the_command_runs(self):
+        """The command may assume the directory is there rather than creating it."""
+        plan = self._raw_repeat_plan(
+            "probe_raw_exists",
+            "import os, sys\n"
+            "assert os.path.isdir(sys.argv[1]), sys.argv[1]\n"
+            "open(os.path.join(sys.argv[1], 'r.json'), 'w').write('{}')\n",
+            1,
+        )
+        run_main(plan, self.out)
+        self.assertEqual(manifest(self.out)["cases"][0]["status"], "ok")
+
+    def test_an_empty_raw_tree_is_still_no_output(self):
+        """The per-repeat subdirs are entries under raw/, so emptiness is judged on files."""
+        plan = self._raw_repeat_plan("probe_writes_nothing", "import sys\nsys.exit(0)\n", 1)
+        stub = TMP / "never_called_raw.py"
+        stub.write_text("import sys\nsys.exit(9)\n")
+        code, _, _ = run_main(plan, self.out, "--ingest", "--ingest-cmd", f"{sys.executable} {stub}")
+        self.assertEqual(code, 1)
+        m = manifest(self.out)
+        self.assertEqual((m["cases"][0]["status"], m["cases"][0]["reason"]), ("failed", "no_output"))
+
     def test_case_filter(self):
         run_main(self.plan, self.out, "--case", "op_mul_fp16")
         m = manifest(self.out)
