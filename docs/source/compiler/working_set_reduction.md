@@ -244,12 +244,14 @@ with torch.inference_mode():
     for_each_tile(
         body, (values,), dims=0, tile_size=1, out_dim=Gather(0, slots), out=kv_pool
     )
-    # Tile i lands at dest[64*i : 64*(i+1)]; not yet on Spyre, see below.
+    # Tile i lands at dest[64*i : 64*(i+1)].
     for_each_tile(body, (x, w), dims=(0, None), tile_size=64, out_dim=0, out=dest)
 ```
 
 - `out_dim=d` (an `int`): step `i`'s tile lands at `narrow(d, i*extent, extent)`
-  of every `out` leaf, which must be `trips * extent` long along `d`.
+  of every `out` leaf, which must be at least `trips * extent` long along `d`.
+  Anything past that keeps its value, so a scratch reserved for the largest
+  trip count can be passed whole.
 
 - `out_dim=Gather(axis, index)`: step `i`'s tile lands at the rows `index[i]`
   names along `axis`. `index` is `[trips]` (one row per step) or
@@ -278,10 +280,19 @@ binds that write to the caller's buffer. Hence:
 
 On Spyre:
 
-- `out_dim=d` (an `int`) is not supported yet, and raises `Unsupported` when the
-  loop is lowered: the write position is the step counter, a carry the
-  indirect-access path cannot index by. Leave `out=None`, or pass a `Gather`
-  index table.
+- `out_dim=d` (an `int`) writes each tile at the loop variable. The write
+  position is the step counter, which starts at 0 and steps by 1 like the loop
+  variable, so the splice writes there instead of indexing by the counter. The
+  tile is written in place, with no copy of the destination: in the default
+  layout along the rows, along a middle dim, and along the last dim in whole
+  sticks, into a view at an offset, and in the indirect-access layout.
+  `reverse=True` raises `Unsupported`.
+- The splice refuses a write it cannot prove fits: with a declared trip count,
+  a destination declared with its own `dynamic=` is not known to be long
+  enough. Pass `out=dest.narrow(d, 0, x.shape[0])`, which ties the two sizes.
+  Do not narrow a static tensor by a declared size, though: torch's
+  functionalization compares the two sizes and so specializes the declared
+  one. Pass the static tensor whole instead.
 
 For a `Gather` on Spyre, keep the destination in a layout with the indexed dimension
 outermost, such as the "indirect access" layout `torch_spyre.model_utils` gives

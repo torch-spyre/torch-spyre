@@ -2618,39 +2618,149 @@ class TestForEachTileCallerOwnedOutputE2E(_DynamoResetTestCase):
                 out=dest,
             )
 
-    @expects_raise
-    def test_out_dim_int_is_rejected(self):
-        """``out_dim=int`` with ``out=`` is refused at lowering, not miscompiled.
+    @staticmethod
+    def _split_fn(out_dim, read_after=False):
+        """Tile ``i`` of ``x @ y`` along ``out_dim`` is written into ``dest``."""
 
-        Its write position is the step counter, a carry the indirect-access path
-        cannot index by. TODO: lower that write as a tile-advancing write (the
-        counter equals the loop variable); this test then becomes value checks for
-        ``out_dim=0`` and ``out_dim=1``.
+        def fn(x, y, dest):
+            def body(_, ops):
+                a, b = ops
+                return None, a @ b
+
+            dims = (0, None) if out_dim == 0 else (None, 1)
+            for_each_tile(
+                body, (x, y), dims=dims, tile_size=64, out_dim=out_dim, out=dest
+            )
+            return dest * 2 if read_after else None
+
+        return fn
+
+    @staticmethod
+    def _split_operands():
+        x = cached_xavier((128, 256))
+        y = cached_xavier((256, 128), differentiation=1)
+        ref = dl16_round(x.float()) @ dl16_round(y.float())
+        return x.to(DEVICE_NAME), y.to(DEVICE_NAME), ref
+
+    def _run_recording(self, fn, *args):
+        """``_run``, recording where the loop's ops sit (``_record_loop_membership``)."""
+        result: dict = {}
+        with (
+            # A cache hit would skip the pipeline the recorder inspects.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                ts_passes, "CustomPreSchedulingPasses", _record_loop_membership(result)
+            ),
+        ):
+            out = self._run(fn, *args)
+        return out, result
+
+    def test_out_dim_int_writes_each_tile_in_place(self):
+        """``out_dim=int`` writes tile ``i`` into the caller's tensor at the loop variable.
+
+        The write position is the step counter, which starts at 0 and steps by 1 like
+        the loop variable. The loop body holds only the matmul and the write, with no
+        copy of the destination, along dim 0 and along dim 1 (where ``out=None`` folds
+        the stacked tiles with a copy).
         """
-        from torch._inductor.exc import InductorError
-
-        def split(out_dim):
-            def fn(x, y, dest):
-                def body(_, ops):
-                    a, b = ops
-                    return None, a @ b
-
-                dims = (0, None) if out_dim == 0 else (None, 1)
-                for_each_tile(
-                    body, (x, y), dims=dims, tile_size=64, out_dim=out_dim, out=dest
-                )
-
-            return fn
-
-        x = cached_xavier((128, 256)).to(DEVICE_NAME)
-        y = cached_xavier((256, 128), differentiation=1).to(DEVICE_NAME)
+        x, y, ref = self._split_operands()
         for out_dim in (0, 1):
             with self.subTest(out_dim=out_dim):
                 dest = torch.zeros(128, 128, dtype=torch.float16).to(DEVICE_NAME)
-                with self.assertRaisesRegex(
-                    InductorError, r"out_dim=int\) is not supported on Spyre"
-                ):
-                    self._run(split(out_dim), x, y, dest)
+                _, result = self._run_recording(self._split_fn(out_dim), x, y, dest)
+                self.assertEqual(result["top_level"], [])
+                self.assertEqual(len(result["in_body"]), 2, result["in_body"])
+                torch.testing.assert_close(
+                    dest.cpu().float(), ref, atol=1e-2, rtol=1e-2
+                )
+
+    def test_out_dim_int_into_an_indirect_access_destination(self):
+        """The indirect-access layout (rows outermost) is written in place as well.
+
+        A read of the destination later in the same graph sees every tile.
+        """
+        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
+
+        x, y, ref = self._split_operands()
+        initial = torch.full((128, 128), 3.0, dtype=torch.float16)
+        dest = _dma_to_spyre_indirect_access(initial)
+        doubled, result = self._run_recording(
+            self._split_fn(0, read_after=True), x, y, dest
+        )
+        self.assertEqual(result["top_level"], [])
+        self.assertEqual(len(result["in_body"]), 2, result["in_body"])
+        torch.testing.assert_close(dest.cpu().float(), ref, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(doubled.cpu().float(), ref * 2, atol=2e-2, rtol=1e-2)
+
+    def test_out_dim_int_with_a_declared_trip_count(self):
+        """One graph writes the tiles at every declared size, one trip included.
+
+        ``dest`` is a static scratch sized for the largest ``x``, passed whole, whose
+        rows past the tiles keep their value, or a tensor declared like ``x``, passed
+        as ``dest.narrow(0, 0, x.shape[0])`` so the splice can prove the tiles fit. A
+        second loop reads the rows back.
+        """
+        from torch._dynamo.utils import counters
+
+        spec = {"min": 64, "max": 512, "granularity": 64}
+        x_cpu = cached_xavier((512, 128))
+        w_cpu = cached_xavier((128, 128), differentiation=1)
+        ref = dl16_round(x_cpu.float()) @ dl16_round(w_cpu.float())
+        w = w_cpu.to(DEVICE_NAME)
+
+        def fn(x, w, dest, declared):
+            def body(_, ops):
+                a, b = ops
+                return None, a @ b
+
+            if declared:
+                dest = dest.narrow(0, 0, x.shape[0])
+            for_each_tile(
+                body, (x, w), dims=(0, None), tile_size=64, out_dim=0, out=dest
+            )
+            _, doubled = for_each_tile(
+                lambda _, t: (None, t[0] * 2),
+                (dest.narrow(0, 0, x.shape[0]),),
+                dims=0,
+                tile_size=64,
+                out_dim=0,
+            )
+            return doubled
+
+        for declared in (False, True):
+            with self.subTest(declared_destination=declared):
+                torch._dynamo.reset()
+                counters.clear()
+                x = x_cpu.to(DEVICE_NAME, dynamic={0: spec})
+                compiled = torch.compile(fn, fullgraph=True)
+                with torch.inference_mode(), config.patch(backend_loop_unroll=False):
+                    for rows in (128, 64, 512, 192):
+                        x.resize_((rows, 128))
+                        initial = torch.full((512, 128), 3.0, dtype=torch.float16)
+                        expected = initial.float()
+                        expected[:rows] = ref[:rows]
+                        if declared:
+                            dest = initial.to(DEVICE_NAME, dynamic={0: spec})
+                            dest.resize_((rows, 128))
+                            expected = expected[:rows]
+                        else:
+                            dest = initial.to(DEVICE_NAME)
+                        doubled = compiled(x, w, dest, declared)
+                        torch.testing.assert_close(
+                            dest.cpu().float(),
+                            expected,
+                            atol=1e-2,
+                            rtol=1e-2,
+                            msg=f"at {rows} rows",
+                        )
+                        torch.testing.assert_close(
+                            doubled.cpu().float(),
+                            ref[:rows] * 2,
+                            atol=2e-2,
+                            rtol=1e-2,
+                            msg=f"read back at {rows} rows",
+                        )
+                self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
     def test_gather_rows_into_caller_pool(self):
         """KV-cache-style write into a pool uploaded with the default layout.

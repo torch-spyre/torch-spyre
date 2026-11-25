@@ -530,14 +530,6 @@ def _normalize_out(out, out_dim, num_tiles) -> _OutSpec:
                 f"for_each_tile() out_dim={out_dim} is invalid for out"
                 f"{keystr(path)} of rank {leaf.ndim}: {exc}"
             ) from exc
-        if index is None:
-            length = leaf.shape[dim]
-            if length % num_tiles != 0:
-                raise ValueError(
-                    f"for_each_tile() out{keystr(path)} has size {length} along dim "
-                    f"{out_dim}, which is not a multiple of the {num_tiles} tiles"
-                )
-            torch._check(length % num_tiles == 0)
         dims.append(dim)
     return _OutSpec(tuple(t for _, t in leaves_with_path), tuple(dims), index)
 
@@ -559,35 +551,24 @@ def _check_gather_rows(index: torch.Tensor, size: int, what: str) -> None:
         )
 
 
-def _out_write_targets(spec: _OutSpec, num_tiles: int) -> list[torch.Tensor]:
-    """The tensors the loop writes, one per `out` leaf, lifted into the body.
-
-    For `out_dim=int d` this is `torch.unflatten(leaf, d, (num_tiles, extent))`,
-    taken here rather than inside the body: the body then writes its placeholder
-    with no view in between, which Inductor reinplaces whatever the leaf's offset
-    and strides. A view taken inside the body is reinplaced only when the leaf is
-    dense with offset 0; for any other leaf the destination is copied every step.
-    `torch.unflatten`, not `Tensor.unflatten`, for the reason in `_xs_leaf`.
-    """
-    if spec.index is not None:
-        return list(spec.leaves)
-    return [
-        torch.unflatten(leaf, dim, (num_tiles, leaf.shape[dim] // num_tiles))
-        for leaf, dim in zip(spec.leaves, spec.dims)
-    ]
-
-
 def _write_out_tiles(
     spec: _OutSpec, targets, y, step, dest_rows, num_tiles, reverse
 ) -> None:
     """Write one step's output tiles into the caller's destinations, in place.
 
-    `targets` are `_out_write_targets` as the body sees them (lifted operands). With
+    `targets` are the `out` leaves as the body sees them (lifted operands). With
     out_dim=Gather, `dest_rows` is this step's row of the index, the destination
-    rows its tiles are written to. With out_dim=int it is `None`, and the step
-    counter `step` is the tile's position along the unflattened axis. Each write is
-    one `index_copy_` on the target itself: through a `narrow`/`select` of it,
-    Inductor would copy the destination region on every step.
+    rows its tiles are written to. With out_dim=int it is `None`: step `i` writes a
+    tile of extent `e` at `[i*e, (i+1)*e)` along the dim, so the leaf must be at
+    least `num_tiles * e` long there, and anything past that is left alone. That
+    is checked by the write itself (and on Spyre when the loop is lowered): a check
+    here would make the body take the trip count as an input.
+
+    Each write is one `index_copy_` on the target itself: through a `narrow` or
+    `unflatten` of it, Inductor would copy the destination on every step. Nor may a
+    tensor in the body have the trip count as a size: tracing the body checks each
+    tensor's contiguity, which guards that size on != 1, and a trip count of 1 then
+    compiles a second graph.
     """
     tiles = tree_leaves(y)
     if len(tiles) != len(targets):
@@ -595,11 +576,6 @@ def _write_out_tiles(
             f"for_each_tile() out has {len(targets)} leaves but the body returns "
             f"{len(tiles)} output tiles"
         )
-    if dest_rows is None:
-        # Under reverse=True step k visits tile n-1-k.
-        pos = (num_tiles - 1 - step if reverse else step).reshape(1)
-    else:
-        pos = dest_rows.reshape(-1)
     for k, (target, tile, dim) in enumerate(zip(targets, tiles, spec.dims)):
         if not isinstance(tile, torch.Tensor):
             raise ValueError(
@@ -611,18 +587,19 @@ def _write_out_tiles(
                 f"leaf {k} has dtype {target.dtype}"
             )
         if dest_rows is None:
-            # `target` is [..., num_tiles, extent, ...], with the tile axis at dim.
-            expected = (*target.shape[:dim], *target.shape[dim + 1 :])
-            source = tile.unsqueeze(dim)
+            extent = tile.shape[dim] if tile.ndim == target.ndim else 1
+            # Under reverse=True step k visits tile n-1-k.
+            first = (num_tiles - 1 - step if reverse else step) * extent
+            pos = first.reshape(1) + torch.arange(extent, device=step.device)
         else:
-            expected = _tile_size_vector(target.shape, dim, pos.shape[0])
-            source = tile
+            pos = dest_rows.reshape(-1)
+        expected = _tile_size_vector(target.shape, dim, pos.shape[0])
         if tuple(tile.shape) != expected:
             raise ValueError(
                 f"for_each_tile() output tile {k} has shape {tuple(tile.shape)}, but "
                 f"out leaf {k} takes tiles of shape {expected}"
             )
-        target.index_copy_(dim, pos, source)
+        target.index_copy_(dim, pos, tile)
 
 
 def _movedim(t: torch.Tensor, src: int, dst: int) -> torch.Tensor:
@@ -775,16 +752,17 @@ def for_each_tile(
             tensors whose leaves match the body's output tiles in flattened order.
             Each step writes its tiles into it in place, so no stacked or folded
             output is materialized, and ``out`` itself is returned. Each leaf has
-            the tile's shape except along ``out_dim``: ``trip count * extent`` long
-            for ``int d``; for ``Gather``, it must hold every row the index names.
+            the tile's shape except along ``out_dim``. For ``int d`` it is at least
+            ``trip count * extent`` long, and anything past that is left alone; for
+            ``Gather``, it must hold every row the index names.
             An eager call checks that, for this index and for an input
             ``Gather``'s, and raises ``IndexError``. A compiled graph does not on
             Spyre: there an out-of-range row reads or writes out of bounds, so
             check the index before uploading it. The leaves must not share storage
             with an operand or with each other. Requires grad mode to be disabled,
             and is not supported in a decomposition (see the tracing contract). On
-            Spyre only ``out_dim=Gather`` is supported so far. ``None`` (the
-            default) returns a new output tensor instead.
+            Spyre, ``out_dim=int`` does not support ``reverse``.
+            ``None`` (the default) returns a new output tensor instead.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -985,7 +963,7 @@ def for_each_tile(
     # The out= destinations come last, after the operands read whole.
     lifted = [operands[i] for i in lifted_idx]
     if out_spec is not None:
-        lifted += _out_write_targets(out_spec, num_tiles)
+        lifted += out_spec.leaves
     if in_decomposition:
         # Reached from an AOT decomposition: trace the HOP without Dynamo.
         final_carry, ys = _scan_in_make_fx(combine_fn, scan_init, xs, lifted, reverse)

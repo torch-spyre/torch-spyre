@@ -2558,6 +2558,57 @@ class TestCallerOwnedOutput(unittest.TestCase):
             acc, _ = fn(X, Y, torch.zeros(nK * M, N))
         torch.testing.assert_close(acc, ref)
 
+    @staticmethod
+    def _split_m_into_start():
+        """Split-M into the start of `scratch`, which may hold more rows."""
+
+        def fn(X, Y, scratch):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            return for_each_tile(
+                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=scratch
+            )
+
+        return fn
+
+    def test_out_dim_int_writes_the_start_of_a_larger_destination(self):
+        """`out` longer than the tiles: they fill its start, the rest keeps its value."""
+        (X, Y), ref = matmul_inputs()
+        expected = torch.full((M + 4, N), 7.0)
+        expected[:M] = ref
+        self._assert_writes_in_place(
+            self._split_m_into_start(),
+            lambda: (X, Y, torch.full((M + 4, N), 7.0)),
+            expected,
+        )
+
+    def test_out_dim_int_with_a_varying_trip_count(self):
+        """One graph writes the start of a scratch sized for the largest trip count.
+
+        ``aot_eager``: Inductor's CPU codegen of a while_loop does not bind a
+        symbolic trip count, with or without ``out=``.
+        """
+        from torch._dynamo.testing import CompileCounterWithBackend
+
+        (_, Y), _ = matmul_inputs()
+        counter = CompileCounterWithBackend("aot_eager")
+        compiled = torch.compile(
+            self._split_m_into_start(), backend=counter, fullgraph=True
+        )
+        torch._dynamo.reset()
+        with torch.no_grad():
+            for rows in (4, 6, 10):
+                X = torch.randn(rows, K)
+                torch._dynamo.mark_dynamic(X, 0)
+                scratch = torch.full((2 * M, N), 7.0)
+                compiled(X, Y, scratch)
+                expected = torch.full((2 * M, N), 7.0)
+                expected[:rows] = X @ Y
+                torch.testing.assert_close(scratch, expected, msg=f"at {rows} rows")
+        self.assertEqual(counter.frame_count, 1)
+
     def test_reverse_lands_in_natural_order(self):
         (X, Y), ref = matmul_inputs()
 
@@ -2783,10 +2834,10 @@ class TestCallerOwnedOutput(unittest.TestCase):
                 ValueError,
                 "needs out_dim",
             ),
-            "size not a multiple of the tiles": (
-                dict(out_dim=0, out=torch.zeros(M + 1, N)),
-                ValueError,
-                "not a multiple",
+            "shorter than the tiles": (
+                dict(out_dim=0, out=torch.zeros(M - 2, N)),
+                IndexError,
+                "out of bounds",
             ),
             "Gather without out": (
                 dict(out_dim=Gather(0, torch.arange(M // 2)), out=None),

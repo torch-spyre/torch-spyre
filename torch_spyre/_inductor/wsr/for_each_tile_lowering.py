@@ -95,6 +95,7 @@ import sympy
 import torch
 
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
+from torch._inductor.index_propagation import SymPyOps, TypedExpr
 from torch._inductor.virtualized import V
 
 from .. import timing_recorder
@@ -312,12 +313,13 @@ def _pointwise_zero_failure(init: Any) -> str | None:
     return None
 
 
-def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
-    """Why the loop counter is not provably initialized to 0, or None if it is.
+def _counter_init_failure(while_op: "ir.WhileLoop", carry: int = 0) -> str | None:
+    """Why ``carried_inputs[carry]`` is not provably initialized to 0, or None.
 
     The trip count ``N`` of ``lt(counter, N)`` is the number of iterations only
-    if the counter starts at 0. The frontend's counter (``carried_inputs[0]``)
-    is always ``torch.zeros([], int64)``, which reaches the IR as an
+    if the counter starts at 0. The loop's counter (``carried_inputs[0]``), and
+    the step counter for_each_tile carries itself, are always
+    ``torch.zeros([], int64)``, which reaches the IR as an
     ``aten.full.default`` ``FallbackKernel`` with no tensor inputs. Before
     PyTorch 2.14 its output was wrapped in a ``MultiOutput``; 2.14 returns the
     kernel directly. Both representations must satisfy the same checks.
@@ -328,7 +330,9 @@ def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
     carried = getattr(while_op, "carried_inputs", None)
     if not carried:
         return "loop has no carried inputs, so no counter to prove"
-    init = _unwrap_to_buffer(carried[0])
+    if len(carried) <= carry:
+        return f"loop has no carried input {carry}, so no counter to prove"
+    init = _unwrap_to_buffer(carried[carry])
     get_dtype = getattr(init, "get_dtype", None)
     dtype = get_dtype() if get_dtype is not None else None
     if dtype != torch.int64:
@@ -369,12 +373,12 @@ def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
     return None
 
 
-def _counter_step_failure(while_op: "ir.WhileLoop") -> str | None:
-    """Why the body does not provably advance the counter by exactly 1, or None.
+def _counter_step_failure(while_op: "ir.WhileLoop", carry: int = 0) -> str | None:
+    """Why the body does not provably advance a counter by exactly 1, or None.
 
-    The body's first output is the next value of ``carried_inputs[0]``. The
-    frontend produces ``counter + 1`` as a scalar ComputedBuffer computing
-    ``ops.load(<body's first placeholder>, 0) + ops.constant(1)``. This runs
+    The body's output ``carry`` is the next value of ``carried_inputs[carry]``.
+    A counter's update is ``counter + 1``, a scalar ComputedBuffer computing
+    ``ops.load(<the carry's placeholder>, 0) + ops.constant(1)``. This runs
     that ``inner_fn`` under a recorder (the same read-only pattern as
     ``_extract_trip_count``) and requires exactly that shape.
     """
@@ -386,11 +390,11 @@ def _counter_step_failure(while_op: "ir.WhileLoop") -> str | None:
         return "no body_subgraph.graph to inspect"
     outputs = getattr(body_graph, "graph_outputs", None)
     graph_inputs = getattr(body_graph, "graph_inputs", None)
-    if not outputs or not graph_inputs:
+    if not outputs or not graph_inputs or len(outputs) <= carry:
         return "body subgraph has no outputs or inputs"
-    first_placeholder = next(iter(graph_inputs), None)
+    placeholder = list(graph_inputs)[carry]
 
-    out0 = _unwrap_to_buffer(outputs[0])
+    out0 = _unwrap_to_buffer(outputs[carry])
     if not isinstance(out0, ir.ComputedBuffer):
         return (
             "body does not compute a new counter in a ComputedBuffer "
@@ -409,7 +413,7 @@ def _counter_step_failure(while_op: "ir.WhileLoop") -> str | None:
     if len(recorder.loads) != 1 or len(recorder.constants) != 1:
         return "body's counter update is not load(counter) + constant"
     loaded_name, loaded_index = recorder.loads[0]
-    if loaded_name != first_placeholder or loaded_index != 0:
+    if loaded_name != placeholder or loaded_index != 0:
         return "body's counter update does not read its own counter input"
     step = recorder.constants[0]
     if isinstance(step, bool) or not isinstance(step, (int, sympy.Integer)):
@@ -446,15 +450,92 @@ def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
     return result
 
 
-def _carry_indexed_destination_write(while_op: "ir.WhileLoop") -> str | None:
-    """Describe a body write into an additional input indexed by an evolving carry.
+class _ScatterPositionRecorder(DefaultHandler):
+    """Evaluates a Scatter's ``output_indexer`` as sympy, outside a kernel.
+
+    Index arithmetic goes through Inductor's ``SymPyOps``, the typed sympy ops of its
+    index propagation, and ``indirect_indexing`` returns the expression. A load of
+    one of ``buffers``, the small Pointwise buffers the body computes the position
+    in, is evaluated through that buffer's ``inner_fn``. Any other load is recorded
+    and returns a fresh symbol, so a position read from a buffer comes back in terms
+    of that load. An op ``SymPyOps`` cannot express is recorded in ``unexpected``.
+    """
+
+    def __init__(self, buffers: dict[str, Any]) -> None:
+        self.buffers = buffers
+        self.loads: list[tuple[str, Any, sympy.Symbol]] = []
+        self.unexpected: list[str] = []
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if name == "load":
+            buffer = self.buffers.get(args[0])
+            if buffer is not None:
+                value = buffer.data.inner_fn([args[1]] if buffer.get_size() else [])
+                return getattr(value, "value", value)  # an OpsValue from ops.*
+            symbol = sympy.Symbol(f"__load{len(self.loads)}__", integer=True)
+            self.loads.append((args[0], args[1], symbol))
+            return TypedExpr(symbol, torch.int64)
+        if name == "indirect_indexing" and isinstance(args[0], TypedExpr):
+            return args[0].expr
+        op = getattr(SymPyOps, name, None)
+        if op is not None and name != "indirect_indexing":
+            try:
+                value = op(*args, **kwargs)
+            except Exception:  # noqa: BLE001 -- an operand that is not a TypedExpr
+                value = NotImplemented
+            if isinstance(value, TypedExpr):
+                return value
+        self.unexpected.append(name)
+        symbol = sympy.Symbol(f"__{name}{len(self.unexpected)}__", integer=True)
+        return symbol if name == "indirect_indexing" else TypedExpr(symbol, torch.int64)
+
+
+def _index_buffers(body_graph) -> dict[str, Any]:
+    """The body's 0-d and 1-d dense Pointwise buffers, by name.
+
+    The frontend computes an ``out_dim=int`` write's rows, ``step * extent +
+    arange(extent)``, in such buffers.
+    """
+    from torch._inductor import ir
+
+    buffers = {}
+    for op in body_graph.operations:
+        data = getattr(op, "data", None)
+        if not isinstance(op, ir.ComputedBuffer) or type(data) is not ir.Pointwise:
+            continue
+        layout = op.get_layout()
+        if len(layout.size) > 1 or list(layout.stride) not in ([], [1]):
+            continue
+        if layout.offset != 0:
+            continue
+        buffers[op.get_name()] = op
+    return buffers
+
+
+def _scatter_position(
+    scatter: "ir.Scatter", buffers: dict[str, Any]
+) -> tuple[list[sympy.Symbol], list[Any], _ScatterPositionRecorder]:
+    """The loop index, the position the Scatter writes it to, and the recorder."""
+    index = [
+        sympy.Symbol(f"__i{k}__", integer=True, nonnegative=True)
+        for k in range(len(scatter.ranges))
+    ]
+    recorder = _ScatterPositionRecorder(buffers)
+    with V.set_ops_handler(recorder):
+        position = list(scatter.output_indexer(index))
+    return index, position, recorder
+
+
+def _counter_indexed_writes(
+    while_op: "ir.WhileLoop",
+) -> list[tuple["ir.ComputedBuffer", list[int]]]:
+    """Scatters into an additional input at a position read from an evolving carry.
 
     ``for_each_tile(out=..., out_dim=int)`` writes step ``i``'s tile at the
-    position its step counter holds: a carry the body advances every trip, read
-    as a runtime index. The indirect-access path only indexes by per-trip rows of
-    a tensor the loop slices (``out_dim=Gather``'s index table, a pass-through
-    carry), so such a write cannot be lowered. Returns a description of the first
-    one found, or None.
+    position its step counter holds, a carry the body advances every trip. Each
+    such write is returned with the indices of the carries its position reads.
+    ``out_dim=Gather``'s rows come from a tensor the loop slices, so its writes
+    are not among them.
     """
     from torch._inductor import ir
 
@@ -467,25 +548,170 @@ def _carry_indexed_destination_write(while_op: "ir.WhileLoop") -> str | None:
     num_carried = len(while_op.carried_inputs)
     additional = set(placeholders[num_carried:])
     evolving = {
-        name
+        name: i
         for i, (name, output) in enumerate(
             zip(placeholders[:num_carried], body_graph.graph_outputs)
         )
         if getattr(output, "get_name", lambda: None)() != name
         and not _body_fx_carry_is_passthrough(while_op, i)
     }
+    buffers = _index_buffers(body_graph)
+    writes = []
     for op in body_graph.operations:
         layout = getattr(op, "layout", None)
         if not isinstance(layout, ir.MutationLayoutSHOULDREMOVE):
             continue
+        if not isinstance(getattr(op, "data", None), ir.Scatter):
+            continue
         if layout.get_buffer().get_name() not in additional:
             continue
-        index_carries = {dep.name for dep in op.get_read_writes().reads} & evolving
-        if index_carries:
+        _, _, recorder = _scatter_position(op.data, buffers)
+        carries = sorted({evolving[n] for n, _, _ in recorder.loads if n in evolving})
+        if carries:
+            writes.append((op, carries))
+    return writes
+
+
+def _counter_write_dim(
+    while_op: "ir.WhileLoop", op: "ir.ComputedBuffer", carry: int, trip_count
+) -> "tuple[int | None, str | None]":
+    """``(dim, None)`` for the dim ``op`` writes at the counter, else ``(None, why)``.
+
+    Lowered only when the carry is a counter (starts at 0, steps by 1), and the
+    Scatter writes one tile of extent ``e`` along one dim at rows
+    ``counter * e + [0, e)`` and in place along every other dim, as the frontend's
+    ``out_dim=int`` write does. The destination must hold a tile for every trip:
+    Spyre does not check the write's bounds.
+    """
+    from torch._inductor import ir
+
+    failure = _counter_init_failure(while_op, carry) or _counter_step_failure(
+        while_op, carry
+    )
+    if failure is not None:
+        return None, f"carry {carry} is not a step counter: {failure}"
+    scatter = op.data
+    if scatter.scatter_mode is not None:
+        return None, f"it accumulates ({scatter.scatter_mode}) instead of writing"
+    body_graph = while_op.body_subgraph.graph
+    index, position, recorder = _scatter_position(scatter, _index_buffers(body_graph))
+    counter = list(body_graph.graph_inputs)[carry]
+    if recorder.unexpected or len(recorder.loads) != 1:
+        return None, (
+            f"its position is computed with {recorder.unexpected} and "
+            f"{len(recorder.loads)} loads, not from the counter alone"
+        )
+    name, load_index, value = recorder.loads[0]
+    if name != counter or load_index != 0:
+        return None, f"its position reads {name} at {load_index}, not the counter"
+    dims = [k for k, e in enumerate(position) if e.has(value)]
+    if len(dims) != 1 or len(position) != len(index):
+        return None, f"it writes the counter at positions {dims}, not along one dim"
+    (dim,) = dims
+    extent = scatter.ranges[dim]
+    rest_in_place = all(
+        e == i for k, (e, i) in enumerate(zip(position, index)) if k != dim
+    )
+    if (
+        not rest_in_place
+        or sympy.expand(position[dim] - extent * value - index[dim]) != 0
+    ):
+        return None, (
+            "it does not write step i at rows i * extent + [0, extent), as under "
+            "reverse=True, which is not supported"
+        )
+    target = op.layout.target
+    storage = target.data if isinstance(target, ir.TensorBox) else target
+    if (
+        not isinstance(storage, ir.StorageBox)
+        or storage.data is not op.layout.get_buffer()
+    ):
+        return None, "it writes through a view of the destination"
+    sizes = op.layout.real_layout().size
+    covers = all(
+        V.graph.sizevars.statically_known_equals(r, s)
+        for k, (r, s) in enumerate(zip(scatter.ranges, sizes))
+        if k != dim
+    )
+    if len(sizes) != len(scatter.ranges) or not covers:
+        return None, "its tile does not span the destination outside the counter's dim"
+    if not V.graph.sizevars.statically_known_leq(trip_count * extent, sizes[dim]):
+        return None, (
+            f"its destination has size {sizes[dim]} along dim {dim}, less than the "
+            f"{trip_count} tiles of {extent} it writes"
+        )
+    return dim, None
+
+
+def _write_at_loop_var(
+    while_op: "ir.WhileLoop", op: "ir.ComputedBuffer", dim: int, loop_var: sympy.Symbol
+) -> None:
+    """Replace a counter-indexed Scatter by the same write at ``loop_var``.
+
+    The replacement is what ``decompose_scan_to_while_loop`` emits for a stacked
+    output: a Pointwise over the tile, stored through a view of the destination
+    one tile further along ``dim`` per trip.
+    """
+    from torch._inductor import ir
+
+    from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
+
+    body_graph = while_op.body_subgraph.graph
+    scatter = op.data
+    storage = op.layout.target
+    if isinstance(storage, ir.TensorBox):
+        storage = storage.data
+    dest = op.layout.real_layout()
+    tile = ir.ReinterpretView(
+        data=storage,
+        layout=ir.FixedLayout(
+            dest.device,
+            dest.dtype,
+            list(scatter.ranges),
+            list(dest.stride),
+            dest.offset + loop_var * scatter.ranges[dim] * dest.stride[dim],
+        ),
+    )
+    pointwise = ir.Pointwise(
+        device=scatter.device,
+        dtype=scatter.dtype,
+        inner_fn=scatter.inner_fn,
+        ranges=list(scatter.ranges),
+    )
+    with V.set_graph_handler(body_graph):
+        new_op = replace_computed_buffer_body(
+            op,
+            pointwise,
+            body_graph.operations,
+            pass_name="splice_while_loops",
+            reason="write the out_dim=int tile at the loop variable",
+        )
+        new_op.layout = ir.MutationLayoutSHOULDREMOVE(tile)
+
+
+def _lower_counter_indexed_writes(
+    while_op: "ir.WhileLoop", loop_var: sympy.Symbol, trip_count: sympy.Expr
+) -> str | None:
+    """Lower each ``out_dim=int`` write as a tile-advancing write, or say why not.
+
+    ``for_each_tile(out=..., out_dim=int)`` writes step ``i``'s tile at the
+    position its step counter holds, a carry read as a runtime index, which the
+    indirect-access path cannot index by. The counter starts at 0 and steps by 1,
+    like the loop's own counter, so it equals ``loop_var``: the write becomes the
+    one at ``loop_var``. Returns None once every such write is rewritten.
+    """
+    for op, carries in _counter_indexed_writes(while_op):
+        dim, failure = (
+            _counter_write_dim(while_op, op, carries[0], trip_count)
+            if len(carries) == 1
+            else (None, f"its position reads several carries {carries}")
+        )
+        if dim is None:
             return (
-                f"{op.get_name()} writes {layout.get_buffer().get_name()} at a "
-                f"position read from the carry {sorted(index_carries)}"
+                f"{op.get_name()} writes {op.layout.get_buffer().get_name()} at a "
+                f"position read from a carry, and {failure}"
             )
+        _write_at_loop_var(while_op, op, dim, loop_var)
     return None
 
 
@@ -3390,15 +3616,13 @@ def splice_while_loops(graph) -> None:
                     "for_each_tile loop this backend can run"
                 )
 
-            # TODO: lower this as a tile-advancing write instead: the counter
-            # starts at 0 and steps by 1, so it equals loop_var.
-            write = _carry_indexed_destination_write(while_op)
-            if write is not None:
+            failure = _lower_counter_indexed_writes(
+                while_op, loop_var, result.trip_count
+            )
+            if failure is not None:
                 raise Unsupported(
-                    "for_each_tile(out=..., out_dim=int) is not supported on Spyre "
-                    "yet: the step writes out at its step counter's position, which "
-                    "the indirect-access path cannot index by "
-                    f"({while_op.get_name()}: {write}). Use out_dim=Gather with a "
+                    "for_each_tile(out=..., out_dim=int) cannot be lowered: "
+                    f"{while_op.get_name()}: {failure}. Use out_dim=Gather with a "
                     "[trip count, rows] index table, or leave out=None."
                 )
 
