@@ -37,13 +37,6 @@ test_suite_config:
             - LxPlanning.*::test_unbind_4d_dim3_lx_planning_(pointwise|reduction)
           mode: xfail
         - names:
-            # float32→float16 on a 1D unaligned tensor (100 elements, not a
-            # multiple of 64).  The LX reduction wrap reduces all fp16 elements
-            # over the stick; FP32_TO_DL16 unaligned stick reduction gives a
-            # wrong result (#4014).
-            - LxPlanning.*::test_to_dtype_float32_to_float16_100_lx_planning_reduction
-          mode: xfail
-        - names:
             - LxPlanning.*::test_to_dtype.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_round_trip_to_dtype.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_flatten.*_lx_planning_(pointwise|reduction)

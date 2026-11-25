@@ -23,7 +23,7 @@ from torch.utils import _pytree as pytree
 from torch._dynamo.testing import make_test_cls_with_patches
 
 import unittest
-from utils_inductor import _safe_test_name, compare_with_cpu
+from utils_inductor import _expect_raise_test, _safe_test_name, compare_with_cpu
 
 _test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(_test_dir)
@@ -354,3 +354,28 @@ _copy_canonical_tests(
     REDUCTION_TEST_FAILURES if not tests_lx_planning_run_skips else None,
     INHERITED_TEST_ATTRIBUTES,
 )
+
+# Base tests that pass on their own but whose reduction wrap the compiler rejects.
+# The base test is not an expect_raise case, so the copy above keeps it; the rejection
+# only appears once the wrap's sum is appended. Each maps a base test name to a
+# fragment of the expected message. Such a copy asserts the rejection instead of
+# running as an xfail, which could not tell this failure from any other.
+REDUCTION_WRAP_EXPECT_RAISE = {
+    # fp32 -> fp16 on a 1D unaligned tensor (100 elements, not a multiple of 64): the
+    # wrap sums the FP32_TO_DL16 result over its stick, which the compiler rejects
+    # until the backend masking bug is fixed.
+    # TODO(#4014): this becomes a positive test when #4014 lands.
+    "test_to_dtype_float32_to_float16_100": "issue #4014",
+}
+
+for _base_name, _fragment in REDUCTION_WRAP_EXPECT_RAISE.items():
+    _wrapped_name = f"{_base_name}_lx_planning_reduction"
+    # Absent when TEST_LX_PLANNING_FULL is unset and the case is not canonical.
+    if hasattr(LxPlanningTwoOpReductionTest, _wrapped_name):
+        setattr(
+            LxPlanningTwoOpReductionTest,
+            _wrapped_name,
+            _expect_raise_test(
+                getattr(LxPlanningTwoOpReductionTest, _wrapped_name), _fragment
+            ),
+        )
