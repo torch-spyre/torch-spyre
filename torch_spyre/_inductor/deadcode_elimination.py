@@ -155,6 +155,10 @@ def _has_side_effects(op: Operation) -> bool:
     """
     if isinstance(op, LoopNode):
         return op.has_side_effects()
+    # An active_count marker is nobody's input until the splice records it on
+    # its loop (and removes it); keep it until then.
+    if getattr(op, "active_count_max", None) is not None:
+        return True
     if _mutation_targets(op):
         return True
     if isinstance(op, FallbackKernel):
