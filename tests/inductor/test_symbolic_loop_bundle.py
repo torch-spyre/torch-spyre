@@ -578,14 +578,15 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
 
 
 class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
-    """With an outer_stride, each trip of the directly enclosing loop reads its
-    own count at base + stride * i, as prefill reads one count per expert."""
+    """With outer_strides, each trip of the enclosing loops reads its own count
+    at base + the sum of each loop's stride times its variable, as prefill
+    reads one count per expert."""
 
     EXPERTS = 8
     STICK = 128
 
     def _strided_loop(self, **overrides):
-        fields = {"outer_stride": self.STICK}
+        fields = {"outer_strides": (self.STICK,)}
         fields.update(overrides)
         return self._device_read_loop(source=self._source(**fields))
 
@@ -644,7 +645,7 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
     def test_a_stride_of_zero_keeps_the_fixed_address(self):
         """Decode: a stride of 0 is the same bundle as no stride at all."""
         explicit = self._run_ops(
-            [_op_spec(), self._in_experts(self._strided_loop(outer_stride=0))], 2
+            [_op_spec(), self._in_experts(self._strided_loop(outer_strides=(0,)))], 2
         )
         default = self._run_ops(
             [_op_spec(), self._in_experts(self._device_read_loop())], 2
@@ -678,17 +679,62 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
             self.assertEqual(self._depth(bundle, marker), inside, marker)
         self.assertEqual(self._depth(bundle, order[-1]), inside - 1)
 
-    def test_the_stride_uses_the_directly_enclosing_loop(self):
-        """Under a batch loop and an expert loop, the count moves per expert,
-        so the expert loop's variable is the one multiplied."""
-        batch = LoopSpec(
-            count=sympy.Integer(2), body=[self._in_experts(self._strided_loop())]
+    def _in_batches(self, strides):
+        """2 batches > 8 experts > a tile loop whose count moves by ``strides``."""
+        inner = self._in_experts(self._strided_loop(outer_strides=strides))
+        return LoopSpec(count=sympy.Integer(2), body=[inner])
+
+    def test_a_count_under_two_loops_moves_with_both(self):
+        """Batch b, expert e reads its own count at base + 1024 * b + 128 * e,
+        so each batch reads its own block of 8 counts."""
+        per_batch = self.EXPERTS * self.STICK
+
+        bundle = self._run_ops(
+            [_op_spec(), self._in_batches((per_batch, self.STICK))], 2
         )
 
-        bundle = self._run_ops([_op_spec(), batch], 2)
+        self.assertIn(
+            f"#map_0 = affine_map<(d0, d1)[s0] -> (s0 + {per_batch}*d0 + "
+            f"{self.STICK}*d1)>",
+            bundle,
+        )
+        self.assertIn(
+            "%cnt_addr_2 = affine.apply #map_0(%i_0, %i_1)[%cnt_base_2]", bundle
+        )
 
-        self.assertIn("%cnt_addr_2 = affine.apply #map_0(%i_1)[%cnt_base_2]", bundle)
-        self.assertNotIn("affine.apply #map_0(%i_0", bundle)
+    def test_a_count_that_moves_with_the_outer_loop_only(self):
+        """A 0 stride leaves that loop out of the map: every expert of batch b
+        reads the same count."""
+        per_batch = self.EXPERTS * self.STICK
+
+        bundle = self._run_ops([_op_spec(), self._in_batches((per_batch, 0))], 2)
+
+        self.assertIn(f"#map_0 = affine_map<(d0)[s0] -> (s0 + {per_batch}*d0)>", bundle)
+        self.assertIn("%cnt_addr_2 = affine.apply #map_0(%i_0)[%cnt_base_2]", bundle)
+
+    @expects_raise
+    def test_one_stride_under_two_loops(self):
+        """One stride for two loops would let the batch loop read the same
+        counts on every trip, so it is refused instead."""
+        self._refuses(
+            [_op_spec(), self._in_batches((self.STICK,))],
+            "1 outer_strides for 2 enclosing loops",
+        )
+
+    @expects_raise
+    def test_the_last_count_of_two_levels_past_the_pool(self):
+        """Batch 1, expert 7 starts at 1024 + 896 and ends at byte 1924."""
+        per_batch = self.EXPERTS * self.STICK
+        end = per_batch + self.STICK * (self.EXPERTS - 1) + 4
+        inner = self._in_experts(
+            self._strided_loop(pool_offset=0, outer_strides=(per_batch, self.STICK))
+        )
+        batch = LoopSpec(count=sympy.Integer(2), body=[inner])
+        self._refuses(
+            [_op_spec(), batch],
+            f"ends at byte {end}, past the {end - 1}-byte pool",
+            pool_size=end - 1,
+        )
 
     def test_two_moving_counts_keep_their_own_names_and_bases(self):
         loop = self._in_experts(
@@ -724,13 +770,15 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
 
     @expects_raise
     def test_a_negative_outer_stride(self):
-        loop = self._in_experts(self._strided_loop(outer_stride=-self.STICK))
-        self._refuses([_op_spec(), loop], f"outer_stride={-self.STICK} is negative")
+        loop = self._in_experts(self._strided_loop(outer_strides=(-self.STICK,)))
+        self._refuses(
+            [_op_spec(), loop], f"outer_strides=({-self.STICK},) has a negative stride"
+        )
 
     @expects_raise
     def test_no_enclosing_loop_to_step_over(self):
         self._refuses(
-            [_op_spec(), self._strided_loop()], "needs an enclosing loop to step over"
+            [_op_spec(), self._strided_loop()], "1 outer_strides for 0 enclosing loops"
         )
 
     @expects_raise
@@ -796,12 +844,12 @@ class TestADeviceReadCountSurvivesTheRealSerializer(unittest.TestCase):
         self.assertIsNone(reloaded.count_from_buffer)
 
     def test_the_outer_stride_comes_back_intact(self):
-        source = CountSource(pool_offset=4096, max_value=16, outer_stride=128)
+        source = CountSource(pool_offset=4096, max_value=16, outer_strides=(128,))
         spec = LoopSpec(count=sympy.Integer(16), body=[], count_from_buffer=source)
 
         (reloaded,), text = self._round_trip(spec)
 
-        self.assertIn("outer_stride=128", text)
+        self.assertIn("outer_strides=(128,)", text)
         self.assertEqual(reloaded.count_from_buffer, source)
 
 
@@ -839,7 +887,7 @@ class TestTheCacheKeySeparatesADeviceReadCount(unittest.TestCase):
         """A fixed count and one that moves per trip are different bundles."""
         self.assertNotEqual(
             self._key(CountSource(pool_offset=0, max_value=16)),
-            self._key(CountSource(pool_offset=0, max_value=16, outer_stride=128)),
+            self._key(CountSource(pool_offset=0, max_value=16, outer_strides=(128,))),
         )
 
     def test_the_same_source_does_share_one(self):
