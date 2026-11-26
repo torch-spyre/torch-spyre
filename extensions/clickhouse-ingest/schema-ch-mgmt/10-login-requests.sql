@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS login_requests
 (
     login                    String,
-    version                  DateTime64(3, 'UTC'),
+    version                  DateTime64(3, 'UTC'), -- no default: the writer supplies a strictly increasing value per login
     requester                String,
     owner                    String,
     tier                     UInt8,

@@ -15,12 +15,14 @@
 """ch_mgmt: the login registry (latest row wins) and its append-only event log."""
 
 import json
+import regex as re
 
 import pytest
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 
 CH_MGMT_DIR = SCHEMA_DIR.parent / "schema-ch-mgmt"
 LOGIN = "app_nightly"
+SECRET = r"password|digest|hash|secret|token"
 
 
 def _tables():
@@ -70,17 +72,77 @@ def _insert(s, table, row):
 
 def test_ch_mgmt_is_separate_from_spyre_v2_schema():
     assert set(_tables()) == {"login_requests", "login_events"}
+    v2 = {
+        o.name
+        for path, text in SchemaApplier.selected_files(SCHEMA_DIR)
+        for o in SchemaApplier.objects(path, text)
+    }
+    assert not v2 & {"login_requests", "login_events"}
     assert not {p.name for p in CH_MGMT_DIR.glob("*.sql")} & {
         p.name for p in SCHEMA_DIR.glob("*.sql")
     }
 
 
-def test_roles_file_is_not_applied_and_grants_no_alter_or_delete():
-    roles = (CH_MGMT_DIR / "roles" / "chlogins-roles.sql").read_text()
+def test_no_column_can_hold_a_secret(chdb_session):
+    cols = _rows(
+        chdb_session,
+        "SELECT name, type FROM system.columns WHERE database = currentDatabase()",
+    )
+    assert cols
+    flags = {"password_issued": "UInt8"}
+    stamps = {"old_password_valid_until"}
+    for c in cols:
+        if not re.search(SECRET, c["name"], re.I):
+            continue
+        assert flags.get(c["name"]) == c["type"] or (
+            c["name"] in stamps and "DateTime64" in c["type"]
+        ), c
+
+
+def test_engines_and_sort_keys(chdb_session):
+    got = {
+        r["name"]: r
+        for r in _rows(
+            chdb_session,
+            "SELECT name, engine, engine_full, sorting_key FROM system.tables "
+            "WHERE database = currentDatabase()",
+        )
+    }
+    req, ev = got["login_requests"], got["login_events"]
+    assert req["engine"] == "ReplacingMergeTree"
+    assert "ReplacingMergeTree(version)" in req["engine_full"]
+    assert req["sorting_key"] == "login"
+    assert ev["engine"] == "MergeTree"
+    assert ev["sorting_key"] == "login, ts"
+
+
+def _grants():
+    out = set()
+    text = (CH_MGMT_DIR / "roles" / "chlogins-roles.sql").read_text()
+    for s in SchemaApplier.statements(text):
+        if s.upper().startswith("CREATE"):
+            continue
+        m = re.fullmatch(r"GRANT\s+([\w\s,]+?)\s+ON\s+(\S+)\s+TO\s+(\w+)", s, re.I)
+        assert m, s
+        for priv in m.group(1).split(","):
+            out.add((m.group(3), priv.strip().upper(), m.group(2)))
+    return out
+
+
+def test_roles_file_is_not_applied_and_grants_exactly_the_contract():
     assert "chlogins-roles.sql" not in {p.name for p in CH_MGMT_DIR.glob("*.sql")}
-    stmts = SchemaApplier.statements(roles)
-    assert stmts and all(s.split()[0] in ("CREATE", "GRANT") for s in stmts)
-    assert not any(w in s.upper() for s in stmts for w in ("ALTER", "DELETE", "DROP"))
+    tables = ("ch_mgmt.login_requests", "ch_mgmt.login_events")
+    want = {
+        ("dashboard_chlogins_writer", p, t)
+        for p in ("SELECT", "INSERT")
+        for t in tables
+    }
+    want |= {("dashboard_chlogins_reader", "SELECT", t) for t in tables}
+    assert _grants() == want
+    stmts = SchemaApplier.statements(
+        (CH_MGMT_DIR / "roles" / "chlogins-roles.sql").read_text()
+    )
+    assert {s.split()[0] for s in stmts} == {"CREATE", "GRANT"}
 
 
 def test_the_latest_version_of_a_login_wins(chdb_session):
