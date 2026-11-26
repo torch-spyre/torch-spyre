@@ -317,6 +317,15 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuSubmitFill";
     case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
       return "aiuIssueBarrier";
+
+    // Timestamp-calibrator counterparts of aiuParseResponseBlocks (81) and
+    // aiuIterationDuration (82). The calibrator's CBs ride the same
+    // ResponseWorker poll loop, so a shared name would charge the profiler's
+    // own maintenance to the workload in any per-name sum (116-117).
+    case AIUPTI_RUNTIME_TRACE_CBID_CALIBRATOR_PARSE_RESPONSE_BLOCKS:
+      return "aiuCalibratorParseResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_CALIBRATOR_ITERATION_DURATION:
+      return "aiuCalibratorIterationDuration";
     default:
       break;
   }
