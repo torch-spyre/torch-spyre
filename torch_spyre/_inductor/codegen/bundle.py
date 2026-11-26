@@ -20,6 +20,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import sympy
+import torch
 
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
@@ -42,6 +43,7 @@ logger = get_inductor_logger("sdsc_compile")
 sdsc_log = get_inductor_logger("sdsc")
 
 _STICK_BYTES = 128  # fixed HW stick size in bytes for every DataFormats
+_COUNT_BYTES = torch.float32.itemsize  # a device-read count is one FP32 value
 
 # ---------------------------------------------------------------------------
 # Types
@@ -788,7 +790,7 @@ def _check_count_sources(
     for idx, src in enumerate(loop_sources):
         if src is None:
             continue
-        first_end = src.pool_offset + _STICK_BYTES
+        first_end = src.pool_offset + _COUNT_BYTES
         if first_end > pool_size:
             raise Unsupported(
                 f"device-read loop count at byte {src.pool_offset} ends at byte "
@@ -809,7 +811,7 @@ def _check_count_sources(
                 "only a concrete enclosing trip count is supported"
             )
         last_end = src.pool_offset + src.outer_stride * (int(outer) - 1)
-        last_end += _STICK_BYTES
+        last_end += _COUNT_BYTES
         if last_end > pool_size:
             raise Unsupported(
                 f"device-read loop count for the last of {int(outer)} trips ends at "

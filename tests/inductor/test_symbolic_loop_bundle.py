@@ -568,7 +568,7 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
         """A count that never moves is checked against the pool end too."""
         self._refuses(
             self._device_read_loop(source=self._source(pool_offset=self.POOL_SIZE)),
-            f"ends at byte {self.POOL_SIZE + 128}, past the {self.POOL_SIZE}-byte pool",
+            f"ends at byte {self.POOL_SIZE + 4}, past the {self.POOL_SIZE}-byte pool",
         )
 
     def test_a_fixed_count_in_the_last_stick_of_the_pool(self):
@@ -718,7 +718,8 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
         self.assertEqual(len(defined), len(set(defined)), "a name is defined twice")
 
     def test_the_last_count_may_end_exactly_at_the_pool_end(self):
-        pool_size = self.STICK * self.EXPERTS
+        """The last of 8 counts starts at byte 896 and its 4 bytes end at 900."""
+        pool_size = self.STICK * (self.EXPERTS - 1) + 4
         loop = self._in_experts(self._strided_loop(pool_offset=0))
 
         bundle = self._run_ops([_op_spec(), loop], 2, pool_size=pool_size)
@@ -752,8 +753,8 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
 
     @expects_raise
     def test_a_last_count_one_byte_past_the_pool(self):
-        """The last of 8 counts ends at byte 1024; a 1023-byte pool is one short."""
-        end = self.STICK * self.EXPERTS
+        """The last of 8 counts ends at byte 900; an 899-byte pool is one short."""
+        end = self.STICK * (self.EXPERTS - 1) + 4
         loop = self._in_experts(self._strided_loop(pool_offset=0))
         self._refuses(
             [_op_spec(), loop],
