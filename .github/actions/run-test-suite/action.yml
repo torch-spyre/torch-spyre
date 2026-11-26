@@ -303,23 +303,39 @@ runs:
           # failure exit code.
           _DEVICE_OPEN_FAIL=0
           grep -q 'RAS::VFIO::DeviceOpenFail' "$log_file" 2>/dev/null && _DEVICE_OPEN_FAIL=1
-          # Several configs in one job: run_test.sh only fails when EVERY file is missing, and the job's
-          # JUnit file holds every member's cases, so one member that collected nothing would pass
-          # unnoticed. Fail the attempt if any file reports no tests when more than one config ran.
-          if [[ $(wc -w <<< "$CONFIG") -gt 1 && $TEST_EXIT -eq 0 ]] && \
-             grep -qE '^  NOTEST ' "$log_file" 2>/dev/null; then
-            echo "::error title=Empty bucket member::a config in this job collected no tests:"
-            grep -E '^  NOTEST ' "$log_file" | sed 's/^/    /'
-            TEST_EXIT=1
-          fi
-          # One config: warn, per file, for each file that collected no tests (pytest exit 5, which
-          # run_test.sh does not fail on). This replaces the run-level "Report empty test suites" job,
-          # which counted <testcase>s per JUnit file after every suite had finished: it only saw a
-          # job where every file was empty, and it held both required checks back by ~1 min.
-          if [[ $(wc -w <<< "$CONFIG") -le 1 ]] && grep -qE '^  NOTEST ' "$log_file" 2>/dev/null; then
-            grep -E '^  NOTEST ' "$log_file" | sed -E 's/^  NOTEST +//; s/ {2,}/: /' | while IFS= read -r _empty; do
-              echo "::warning title=Empty test suite::${CONFIG}: ${_empty}"
-            done
+          # Files that collected no tests: pytest exit 5, which run_test.sh records as NOTEST in its
+          # per-file summary and does not fail on. Parsed without relying on that summary's column
+          # widths: drop the status word, squeeze whitespace, drop the "no tests collected" text.
+          _EMPTY_FILES=$(grep -E '^  NOTEST ' "$log_file" 2>/dev/null \
+            | sed -E 's/^  NOTEST[[:space:]]+//; s/[[:space:]]+/ /g; s/ ?no tests collected$//; s/ $//')
+          if [[ -n "$_EMPTY_FILES" ]]; then
+            _EMPTY_COUNT=$(wc -l <<< "$_EMPTY_FILES" | tr -d ' ')
+            _EMPTY_LIST=$(paste -sd ',' - <<< "$_EMPTY_FILES" | sed 's/,/, /g')
+            if [[ $(wc -w <<< "$CONFIG") -gt 1 && $TEST_EXIT -eq 0 ]]; then
+              # Several configs in one job: run_test.sh only fails when EVERY file is missing, and the
+              # job's JUnit file holds every member's cases, so one member that collected nothing would
+              # pass unnoticed. Fail the attempt if any file reports no tests when more than one config ran.
+              echo "::error title=Empty bucket member::a config in this job collected no tests: ${_EMPTY_LIST}"
+              TEST_EXIT=1
+            else
+              # One config, or a group that already failed: warn. One annotation per attempt naming every
+              # file, since GitHub shows at most 10 warning annotations per step. This replaces the
+              # run-level "Report empty test suites" job, which counted <testcase>s per JUnit file after
+              # every suite had finished: it only saw a job where every file was empty, and it held both
+              # required checks back by ~1 min.
+              echo "::warning title=Empty test suite::${_EMPTY_COUNT} file(s) collected no tests: ${_EMPTY_LIST}"
+            fi
+            if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+              {
+                echo "### Files that collected no tests (${_EMPTY_COUNT})"
+                echo ""
+                echo "Config(s): \`${CONFIG}\`"
+                echo ""
+                echo "| File |"
+                echo "|---|"
+                while IFS= read -r _f; do echo "| \`${_f}\` |"; done <<< "$_EMPTY_FILES"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
           rm -f "$log_file" "$stall_flag" "${stall_flag}.done" "${stall_flag}.stalled"
         }
