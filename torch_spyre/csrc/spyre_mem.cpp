@@ -2616,8 +2616,18 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "). Fill the underlying tensor, or a CPU copy, instead.");
   const at::TensorBase& root =
       self.is_view() ? self._base() : static_cast<const at::TensorBase&>(self);
+  // A view(dtype) of a Spyre tensor shares its storage but not its device
+  // layout: it is not a tracked view, and its TensorImpl is not a
+  // SpyreTensorImpl, so there is no layout to check the fill against.
+  // Reading one through a static_cast was undefined behavior (it segfaulted
+  // on p.view(torch.uint8).zero_() of a KV-cache page); reject it instead.
   const auto* root_impl =
-      static_cast<SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+      dynamic_cast<const SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+  TORCH_CHECK(root_impl != nullptr,
+              "fill_/zero_ of a Spyre tensor without a device layout is not "
+              "supported: this is usually a dtype view such as "
+              "t.view(torch.uint8), which shares the storage but not the "
+              "layout. Fill the original tensor instead.");
   int64_t whole_elements = -1;  // -1: unknown, do not check the root
   if (root_impl->has_intact_reservation()) {
     whole_elements = root.numel();

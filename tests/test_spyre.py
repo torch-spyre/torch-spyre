@@ -201,6 +201,58 @@ class TestSpyre(TestCase):
             d.t().zero_()
             self.assertTrue(torch.equal(d.cpu(), torch.zeros(64, 64)))
 
+    @parametrize("op", [subtest("fill", name="fill"), subtest("zero", name="zero")])
+    def test_fill_dtype_view_rejected(self, op):
+        # view(dtype) shares the storage but not the device layout, so it has
+        # no layout to check the fill against. It must raise (not crash) and
+        # leave the tensor unchanged.
+        expected = (torch.arange(64 * 64) % 1024).reshape(64, 64).to(torch.float16)
+        d = expected.to("spyre")
+        v = d.view(torch.uint8)
+        with self.assertRaisesRegex(RuntimeError, "without a device layout"):
+            if op == "fill":
+                v.fill_(0)
+            else:
+                v.zero_()
+        self.assertTrue(torch.equal(d.cpu(), expected))
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.float16, name="fp16"),
+            subtest(torch.float8_e4m3fn, name="fp8"),
+        ],
+    )
+    def test_zero_dtype_view_of_kv_layout_page_rejected(self, dtype):
+        # spyre-inference zeroed KV-cache pages (a layout with valid_elements)
+        # through p.view(torch.uint8).zero_(), which segfaulted in the fill
+        # guard. It must raise, and zero_() of the page itself must work.
+        from torch_spyre._C import (
+            SpyreTensorLayout,
+            get_device_dtype,
+            get_elem_in_stick,
+        )
+
+        num_blocks, kv_heads, block_size, head_size = 2, 2, 64, 128
+        eps = get_elem_in_stick(dtype)
+        num_pages = num_blocks * kv_heads
+        layout = SpyreTensorLayout(
+            device_size=[num_pages, block_size, (head_size + eps - 1) // eps, eps],
+            stride_map=[block_size * head_size, head_size, eps, 1],
+            device_dtype=get_device_dtype(dtype),
+            valid_elements={(0,): num_pages, (1,): block_size, (2, 3): head_size},
+        )
+        p = torch.empty(
+            (num_blocks, kv_heads, block_size, head_size),
+            dtype=dtype,
+            device=torch.device("spyre"),
+            device_layout=layout,
+        )
+        with self.assertRaisesRegex(RuntimeError, "without a device layout"):
+            p.view(torch.uint8).zero_()
+        p.zero_()
+        self.assertTrue((p.cpu().view(torch.uint8) == 0).all())
+
     @parametrize(
         "view",
         [

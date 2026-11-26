@@ -89,6 +89,9 @@ _UNITS = {
     "total_token_throughput": "tok/s",
 }
 # The HUD view cannot see the CI coordinates, so it reads them off benchmark_runs.props.
+# A repeat is one execution of a benchmark; the engine writes each into its own subdir of raw_dir.
+REPEAT_DIR_PREFIX = "repeat-"
+REPEAT_PROP = "run.repeat"
 _RUN_PROP_COLUMNS = ("repo", "head_branch", "workflow_id", "run_attempt", "job_id")
 _RUN_PROP_EXTRA_KEYS = ("head_sha", "arch", "hardware_type")
 _BENCH_TABLES = (schema.BENCHMARKS, schema.BENCHMARK_RUNS)
@@ -212,6 +215,28 @@ def bench_name(filename: str) -> str:
     )
 
 
+def repeat_of(path: str) -> str:
+    """The repeat a results file sits under (`.../repeat-003/x.json` -> '3'), '' at the top level."""
+    parent = os.path.basename(os.path.dirname(path))
+    stem = parent.removeprefix(REPEAT_DIR_PREFIX)
+    return (
+        str(int(stem))
+        if parent.startswith(REPEAT_DIR_PREFIX) and stem.isdigit()
+        else ""
+    )
+
+
+def results_json(results_dir: str) -> tuple[list[str], set[str], set[str]]:
+    """(native, pytorch, host-resource) JSON under `results_dir` and its repeat-NNN subdirs."""
+    bases = (f"{results_dir}/", f"{results_dir}/{REPEAT_DIR_PREFIX}*/")
+    found = {
+        suffix: {p for b in bases for p in glob.glob(f"{b}*{suffix}")}
+        for suffix in (".json", ".pytorch.json", ".host_resources.json")
+    }
+    pytorch, host = found[".pytorch.json"], found[".host_resources.json"]
+    return sorted(found[".json"] - pytorch - host), pytorch, host
+
+
 def model_from_record(record: dict[str, Any], filename: str) -> str:
     """Best-effort model name from a record, falling back to the file's test name."""
     raw_model = record.get("model")
@@ -261,10 +286,7 @@ def extract_rows(
     """
     rows = []
     ts = int(time.time() * 1000)
-    all_json = set(glob.glob(f"{results_dir}/*.json"))
-    pytorch_files = set(glob.glob(f"{results_dir}/*.pytorch.json"))
-    host_resource_files = set(glob.glob(f"{results_dir}/*.host_resources.json"))
-    native_files = sorted(all_json - pytorch_files - host_resource_files)
+    native_files, pytorch_files, host_resource_files = results_json(results_dir)
     log.info(
         "Found %d vLLM-native, %d PyTorch-format, and %d host-resource JSON files in %s",
         len(native_files),
@@ -280,6 +302,7 @@ def extract_rows(
         value: float,
         n: int = 0,
         test_name: str = "",
+        repeat: str = "",
     ) -> None:
         info = {
             "device": "spyre",
@@ -291,6 +314,8 @@ def extract_rows(
             "pr_number": pr_number,
             "value": value,
         }
+        if repeat:
+            info["repeat"] = repeat
         if n:
             info["iterations"] = n
         rows.append(
@@ -323,6 +348,7 @@ def extract_rows(
     ]:
         filename = os.path.basename(file)
         test_name = bench_name(filename)
+        repeat = repeat_of(file)
         try:
             records = read_benchmark_results(file)
         except Exception:
@@ -351,19 +377,24 @@ def extract_rows(
                 raw = record.get("model")
                 record_model = (
                     raw if isinstance(raw, str) and raw else None
-                ) or model_by_test.get(effective_test_name, effective_test_name)
+                ) or model_by_test.get(
+                    (effective_test_name, repeat), effective_test_name
+                )
             else:
                 record_model = model_from_record(record, filename)
             if is_pytorch:
                 if record_model != test_name:
-                    model_by_test[test_name] = record_model
+                    model_by_test[(test_name, repeat)] = record_model
             elif not is_host_resource and record_model == test_name:
-                record_model = model_by_test.get(test_name) or model or record_model
-            # Dedup set is keyed on the resolved test_name, not the filename stem.
-            covered = pytorch_metrics.setdefault(effective_test_name, set())
+                record_model = (
+                    model_by_test.get((test_name, repeat)) or model or record_model
+                )
+            # Dedup set is keyed on the resolved test_name and repeat, not the filename stem:
+            # each repeat is its own measurement, so one must not dedup away against another.
+            covered = pytorch_metrics.setdefault((effective_test_name, repeat), set())
             n = 0 if (is_pytorch or is_host_resource) else sample_count(record)
             if n:
-                samples_by_test.setdefault(effective_test_name, n)
+                samples_by_test.setdefault((effective_test_name, repeat), n)
             for metric_name, value in extractor(record):
                 if is_pytorch:
                     covered.add(metric_name)
@@ -376,6 +407,7 @@ def extract_rows(
                     value,
                     n,
                     test_name=effective_test_name,
+                    repeat=repeat,
                 )
         extracted = len(rows) - before_rows
         if extracted:
@@ -387,14 +419,14 @@ def extract_rows(
     for r in rows:
         extra = json.loads(r["extra"])
         if extra.get("iterations"):
-            counted.add(extra.get("test_name"))
+            counted.add((extra.get("test_name"), extra.get("repeat", "")))
     for r in rows:
         extra = json.loads(r["extra"])
-        name = extra.get("test_name")
-        if name in samples_by_test and name not in counted:
-            extra["iterations"] = samples_by_test[name]
+        key = (extra.get("test_name"), extra.get("repeat", ""))
+        if key in samples_by_test and key not in counted:
+            extra["iterations"] = samples_by_test[key]
             r["extra"] = json.dumps(extra)
-            counted.add(name)
+            counted.add(key)
 
     log.info("Total rows extracted: %d", len(rows))
     return rows
@@ -425,14 +457,18 @@ def bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged by the writer into one benchmark_runs row per (benchmark, backend).
 
     iterations is set on ONE entry per benchmark: insert_benchmarks sums it across entries.
+
+    `repeat` rides on the entry, never in `props`/`disc`: disc_keys is positional, so adding a
+    key there would re-key every vLLM benchmark already stored.
     """
     entries = []
-    counted: set[str] = set()
+    counted: set[tuple[str, str]] = set()
     for r in rows:
         extra = json.loads(r["extra"])
         name = extra.get("test_name") or ""
         if not name:
             continue
+        repeat = str(extra.get("repeat", ""))
         props = {"record_type": "model", "run_mode": name.split("_")[0]}
         props.update(parse_input_shapes(name))
         model = extra.get("model", "")
@@ -446,12 +482,13 @@ def bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if unit:
             run_props[f"unit.{r['metric']}"] = unit
         iterations = 0
-        if extra.get("iterations") and name not in counted:
-            counted.add(name)
+        if extra.get("iterations") and (name, repeat) not in counted:
+            counted.add((name, repeat))
             iterations = int(extra["iterations"])
         entries.append(
             {
                 "name": name,
+                "repeat": repeat,
                 "tags": [],
                 # A column, never a hash input: the axis a cross-backend comparison pivots on.
                 "backend": extra.get("device", ""),
@@ -497,14 +534,34 @@ def write_benchmarks(
     if landed:
         log.info("v2 perf rows already present for run_id=%s — skipping", run_id)
         return 0
-    n = insert_benchmarks(
-        client,
-        db,
-        BENCH_COMPONENT,
+    # One insert per repeat: the writer merges to one row per (benchmark, backend), so a single
+    # call would collapse a benchmark's repeats into one row. The dimension dedups identities, so
+    # the benchmark's identity row is still written once. Unrepeated rows take the single-group
+    # path and are byte-identical to before.
+    by_repeat: dict[str, list] = {}
+    for entry in bench_entries(rows):
+        by_repeat.setdefault(entry.pop("repeat", ""), []).append(entry)
+    by_repeat = by_repeat or {
+        "": []
+    }  # no rows still makes the one call, as it always did
+    n = 0
+    for repeat, entries in sorted(by_repeat.items()):
+        n += insert_benchmarks(
+            client,
+            db,
+            BENCH_COMPONENT,
+            run_id,
+            entries,
+            report_kind=REPORT_KIND,
+            row_props={
+                **(row_props or {}),
+                **({REPEAT_PROP: repeat} if repeat else {}),
+            },
+        )
+    log.info(
+        "Inserted %d benchmark_runs row(s) across %d repeat(s) under run_id=%s",
+        n,
+        len(by_repeat),
         run_id,
-        bench_entries(rows),
-        report_kind=REPORT_KIND,
-        row_props=row_props,
     )
-    log.info("Inserted %d benchmark_runs row(s) under run_id=%s", n, run_id)
     return n
