@@ -13,10 +13,12 @@
 # limitations under the License.
 
 """for_each_tile(active_count=...): the keyword's checks, the marker that reads
-the count once in the loop body so the capture keeps it, and the loop's
-``count_source`` that the splice makes from it, with its read edges.
+the count once in the loop body so the capture keeps it, the loop's
+``count_source`` that the splice makes from it, its read edges, and the
+resolver that turns it into the loop's ``CountSource`` after pooling.
 
-No device needed: the IR is stand-ins.
+No device needed: the IR is stand-ins. The device runs are in
+test_active_count_e2e.py.
 """
 
 import unittest
@@ -25,12 +27,19 @@ from types import SimpleNamespace
 import sympy
 import torch
 from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep
+from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 
 from torch_spyre._inductor.deadcode_elimination import live_operations
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_checker import find_violations
 from torch_spyre._inductor.loop_node import LoopCountSource, LoopNode, OpsView
+from torch_spyre._inductor.op_spec import CountSource, LoopSpec
+from torch_spyre._inductor.scheduler import _resolve_count_source
+from torch_spyre._inductor.spyre_kernel import SpyreKernel
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.wsr.for_each_tile_lowering import _take_active_counts
 
@@ -240,6 +249,102 @@ class TestTheReadEdges(unittest.TestCase):
         """It is refused at codegen instead, with a message for the user."""
         ops = [_counted("loop", [_Op("t")])]
         self.assertEqual(find_violations(ops, inputs={"cnt"}), [])
+
+
+class TestCountedLoop(unittest.TestCase):
+    """Plan 2.4: counted_loop runs before pooling, so it keeps the source."""
+
+    def test_the_source_waits_on_the_loop_spec(self):
+        source = LoopCountSource("cnt", 32 * U0, 4)
+        loop = SpyreKernel.counted_loop(sympy.Integer(4), [], source, (U0,))
+        self.assertEqual(loop._pending_count_source, (source, (U0,)))
+        self.assertIsNone(loop.count_from_buffer)
+
+    def test_an_ordinary_loop_has_none(self):
+        loop = SpyreKernel.counted_loop(sympy.Integer(4), [])
+        self.assertFalse(hasattr(loop, "_pending_count_source"))
+
+
+class TestTheResolver(unittest.TestCase):
+    """Plan 2.5. A count buffer of 8 rows, one 128-byte stick each, placed at
+    pool byte 4096 by pooling; the read index says which row this loop uses."""
+
+    ROWS = 8
+
+    def _layout(self, arrangement=ElementArrangement.STANDARD, cols=32, pool=4096):
+        stl = SpyreTensorLayout([self.ROWS, cols], torch.float32)
+        if arrangement != ElementArrangement.STANDARD:
+            stl = stl.with_element_arrangement(arrangement)
+        layout = FixedTiledLayout(
+            torch.device("cpu"), torch.float32, [self.ROWS, cols], [cols, 1], stl
+        )
+        if pool is not None:
+            layout.allocation["hbm_pool"] = pool
+        return layout
+
+    def _resolve(self, index, enclosing=(), max_value=4, layout=None, trips=4):
+        layout = layout or self._layout()
+        graph = SimpleNamespace(
+            try_get_buffer=lambda name: SimpleNamespace(get_layout=lambda: layout)
+        )
+        loop = LoopSpec(count=sympy.Integer(trips), body=[])
+        source = LoopCountSource("buf_count", sympy.sympify(index), max_value)
+        with V.set_graph_handler(graph):
+            _resolve_count_source(loop, source, tuple(enclosing))
+        return loop.count_from_buffer
+
+    def test_a_per_trip_copy_is_a_fixed_address(self):
+        """Prefill as lowered today: each expert trip copies its row to a
+        buffer of its own, which the inner loop reads at index 0."""
+        self.assertEqual(
+            self._resolve(0, enclosing=[U0]),
+            CountSource(pool_offset=4096, max_value=4, outer_strides=()),
+        )
+
+    def test_a_row_read_in_place_moves_one_stick_per_trip(self):
+        self.assertEqual(
+            self._resolve(32 * U0, enclosing=[U0]),
+            CountSource(pool_offset=4096, max_value=4, outer_strides=(128,)),
+        )
+
+    def test_two_levels_give_one_stride_each(self):
+        self.assertEqual(
+            self._resolve(128 * U0 + 32 * U1 + 64, enclosing=[U0, U1]),
+            CountSource(pool_offset=4096 + 256, max_value=4, outer_strides=(512, 128)),
+        )
+
+    def test_a_loop_the_count_does_not_move_with_gets_a_zero(self):
+        self.assertEqual(
+            self._resolve(32 * U1, enclosing=[U0, U1]),
+            CountSource(pool_offset=4096, max_value=4, outer_strides=(0, 128)),
+        )
+
+    def test_a_count_outside_the_pool_is_refused(self):
+        """A host count (a kernel input) lands here: CountSource has no field
+        for it yet."""
+        with self.assertRaisesRegex(Unsupported, "not in this bundle's pool"):
+            self._resolve(0, layout=self._layout(pool=None))
+
+    def test_a_staggered_count_is_refused(self):
+        layout = self._layout(arrangement=ElementArrangement.DL16_TO_FP32)
+        with self.assertRaisesRegex(Unsupported, "stored DL16_TO_FP32"):
+            self._resolve(0, layout=layout)
+
+    def test_a_mid_stick_read_is_refused(self):
+        with self.assertRaisesRegex(Unsupported, "not at the start of a stick"):
+            self._resolve(1)
+
+    def test_a_row_narrower_than_a_stick_is_refused(self):
+        with self.assertRaisesRegex(Unsupported, "one stick per row"):
+            self._resolve(0, layout=self._layout(cols=16))
+
+    def test_a_read_over_another_symbol_is_refused(self):
+        with self.assertRaisesRegex(Unsupported, "not only on enclosing loop"):
+            self._resolve(32 * U1, enclosing=[U0])
+
+    def test_a_maximum_other_than_the_trip_count_is_refused(self):
+        with self.assertRaisesRegex(Unsupported, "!= the loop's 4 trips"):
+            self._resolve(0, max_value=8)
 
 
 if __name__ == "__main__":

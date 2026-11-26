@@ -1632,12 +1632,16 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
-    def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
+    def wrap_op_specs_in_loop(
+        self, count: sympy.Expr, source: Any = None, enclosing: tuple = ()
+    ) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
-        self.op_specs = [self.counted_loop(count, self.op_specs)]
+        self.op_specs = [self.counted_loop(count, self.op_specs, source, enclosing)]
 
     @staticmethod
-    def counted_loop(count: sympy.Expr, body: list) -> LoopSpec:
+    def counted_loop(
+        count: sympy.Expr, body: list, source: Any = None, enclosing: tuple = ()
+    ) -> LoopSpec:
         """The one place a LoopSpec is built from a trip count.
 
         The outermost loop (wrap_op_specs_in_loop) and every nested level (the
@@ -1650,14 +1654,24 @@ class SpyreKernel(Kernel[CSEVariable]):
         bounds, its sources and the bundle as the one surviving symbol. A count
         over a dimension nobody declared is refused here, the one place every
         level passes (see ``require_declared_count``).
+
+        ``source`` is the ``LoopNode``'s ``count_source`` when the trip count is
+        read on the device, and ``enclosing`` the induction variables of the
+        loops around this one in the kernel, outermost first. The count buffer
+        has no pool offset yet (pooling runs after this), so the source is kept
+        on the LoopSpec and ``scheduler.resolve_count_sources`` turns it into the
+        ``CountSource`` once pooling has run.
         """
         count = with_shape_env_replacements(count)
         require_declared_count(count)
-        return LoopSpec(
+        loop = LoopSpec(
             count=count,
             body=body,
             count_symbol_bounds=symbolic_count_bounds(count),
         )
+        if source is not None:
+            loop._pending_count_source = (source, tuple(enclosing))
+        return loop
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""

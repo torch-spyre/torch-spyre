@@ -94,6 +94,104 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
         return False
 
 
+def _resolve_count_source(loop, source, enclosing: tuple) -> None:
+    """Turn the loop's ``LoopCountSource`` into its ``CountSource``, now that
+    pooling has placed the count buffer. Only a count in this bundle's pool is
+    supported, as the first value of a stick, in a buffer whose rows are one
+    stick each (so an element offset times the item size is a device byte
+    offset), stored in STANDARD order.
+
+    A count passed straight in from the host (a graph input) is a kernel
+    input, which ``CountSource`` has no field for yet: it is refused here.
+    Compute it with one device op instead (``active_count=cnt.abs()``)."""
+    from .op_spec import CountSource
+
+    name = source.buffer
+    buf = V.graph.try_get_buffer(name)
+    if buf is None:
+        raise Unsupported(f"active_count buffer {name} does not exist at codegen")
+    layout = buf.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        raise Unsupported(
+            f"active_count buffer {name} has no device layout ({type(layout).__name__})"
+        )
+    if "hbm_pool" not in layout.allocation:
+        where = sorted(layout.allocation) or ["a kernel input"]
+        raise Unsupported(
+            f"active_count buffer {name} is in {where}, not in this bundle's pool; "
+            "the count must be written earlier in the same bundle (a fallback op "
+            "between the count and the loop splits them)"
+        )
+    from torch_spyre._C import ElementArrangement
+
+    if layout.dtype.itemsize != 4 or layout.dtype.is_floating_point is False:
+        raise Unsupported(
+            f"active_count buffer {name} is {layout.dtype}; the device reads FP32"
+        )
+    arrangement = layout.device_layout.element_arrangement
+    if arrangement != ElementArrangement.STANDARD:
+        raise Unsupported(
+            f"active_count buffer {name} is stored {arrangement.name}: its first "
+            "physical value is not its first logical value"
+        )
+    itemsize = layout.dtype.itemsize
+    per_stick = layout.device_layout.elems_per_stick()
+    size = [int(s) for s in layout.size]
+    stride = [int(s) for s in layout.stride]
+    contiguous = stride[-1] == 1 and all(
+        stride[i] == stride[i + 1] * size[i + 1] for i in range(len(size) - 1)
+    )
+    if size[-1] != per_stick or not contiguous:
+        raise Unsupported(
+            f"active_count buffer {name} must hold one stick per row "
+            f"(contiguous, last dim {per_stick}), got size {size} stride {stride}"
+        )
+    index = sympy.expand(source.index)
+    loop_vars = [var for var in enclosing if var is not None]
+    stray = index.free_symbols - set(loop_vars)
+    if stray:
+        raise Unsupported(
+            f"active_count read {name}[{index}] depends on {sorted(map(str, stray))}, "
+            "not only on enclosing loop variables"
+        )
+    strides = []
+    for var in enclosing:
+        coeff = sympy.Integer(0) if var is None else index.coeff(var)
+        if not coeff.is_Integer:
+            raise Unsupported(f"active_count read {name}[{index}] is not affine")
+        strides.append(int(coeff) * itemsize)
+    const = index.subs({var: 0 for var in loop_vars})
+    if not const.is_Integer:
+        raise Unsupported(f"active_count read {name}[{index}] has no constant base")
+    element = int(const)
+    if element % per_stick or any(s % (per_stick * itemsize) for s in strides):
+        raise Unsupported(
+            f"active_count read {name}[{index}] is not at the start of a stick"
+        )
+    if int(loop.count) != source.max_value:
+        raise Unsupported(
+            f"active_count max {source.max_value} != the loop's {loop.count} trips"
+        )
+    loop.count_from_buffer = CountSource(
+        pool_offset=int(layout.allocation["hbm_pool"]) + element * itemsize,
+        max_value=source.max_value,
+        outer_strides=tuple(strides) if any(strides) else (),
+    )
+
+
+def resolve_count_sources(specs: list) -> None:
+    """Address every device-read loop count in ``specs`` (see
+    ``SpyreKernel.counted_loop``). Called once pooling has run."""
+    from .op_spec import LoopSpec
+
+    for spec in specs:
+        if isinstance(spec, LoopSpec):
+            pending = getattr(spec, "_pending_count_source", None)
+            if pending is not None:
+                _resolve_count_source(spec, *pending)
+            resolve_count_sources(spec.body)
+
+
 def _lx_layout(name: str):
     buffer = V.graph.try_get_buffer(name)
     if buffer is None:
@@ -322,12 +420,37 @@ class SuperDSCScheduling(BaseScheduling):
         kernel.local_read_contract_factory = lambda name, consumer: (
             local_lx_emission_contract(V.graph, name, consumer)
         )
+        is_loop = isinstance(node, CountedLoopSchedulerNode)
+        if is_loop:
+            SuperDSCScheduling._enter_loop(node, kernel)
         with kernel:
             self._codegen_into_kernel(nodes, kernel)
-        if isinstance(node, CountedLoopSchedulerNode):
-            kernel.wrap_op_specs_in_loop(node.loop_count)
+        if is_loop:
+            kernel.wrap_op_specs_in_loop(
+                node.loop_count, **SuperDSCScheduling._leave_loop(node, kernel)
+            )
         kernel.check_op_specs()
         return kernel
+
+    @staticmethod
+    def _enter_loop(node: CountedLoopSchedulerNode, kernel: SpyreKernel) -> None:
+        """Push ``node``'s induction variable on the kernel's loop stack."""
+        loop_node = getattr(node, "loop_node", None)
+        stack = kernel.__dict__.setdefault("_loop_inductions", [])
+        stack.append(getattr(loop_node, "induction", None))
+
+    @staticmethod
+    def _leave_loop(node: CountedLoopSchedulerNode, kernel: SpyreKernel) -> dict:
+        """Pop it. Returns ``counted_loop``'s device-count arguments: the
+        ``LoopNode``'s ``count_source`` and the inductions of the loops still
+        around it in this kernel."""
+        stack = kernel.__dict__["_loop_inductions"]
+        stack.pop()
+        loop_node = getattr(node, "loop_node", None)
+        return {
+            "source": getattr(loop_node, "count_source", None),
+            "enclosing": tuple(stack),
+        }
 
     def codegen_node(
         self, node: Union[FusedSchedulerNode, SchedulerNode, CountedLoopSchedulerNode]
@@ -353,6 +476,8 @@ class SuperDSCScheduling(BaseScheduling):
         all_schedule_nodes = kernel.scheduled_nodes
 
         kernel.pool_size = getattr(V.graph, "hbm_pool_sizes", {}).get(name, 0)
+        # Pooling has placed every buffer: a device-read count can now be addressed.
+        resolve_count_sources(kernel.op_specs)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -398,11 +523,16 @@ class SuperDSCScheduling(BaseScheduling):
         kernel.
         """
         body_start = len(kernel.op_specs)
+        SuperDSCScheduling._enter_loop(node, kernel)
         self._codegen_into_kernel(self._live_nodes(node), kernel)
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(SpyreKernel.counted_loop(node.loop_count, body))
+        kernel.op_specs.append(
+            SpyreKernel.counted_loop(
+                node.loop_count, body, **SuperDSCScheduling._leave_loop(node, kernel)
+            )
+        )
 
     def _codegen_into_kernel(
         self, nodes: list[BaseSchedulerNode], kernel: SpyreKernel
