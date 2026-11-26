@@ -48,9 +48,10 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
+    SHUFFLE_OP,
     SPYRE_INT32_OPS,
     TOPK_OPS,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
 )
 from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
@@ -97,8 +98,19 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     device_tile_advance_expr: Expr | None = None
+    element_arrangement: ElementArrangement = dataclasses.field(
+        default_factory=lambda: ElementArrangement.STANDARD
+    )
+    # Elements in the tensor's stick dim as laid out on the device (padded to
+    # whole sticks, and to whole stick pairs for DL16_TO_FP32), summed over all
+    # cores. None when the stick dim is not part of dim_order.
+    stick_device_size: int | None = None
     # Sharded storage: each core addresses its own chunk (see sharded_hbm.py).
     non_unified_shard_bytes: int = 0
+    # SDSC-dim symbol of the shard dim (already mapped to the dim label),
+    # when this arg is sharded storage; None otherwise. Read only by the
+    # codegen guard verify_non_unified_split.
+    non_unified_shard_dim: Symbol | None = None
 
     @property
     def non_unified(self) -> bool:
@@ -640,8 +652,9 @@ def _is_depthwise_conv(op: str) -> bool:
     return op == DEPTHWISE_CONV2D_OP
 
 
-def _is_keep_by_index(op: str) -> bool:
-    return op == KEEP_BY_INDEX_OP
+def _is_index_masking_op(op: str) -> bool:
+    """True for keepbyindex and maskbyindex."""
+    return op in INDEX_MASKING_OPS
 
 
 # Canonical avgpool iteration-space order (NHWC) -> SDSC labels.  Codegen owns
@@ -1524,8 +1537,8 @@ def _create_sdsc_tensors(
         # (innermost) tile extent this arg is written/read at per
         # iteration, and the full extent it sits within -- to compute a
         # correct base offset/backGap, since device_coordinates cannot
-        # represent "which supertile" for these ops (see
-        # coarse_tiling_loops.md's IR-rewiring appendix). The innermost
+        # represent "which supertile" for these ops (see "Invariants and
+        # failure modes" in docs/source/compiler/loop_nodes.md). The innermost
         # level that tiles a given dim owns its true per-iteration
         # tile_size; the full extent is that tile_size times every level's
         # supertile_count for that dim.
@@ -1598,7 +1611,7 @@ def _create_sdsc_tensors(
             use_op_dims
             and dim_order != dims
             and not _is_topk(op_spec.op)
-            and not _is_keep_by_index(op_spec.op)
+            and not _is_index_masking_op(op_spec.op)
         ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
@@ -1677,6 +1690,7 @@ def _create_sdsc_tensors(
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
 
+        stick_device_size = None
         # The K axis of a QFP8WT 2D stick is device coordinate -2.
         qfp8wt_k_sym = None
         if is_qfp8wt_2d_stick and len(arg.device_coordinates) >= 2:
@@ -1742,8 +1756,8 @@ def _create_sdsc_tensors(
                 # dim at a different position for this (Case 2 / mutated) arg
                 # than for its sibling args, which makes the stride_idx-based
                 # arg.device_size[-stride_idx-2] lookup below read the wrong
-                # slot for this arg specifically (see
-                # coarse_tiling_loops.md's IR-rewiring appendix). Use the
+                # slot for this arg specifically (see "Invariants and failure
+                # modes" in docs/source/compiler/loop_nodes.md). Use the
                 # authoritative supertile count for dev_dim_size instead of
                 # trusting that slot. Scoped to the stick dim only: other
                 # coarse-tiled dims (e.g. mb) already read the correct slot
@@ -1776,6 +1790,8 @@ def _create_sdsc_tensors(
                     stick_size = arg.device_dtype.elems_per_stick()
                     dev_dim_size *= stick_size
                     it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+            if dim == stick_dim:
+                stick_device_size = dev_dim_size
 
             if has_indirect_access:
                 max_dim_sizes[dim] = compute_indirect_max_dim_sizes(
@@ -2042,7 +2058,17 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
+            element_arrangement=arg.element_arrangement,
+            stick_device_size=stick_device_size,
             non_unified_shard_bytes=arg.non_unified_shard_bytes,
+            non_unified_shard_dim=(
+                # Map the planner's raw pinned symbol to the emitted dim
+                # label, the same rename every other symbol gets, so the
+                # guard can compare it against work_slices' keys.
+                symbol_mapping.get(arg.non_unified_shard_dim, arg.non_unified_shard_dim)
+                if arg.non_unified_shard_dim is not None
+                else None
+            ),
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)
@@ -2072,7 +2098,7 @@ def _get_op_func(
         and not _is_topk(op)
         and not _is_conv(op)
         and -2 not in output_scales.values()
-        and not _is_keep_by_index(op)
+        and not _is_index_masking_op(op)
     ):
         return op + "nonstick"
     return op
@@ -2290,6 +2316,37 @@ def _extend_restickify_to_padded(
         )
 
 
+def extend_shuffle_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Extend sdsc_iteration_space[stick_sym] to the largest stick extent of any arg.
+
+    A staggered operand (DL16_TO_FP32) is padded to whole stick pairs, e.g. 4
+    fp32 sticks for 68 elements, while the stick-aligned iteration space only
+    covers 3. The staggered element order is only defined over whole pairs, so a
+    shuffle must iterate the full padded extent of its widest operand.
+    """
+    for arg in op_spec.args:
+        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
+        if stick_sym is None or stick_sym not in sdsc_iteration_space:
+            continue
+        extent = math.prod(
+            size
+            for size, coord in zip(arg.device_size, arg.device_coordinates)
+            if stick_sym in coord.subs(symbol_mapping).free_symbols
+        )
+        if extent > sdsc_iteration_space[stick_sym]:
+            logger.debug(
+                "extend_shuffle_to_padded: extending %s %d -> %d",
+                stick_sym,
+                sdsc_iteration_space[stick_sym],
+                extent,
+            )
+            sdsc_iteration_space[stick_sym] = extent
+
+
 def _inject_implicit_conv_kernel_dims(
     is_conv2d: bool,
     op_spec: OpSpec,
@@ -2424,11 +2481,21 @@ def _topk_injected_dims(
     return injected
 
 
+def _changes_element_arrangement(spec, is_ea_shuffle: bool) -> bool:
+    """True for ops that reorder elements within a stick."""
+    if is_ea_shuffle:
+        return True
+    if spec.op == IDENTITY_OP:
+        return False
+    return DtypeOpTable.is_dtype_op(spec.op) or spec.op in ("qfp8ch", "qfp8wt")
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     is_restickify = op_spec.op == RESTICKIFY_OP
+    is_ea_shuffle = op_spec.op == SHUFFLE_OP
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -2591,7 +2658,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             not (is_matmul or is_pool or has_indirect_access)
             and not is_conv
             and not _is_topk(op_spec.op)
-            and not _is_keep_by_index(op_spec.op)
+            and not _is_index_masking_op(op_spec.op)
         ):
             op_dim_order, op_stick_dim = _merged_reduction_dim_order(
                 op_spec, symbol_mapping
@@ -2606,19 +2673,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         )
 
     # A dtype conversion that changes the elements per stick (DL16TOFP32,
-    # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
-    # dim beyond the stick; inject a virtual mb=1 row when the op's tensor has
-    # only the stick dim.
+    # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) and an EA shuffle both reorder
+    # elements within a stick, and require at least one outer spatial dim beyond
+    # the stick; inject a virtual mb=1 row when the op's tensor has only the
+    # stick dim.
     # op_dim_order is empty for a degenerate stick dim, which has no loop symbol.
     changes_stick_width = len(op_spec.args) == 2 and (
         op_spec.args[0].device_dtype.elems_per_stick()
         != op_spec.args[1].device_dtype.elems_per_stick()
     )
+    stick_only = op_dim_order in ([], [op_stick_dim])
     mb_sym: Symbol | None = None
-    if changes_stick_width and (op_dim_order == [] or op_dim_order == [op_stick_dim]):
-        assert op_spec.op != IDENTITY_OP and (
-            DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op in ("qfp8ch", "qfp8wt")
-        ), f"{op_spec.op} changes the elements per stick but is not a conversion"
+    if stick_only and (changes_stick_width or is_ea_shuffle):
+        assert _changes_element_arrangement(op_spec, is_ea_shuffle), (
+            f"{op_spec.op} changes the elements per stick but is not a "
+            "type conversion or shuffle"
+        )
         mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
         dim_splits = {mb_sym: 1, **dim_splits}
@@ -2760,6 +2830,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         )
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    elif is_ea_shuffle:
+        extend_shuffle_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
     if reinstated_unit_spatial:
@@ -2796,6 +2868,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 work_slices,
             )
         )
+    elif _is_index_masking_op(op_spec.op) and op_stick_fallback_sym is not None:
+        # keep/mask_by_index share the same fallback-stick need as topk: when the
+        # op has no real stick dim, _create_sdsc_tensors Step 3 would pick an
+        # independent fallback symbol per arg (values vs. output), causing
+        # mismatched stick variables and a dbo-opt DtException.  Inject the
+        # op-level symbol so both args share one fallback stick.
+        # Unlike topk, keep/mask_by_index need no topk_missing_dim.
+        injected_dims["topk_stick_fallback_sym"] = op_stick_fallback_sym
 
     # For matmul N=1: inject N dimension into iteration space so y and output have it.
     if is_matmul:
@@ -2849,9 +2929,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0]],
             [args[0].dim_order],
         )
-    elif is_restickify:
+    elif is_restickify or is_ea_shuffle:
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
+        # SHUFFLE_OP (element-arrangement shuffle) also has potentially
+        # different arrangements on input and output and needs both padded.
         pad_args, pad_sdsc_args, dim_order = (
             list(op_spec.args),
             args,
@@ -2945,8 +3027,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
-    if _is_keep_by_index(op_spec.op):
-        num_inputs = 2  # keep_by_index has exactly 2 input tensors (values, indices)
+    if _is_index_masking_op(op_spec.op):
+        # keep/mask_by_index have exactly 2 input tensors (values, indices)
+        num_inputs = 2
 
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
@@ -3075,7 +3158,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     value_arg_index = 1 if indirect_access_indices else 0
     opfunc = (
         "shuffle"
-        if is_relayout
+        if is_relayout or is_ea_shuffle
         else _get_op_func(
             op_spec.op,
             op_spec.is_reduction,

@@ -40,6 +40,7 @@ RUN_TOKENS = (
     "cache",
     "profile_level",
     "raw_dir",
+    "raw_repeat_dir",
     "repeat_dir",
     "out_dir",
     "python",
