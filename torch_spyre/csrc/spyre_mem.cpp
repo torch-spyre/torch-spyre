@@ -2145,13 +2145,14 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               " at storage offset ", sharded.storage_offset(), ")");
   TORCH_CHECK(host.sizes() == sharded.sizes(),
               "copy shape mismatch: ", host.sizes(), " vs ", sharded.sizes());
-  // Dtype-converting DMA is rejected: converting shard copies are untested
-  // against the D2H conversion path, which bounds its host output by the
-  // host_capacity the DMA factories set.
-  TORCH_CHECK(host.dtype() == sharded.dtype(),
-              "sharded Spyre tensors can only be copied without a dtype "
-              "change (got ",
-              sharded.dtype(), " -> ", host.dtype(), ")");
+  // Copies to the CPU may change the dtype (#5824): each shard's staging
+  // buffer below is allocated in the host dtype, and the D2H conversion is
+  // bounded by that buffer's size (the host_capacity the DMA factories take).
+  // Converting copies to the device are untested and stay rejected.
+  TORCH_CHECK(!host2device || host.dtype() == sharded.dtype(),
+              "sharded Spyre tensors can only be copied to the device "
+              "without a dtype change (got ",
+              host.dtype(), " -> ", sharded.dtype(), ")");
   const auto& info = *sharding_of(sharded)->sharding;
   // A same-size view(dtype) passes the view checks but leaves a tensor whose
   // dtype disagrees with the recorded shard layout; reject it before the copy
@@ -2673,8 +2674,18 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "). Fill the underlying tensor, or a CPU copy, instead.");
   const at::TensorBase& root =
       self.is_view() ? self._base() : static_cast<const at::TensorBase&>(self);
+  // A view(dtype) of a Spyre tensor shares its storage but not its device
+  // layout: it is not a tracked view, and its TensorImpl is not a
+  // SpyreTensorImpl, so there is no layout to check the fill against.
+  // Reading one through a static_cast was undefined behavior (it segfaulted
+  // on p.view(torch.uint8).zero_() of a KV-cache page); reject it instead.
   const auto* root_impl =
-      static_cast<SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+      dynamic_cast<const SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+  TORCH_CHECK(root_impl != nullptr,
+              "fill_/zero_ of a Spyre tensor without a device layout is not "
+              "supported: this is usually a dtype view such as "
+              "t.view(torch.uint8), which shares the storage but not the "
+              "layout. Fill the original tensor instead.");
   int64_t whole_elements = -1;  // -1: unknown, do not check the root
   if (root_impl->has_intact_reservation()) {
     whole_elements = root.numel();

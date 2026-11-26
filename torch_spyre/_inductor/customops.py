@@ -228,6 +228,58 @@ def keep_by_index_cpu(
     return torch.where(mask, values, torch.full_like(values, fill_value))
 
 
+@torch.library.custom_op("spyre::mask_by_index", mutates_args=(), device_types="spyre")
+def mask_by_index(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    pass
+
+
+@mask_by_index.register_fake
+def _(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    return values.new_empty(values.size())
+
+
+@torch.library.register_kernel("spyre::mask_by_index", ["cpu"])
+def mask_by_index_cpu(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    # Normalize dim to handle negative indices
+    dim = dim % values.ndim
+    indices_long = indices.to(torch.long)
+
+    # Create mask: for each position in output, check if value[dim] matches any index
+    mask = torch.zeros_like(values, dtype=torch.bool)
+
+    # For each k in the indices dimension, check which values match
+    for k in range(indices.shape[dim]):
+        idx_k = indices_long.select(dim, k)  # values.shape with dim removed
+        idx_k = idx_k.unsqueeze(dim)  # add back dimension
+
+        # Create coordinate tensor reshaped for broadcasting
+        shape = [1] * values.ndim
+        shape[dim] = values.shape[dim]
+        coords = torch.arange(
+            values.shape[dim], device=values.device, dtype=torch.long
+        ).view(shape)
+
+        # Mark where values[dim] == indices[k, ...]
+        mask = mask | (coords == idx_k)
+
+    return torch.where(mask, torch.full_like(values, fill_value), values)
+
+
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
 def gelu(
     input: torch.Tensor,
@@ -835,6 +887,37 @@ def _constant(
     return fill_value
 
 
+@torch.library.custom_op("spyre::arange", mutates_args=(), device_types="spyre")
+def spyre_arange(
+    length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    column: bool = False,
+    owned: bool = False,
+) -> torch.Tensor:
+    # Marks a cacheable coordinate in the FX graph: the [0, length) ramp, or its
+    # [length, 1] column form when column is set.  Lowering turns this into a
+    # SpyreArangeFallback, whose codegen emits the memoized runtime call.  owned
+    # asks for a private copy rather than the shared cached buffer.  The op has
+    # no eager kernel: an eager torch.arange compiles its decomposition, and only
+    # a frame Dynamo gives up on (past its recompile limit) would reach this.
+    raise RuntimeError(
+        "spyre::arange runs only inside a compiled graph; it has no eager kernel"
+    )
+
+
+@spyre_arange.register_fake
+def _arange(
+    length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    column: bool = False,
+    owned: bool = False,
+) -> torch.Tensor:
+    size = (length, 1) if column else (length,)
+    return torch.empty(size, dtype=dtype, device=device)
+
+
 @torch.library.custom_op("spyre::to_dtype_cpu", mutates_args=(), device_types="spyre")
 def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     warn_fallback(f"conversion from {input.dtype} to {dtype}")
@@ -1200,100 +1283,6 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
-@torch.library.custom_op("spyre::triu_cpu", mutates_args=())
-def triu_cpu(input: torch.Tensor, diagonal: int) -> torch.Tensor:
-    """
-    CPU fallback for torch.triu on dtypes with no Spyre elementwise support.
-
-    The mask-multiply decomposition needs an elementwise mul, which the device
-    rejects for the narrow integral formats (uint8 -> SENUINT32, int8 ->
-    SENINT8, int32 -> IEEE_INT32); torch.where is rejected for the same
-    formats, so there is no on-device masking path at all.  Mirrors
-    max_dim_int64_fallback: the Spyre kernel is registered in fallbacks.py, and
-    this CompositeExplicitAutograd body computes the real result so calls with
-    non-Spyre inputs (e.g. compare_with_cpu paths) still work.
-    """
-    return torch.triu(input, diagonal)
-
-
-@triu_cpu.register_fake
-def _(input: torch.Tensor, diagonal: int) -> torch.Tensor:
-    return torch.empty_like(input)
-
-
-@torch.library.custom_op("spyre::triu_mask", mutates_args=())
-def triu_mask(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Build an upper triangular mask on CPU and transfer to the target device.
-
-    Shape: [H, W] in the input's dtype
-
-    Built entirely on CPU so the construction is opaque to torch.compile —
-    assert_functional_graph is satisfied and the compiled graph only sees the
-    resulting device tensor.  No device_types restriction is set because there
-    are no tensor arguments to dispatch on; the device is an explicit parameter.
-    """
-    cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
-    rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
-    mask = ((cols - rows) >= diagonal).to(dtype=dtype)  # [H, W]
-    return mask.to(device=device)
-
-
-@triu_mask.register_fake
-def _(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.empty(h, w, dtype=dtype, device=device)
-
-
-@torch.library.custom_op("spyre::tril_mask", mutates_args=())
-def tril_mask(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Build a lower triangular 0/1 mask on CPU and transfer to the target device.
-
-    Shape: [H, W] in the requested dtype. Follows ``torch.tril``: element
-    ``(i, j)`` is 1 when ``j - i <= diagonal``, so ``diagonal=0`` keeps the main
-    diagonal and everything below it.
-
-    The mirror of ``spyre::triu_mask``, built the same way for the same
-    reason: construction on CPU is opaque to torch.compile, so
-    assert_functional_graph is satisfied and the compiled graph only sees the
-    resulting device tensor. Linear attention multiplies its intra-chunk scores
-    by this mask (there is no softmax to carry an additive ``-inf`` mask).
-    """
-    cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
-    rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
-    mask = ((cols - rows) <= diagonal).to(dtype=dtype)  # [H, W]
-    return mask.to(device=device)
-
-
-@tril_mask.register_fake
-def _(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.empty(h, w, dtype=dtype, device=device)
-
-
 @torch.library.custom_op(
     "spyre::sliding_window_attention", mutates_args=(), device_types="spyre"
 )
@@ -1514,67 +1503,6 @@ def linear_attention_cpu(
 
 
 @torch.library.custom_op(
-    "spyre::stagger_to_standard_ea", mutates_args=(), device_types="spyre"
-)
-def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
-    """Restore standard Element Arrangement (EA) from staggered EA.
-
-    The fp32todl16 conversion reorders elements when converting fp32 to fp16,
-    producing staggered EA in the output.  This op applies mm(x, P.t()) to
-    permute the last dimension back to standard EA so downstream ops see a
-    normal fp16 tensor.
-
-    The permutation matrix P encodes the hardware fp32→fp16 stagger pattern.
-    Each fp16 stick (64 elements) staggers independently:
-        stick_base = (phys // 64) * 64
-        local_phys = phys % 64
-        k, w = local_phys // 8, local_phys % 8
-        local_logical = k*4 + w            if w < 4
-                      = k*4 + (w-4) + 32   otherwise   (32 = fp16_stick // 2)
-        logical = stick_base + local_logical
-
-    ``half`` is always 32 (half of one fp16 stick), independent of N.
-    N = x.shape[-1] must be a multiple of 64.
-
-    P is built on CPU and transferred to the device.  It is determined solely
-    by N, so it is constant for a given tensor width and can be reused across
-    ops (lt, eq, etc.) that produce the same stagger pattern.
-
-    Input:  fp16 tensor with staggered EA, any shape [..., N]
-    Output: fp16 tensor with standard EA, same shape [..., N]
-    """
-    n = x.shape[-1]
-    device = x.device
-
-    # Build N×N permutation matrix on CPU, transfer to device.
-    # Each fp16 stick (64 elements) staggers independently with half=32.
-    FP16_STICK = 64
-    half = FP16_STICK // 2  # 32 — fixed, independent of n
-    P = torch.zeros(n, n, dtype=x.dtype, device="cpu")
-    for phys_j in range(n):
-        stick_base = (phys_j // FP16_STICK) * FP16_STICK
-        local_phys = phys_j % FP16_STICK
-        k, w = local_phys // 8, local_phys % 8
-        local_logical = k * 4 + w if w < 4 else k * 4 + (w - 4) + half
-        P[stick_base + local_logical, phys_j] = 1.0
-    P = P.to(device=device)
-
-    # Flatten all dims except the last into a single batch dim for mm,
-    # then restore the original shape.  This works for any rank >= 1:
-    # the stagger pattern only affects the last (stick) dimension, so
-    # flattening leading dims produces the correct row ordering for mm.
-    orig_shape = list(x.shape)
-    m = x.numel() // n
-    result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
-    return result
-
-
-@stagger_to_standard_ea.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-@torch.library.custom_op(
     "spyre::compute_grouped_mm_routing_tables",
     mutates_args=(),
 )
@@ -1674,8 +1602,6 @@ mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
 mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
-mark_lx_safe(torch.ops.spyre.triu_mask.default)
-mark_lx_safe(torch.ops.spyre.tril_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
 # them to fallback_ops -- _is_cpu_only_fallback (lx_context_switching.py)

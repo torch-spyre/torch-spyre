@@ -673,52 +673,64 @@ def _fx_cache_key(*args: Any, **kwargs: Any) -> Optional[str]:
     uncacheable graph, or anything unexpected, gives None.
     """
     try:
-        from torch._inductor import config
-        from torch._inductor.codecache import FxGraphCache
-        from torch._inductor.compile_fx import get_input_idxs_to_check
-        from torch_spyre._inductor.decompositions import get_spyre_decomp_table
-
-        if config.force_disable_caches or not config.fx_graph_cache:
-            return None
-        gm = kwargs["gm"] if "gm" in kwargs else args[0]
-        example_inputs = (
-            kwargs["example_inputs"] if "example_inputs" in kwargs else args[1]
-        )
-        graph_kwargs = {
-            k: v
-            for k, v in kwargs.items()
-            if k not in ("gm", "example_inputs", "compile_region_name")
-        }
-        graph_kwargs["get_decomp_fn"] = get_spyre_decomp_table
-        # The defaults compile_fx_inner fills in; they are part of the key.
-        for name, default in (
-            ("cudagraphs", None),
-            ("static_input_idxs", ()),
-            ("is_backward", False),
-            ("graph_id", None),
-            ("cpp_wrapper", False),
-            ("fx_wrapper", False),
-            ("is_inference", False),
-            ("boxed_forward_device_index", None),
-            ("layout_opt", None),
-            ("extern_node_serializer", None),
-        ):
-            graph_kwargs.setdefault(name, default)
-        inputs_to_check = get_input_idxs_to_check(
-            example_inputs, graph_kwargs["static_input_idxs"]
-        )
-        key_info, _ = FxGraphCache.prepare_key(
-            gm, example_inputs, graph_kwargs, inputs_to_check, False
-        )
+        key_info = _fx_cache_key_info(*args, **kwargs)
         return key_info[0] if key_info else None
     except Exception:
         return None
 
 
+def _fx_cache_key_info(*args: Any, **kwargs: Any) -> Optional[tuple]:
+    """``(key, debug lines)`` as ``_fx_cache_key`` computes them, or None for a
+    key-less or uncacheable graph. Raises on anything unexpected."""
+    from torch._inductor import config
+    from torch._inductor.codecache import FxGraphCache
+    from torch._inductor.compile_fx import get_input_idxs_to_check
+    from torch.utils._python_dispatch import _disable_current_modes
+    from torch_spyre._inductor.decompositions import get_spyre_decomp_table
+
+    if config.force_disable_caches or not config.fx_graph_cache:
+        return None
+    gm = kwargs["gm"] if "gm" in kwargs else args[0]
+    example_inputs = kwargs["example_inputs"] if "example_inputs" in kwargs else args[1]
+    graph_kwargs = {
+        k: v
+        for k, v in kwargs.items()
+        if k not in ("gm", "example_inputs", "compile_region_name")
+    }
+    graph_kwargs["get_decomp_fn"] = get_spyre_decomp_table
+    # The defaults compile_fx_inner fills in; they are part of the key.
+    for name, default in (
+        ("cudagraphs", None),
+        ("static_input_idxs", ()),
+        ("is_backward", False),
+        ("graph_id", None),
+        ("cpp_wrapper", False),
+        ("fx_wrapper", False),
+        ("is_inference", False),
+        ("boxed_forward_device_index", None),
+        ("layout_opt", None),
+        ("extern_node_serializer", None),
+    ):
+        graph_kwargs.setdefault(name, default)
+    inputs_to_check = get_input_idxs_to_check(
+        example_inputs, graph_kwargs["static_input_idxs"]
+    )
+    # compile_fx_inner takes its key with the dispatch modes (the fake mode)
+    # turned off.
+    with _disable_current_modes():
+        key_info, _ = FxGraphCache.prepare_key(
+            gm, example_inputs, graph_kwargs, inputs_to_check, False
+        )
+    return key_info
+
+
 def _fx_cache_holds(*args: Any, **kwargs: Any) -> bool:
     """Whether the local FX graph cache already holds this inner compile's graph
     (see ``_fx_cache_key``); anything unexpected counts as a miss."""
-    key = _fx_cache_key(*args, **kwargs)
+    return _fx_cache_has(_fx_cache_key(*args, **kwargs))
+
+
+def _fx_cache_has(key: Optional[str]) -> bool:
     if key is None:
         return False
     try:
@@ -728,6 +740,164 @@ def _fx_cache_holds(*args: Any, **kwargs: Any) -> bool:
         return os.path.isdir(key_dir) and any(True for _ in os.scandir(key_dir))
     except Exception:
         return False
+
+
+AOT_REUSE_ENV = "TORCH_SPYRE_AOT_REUSE_FX"
+
+# The reuse rests on internals of these torch releases: which flags
+# ``compile_fx_inner`` reads, the ``precompile_enabled`` field of the FX key, and
+# why torch keeps the two caches apart (pytorch#156611). On any other release the
+# switch is ignored and ``aot_compile`` compiles as without it. A torch upgrade
+# re-checks ``_pool_graph_state``'s argument and moves this tuple, as it does
+# ``loop_scheduler.SUPPORTED_RELEASES``.
+AOT_REUSE_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
+
+# Process-wide state, like the swap of ``_spyre_inner_compile`` in
+# ``fork_inner_compiles``: compiles run on one thread at a time (Dynamo's compile
+# lock), and neither of the two dicts below is ever cleared.
+#
+# ``_pool_fx_keys`` holds the FX graph cache keys of the graphs a pool of this
+# process compiled in a child (or found in the FX graph cache), kept while
+# ``TORCH_SPYRE_AOT_REUSE_FX=1``, with the key's debug lines, so a lookup that
+# misses can name the fields that differ from the pool's keys. It grows by one
+# entry per graph key a pool sees.
+_pool_fx_keys: dict = {}
+# ``_aot_reuse_counts`` counts the outcomes of ``compile_reusing_pool_graph``.
+_aot_reuse_counts = {"reused": 0, "not seen": 0, "miss": 0}
+_aot_reuse_release_warned = False
+
+
+def _aot_reuse_on() -> bool:
+    global _aot_reuse_release_warned
+    if os.environ.get(AOT_REUSE_ENV, "0") != "1":
+        return False
+    release = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
+    if release in AOT_REUSE_RELEASES:
+        return True
+    if not _aot_reuse_release_warned:
+        _aot_reuse_release_warned = True
+        logger.warning(
+            "aot_compile reuse: %s=1 ignored, torch %s is not a release it was "
+            "checked on (%s)",
+            AOT_REUSE_ENV,
+            torch.__version__,
+            ", ".join(f"{major}.{minor}" for major, minor in AOT_REUSE_RELEASES),
+        )
+    return False
+
+
+def _pool_graph_state(*args: Any, **kwargs: Any) -> tuple:
+    """Whether ``aot_compile`` may take this graph from the FX graph cache.
+
+    ``aot_compile`` sets functorch's ``bundled_autograd_cache``, and then
+    ``compile_fx_inner`` neither reads nor writes the FX graph cache, so every graph
+    a pool child already compiled is compiled again here. The flag is also a field
+    of the FX key (``precompile_enabled``), so the key differs from the child's.
+
+    The key computed as the plain path computes it (flag off) is the child's key:
+    the pool's own second pass finds the children's entries with it. Of what a child
+    changes, only the thread count can enter the key, and only for a graph with CPU
+    C++ code, whose kernels are built for that count; such a graph is not reused.
+
+    Returns ``(state, detail)``. ``state`` is None when this does not apply (switch
+    off, not inside ``aot_compile``), ``"found"`` when the FX graph cache holds the
+    key, ``"not seen"`` when there is no key (a backward graph, or an error) and
+    ``"missing"`` when the cache holds no entry for it; ``detail`` says why, for the
+    log. The entry may come from a pool child or from a plain compile of an earlier
+    start (an upgraded start whose saved ``aot_compile`` files no longer match, with
+    no pool to fork). On ``"found"`` the
+    caller runs the plain ``compile_fx_inner`` with the flag off, which loads that
+    entry: the ``CompiledFxGraph`` a plain compile of this graph returns. The key
+    covers the graph, the inputs (with the Spyre layouts) and the Inductor config,
+    and the other functorch flags ``aot_compile`` sets are read by AOTAutograd only,
+    before the inner compile. The entry holds no trace of the flag: torch adds it to
+    the key so that the FX graph cache and the bundled AOTAutograd cache do not mix
+    their entries (pytorch#156611). Forward graphs only.
+    """
+    # ``config.patch`` below is process-wide too: safe under the same one-thread
+    # rule, and it is undone before the call returns.
+    if not (_aot_reuse_on() and torch._functorch.config.bundled_autograd_cache):
+        return None, ""
+    if kwargs.get("is_backward", False):
+        return "not seen", "a backward graph"
+    try:
+        with torch._functorch.config.patch(bundled_autograd_cache=False):
+            key_info = _fx_cache_key_info(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001 - any error means no reuse
+        return "not seen", f"no FX key: {type(e).__name__}: {e}"
+    if not key_info:
+        return "not seen", "no FX key (cache off or graph not cacheable)"
+    key, lines = key_info
+    if not _fx_cache_has(key):
+        if key in _pool_fx_keys:
+            return "missing", f"key {key}, a pool key, no entry on disk"
+        return "missing", f"key {key}, no entry on disk; {_closest_pool_key(lines)}"
+    source = "a pool key" if key in _pool_fx_keys else "not a pool key"
+    return "found", f"key {key}, {source}"
+
+
+def _closest_pool_key(lines: list) -> str:
+    """Which key fields differ from the pool key closest to ``lines``."""
+    if not _pool_fx_keys:
+        return "the pool noted no key"
+
+    def hashed(key_lines: list) -> set:
+        # "[hash] field: text": compare the hash, not the text, which for an object
+        # without a repr (a custom pass in the Inductor config) holds its address.
+        return {line.split(": ", 1)[0] for line in key_lines}
+
+    def fields(diff: set) -> list:
+        return sorted({line.split("] ", 1)[-1] for line in diff})
+
+    ours = hashed(lines)
+    key, theirs = min(
+        ((k, hashed(v)) for k, v in _pool_fx_keys.items()),
+        key=lambda kv: len(ours ^ kv[1]),
+    )
+    return f"closest pool key {key} differs in: {', '.join(fields(ours ^ theirs))}"
+
+
+def compile_reusing_pool_graph(compile_inner: Callable, *args: Any, **kwargs: Any):
+    """``compile_inner(*args, **kwargs)``, but under ``aot_compile`` with
+    ``TORCH_SPYRE_AOT_REUSE_FX=1`` a graph the FX graph cache holds (left by a pool
+    child or a plain compile) is loaded from there (see ``_pool_graph_state``). Logs
+    one line per such compile: a reuse at INFO, a compile as a warning.
+
+    If torch's lookup then misses (a corrupt entry, or guards that fail under
+    dynamic shapes), that call has already compiled the graph with
+    ``bundled_autograd_cache`` off: the plain path, which writes an FX entry. The
+    result is the same graph, compiled as without the switch."""
+    state, detail = _pool_graph_state(*args, **kwargs)
+    if state is None:
+        return compile_inner(*args, **kwargs)
+    if state != "found":
+        outcome = "not seen" if state == "not seen" else "miss"
+        out = compile_inner(*args, **kwargs)
+    else:
+        from torch._dynamo.utils import counters
+
+        hits = counters["inductor"]["fxgraph_cache_hit"]
+        with torch._functorch.config.patch(bundled_autograd_cache=False):
+            out = compile_inner(*args, **kwargs)
+        if counters["inductor"]["fxgraph_cache_hit"] > hits:
+            outcome = "reused"
+        else:
+            outcome, detail = "miss", detail + ", the FX lookup missed"
+    _aot_reuse_counts[outcome] += 1
+    message = {
+        "reused": "reused FX entry",
+        "not seen": "no FX key, compiled",
+        "miss": "FX miss, compiled",
+    }[outcome]
+    (logger.info if outcome == "reused" else logger.warning)(
+        "aot_compile reuse: %s (%d reused, %d not seen, %d miss so far): %s",
+        message,
+        _aot_reuse_counts["reused"],
+        _aot_reuse_counts["not seen"],
+        _aot_reuse_counts["miss"],
+        detail,
+    )
+    return out
 
 
 @contextlib.contextmanager
@@ -750,7 +920,19 @@ def fork_inner_compiles(
     pool = _Pool(max(1, workers), timeout_s, placeholders)
 
     def inner_compile(*args: Any, **kwargs: Any) -> Any:
-        if _fx_cache_holds(*args, **kwargs):
+        if _aot_reuse_on():
+            # Key the graph once: note the key, then look it up.
+            try:
+                key_info = _fx_cache_key_info(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 - only the reuse is lost
+                key_info = None
+                logger.warning("aot_compile reuse: the pool cannot key a graph: %r", e)
+            if key_info:
+                _pool_fx_keys[key_info[0]] = key_info[1]
+            held = _fx_cache_has(key_info[0] if key_info else None)
+        else:
+            held = _fx_cache_holds(*args, **kwargs)
+        if held:
             # A graph AOTAutograd would not cache (it bypasses graphs that call
             # torch-spyre's Tensor.to) reaches the inner compile on every start, and
             # the FX graph cache answers it in place faster than a fork.
@@ -776,6 +958,8 @@ def fork_inner_compiles(
         spyre_inductor._spyre_inner_compile = original
         pool.wait()
         pool.open = False
+    if _aot_reuse_on():
+        logger.info("aot_compile reuse: the pool noted %d FX keys", len(_pool_fx_keys))
     logger.info(
         "parallel precompile: %d compiles ok (%d with an LX planning solve at its time "
         "limit), %d failed, %d workers, %.1f s",

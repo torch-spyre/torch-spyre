@@ -31,9 +31,10 @@ allocation. Sharded tensors are the smallest faithful implementation of that mod
   intermediate is rejected. Everything else that would touch sharded
   storage is rejected at compile time with a message saying why.
 * **Host copies and fills.** Sharded tensors copy to and from the CPU
-  (whole-tensor, no dtype change), and eager `fill_`/`zero_` fill each
-  shard's own allocation. Device-to-device copies are rejected because they
-  take a single device address.
+  (whole-tensor; copies to the CPU may change the dtype, copies to the
+  device may not), and eager `fill_`/`zero_` fill each shard's own
+  allocation. Device-to-device copies are rejected because they take a
+  single device address.
 
 Beyond the op set, the compiled path admits only a narrow shape regime;
 everything outside it fails at compile time with a specific message:
@@ -42,7 +43,19 @@ everything outside it fails at compile time with a specific message:
   shape — no views, slices, reshapes, broadcasts or reindexing (most views
   of sharded storage are additionally rejected at construction; box views
   are allowed there but only for copies to the CPU; see
-  [Runtime](#runtime-storage-and-addressing-c)).
+  [Runtime](#runtime-storage-and-addressing-c)). Operands sharded
+  differently (`Shard(0)` with `Shard(1)`) are rejected with both placements
+  named: combining them needs data movement between shards.
+* **Unsharded operands are read-only replicas.** A pointwise op on a sharded
+  tensor may also read a scalar (a replicated constant) or a plain unified
+  graph input of the op's shape or broadcast to it, such as a bias along the
+  non-shard dims. Every core reads it with ordinary unified addressing;
+  the result takes the sharded operand's placement. An unsharded operand
+  computed inside the graph, or read by a reduction, is rejected. The
+  one-dtype rule below applies to replicas too, so an fp16 sharded tensor
+  times an fp32 scale (including a 0-d one) is rejected: cast the scale to
+  fp16 first. There is no `Replicate()` placement for `to_sharded` yet: a
+  plain `.to("spyre")` tensor is the replica.
 * Each shard must be a whole device dim of whole sticks: the shard keeps
   the global device layout's dim structure, the shard boundary falls on
   whole sticks for a last-dim shard (a stick cannot be split between
@@ -284,6 +297,11 @@ whose `plan_sharded_hbm` admits a graph for sharded compilation or raises
 2. Every sharded input must agree with the others on placement (shard dim,
    count) — an operand-vs-operand check; each operand's own storage was
    already validated against its receipt when the tensor was created.
+   Unsharded operands of a pointwise op are admitted when they are a scalar
+   constant or a graph input (`_require_replica_source`) of the op's shape
+   or broadcast to it (`_require_replica_read`); they keep ordinary unified
+   addressing, and only the sharded arguments get per-core shard addresses
+   (`verify_mixed_args`).
 3. Only pinned ops may read sharded storage, including
    non-`ComputedBuffer` consumers (fallback kernels), which a separate
    loop catches.
@@ -336,8 +354,9 @@ load-bearing contracts, and where they are pinned:
 * **The neutral receipt contract holds for every backend**
   (`tests/sharding/test_sharding_spec.py`).
 * **The compiled path is correct and isolated**: one shard per core,
-  each core writes only its own shard, sharded and unsharded inputs never
-  share a kernel, and unsupported ops/shardings fail at compile with
+  each core writes only its own shard, a sharded and an unsharded tensor
+  of the same shape never share a cache entry, sharded operands mix with
+  unsharded read-only replicas, and unsupported ops/shardings fail at compile with
   stable messages (`tests/sharding/test_sharded_add.py`).
 
 `test_sharded_add.py` needs a device or the emulation shape (`SENCORES`
