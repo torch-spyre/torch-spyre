@@ -100,6 +100,25 @@ def _dropout_pre(sample: SampleInput) -> SampleInput:
     return sample
 
 
+def _index_copy_pre(sample: SampleInput) -> SampleInput:
+    """Ensure index tensor has unique elements to avoid non-deterministic duplicate writes."""
+    if len(sample.args) >= 2 and torch.is_tensor(sample.input):
+        dim = sample.args[0]
+        index = sample.args[1]
+        if torch.is_tensor(index) and index.numel() > 1:
+            if len(torch.unique(index.cpu())) < index.numel():
+                dim_size = sample.input.size(dim)
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(0x1DE8)
+                    unique_indices = torch.randperm(
+                        dim_size, dtype=index.dtype, device="cpu"
+                    )[: index.numel()].to(index.device)
+                new_args = list(sample.args)
+                new_args[1] = unique_indices
+                sample.args = tuple(new_args)
+    return sample
+
+
 # -----------------------------
 # Wrappers for Tensor methods
 # -----------------------------
@@ -380,6 +399,14 @@ def _tensor_index_copy_(
     return x.index_copy_(dim, index, source)
 
 
+def _tensor_index_copy_reference(
+    x: torch.Tensor, dim: int, index: torch.Tensor, source: torch.Tensor
+):
+    # The traced model passes an int32 index for some index_copy_ calls, but
+    # aten's CPU index_copy_ only accepts a long index.
+    return x.index_copy_(dim, index.long(), source)
+
+
 # -----------------------------
 # OP_REGISTRY: unique ops only
 # -----------------------------
@@ -470,7 +497,11 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     # "torch.scatter_": OpAdapter("torch.scatter_", torch.Tensor.scatter_, is_inplace=True),
     "torch.index_add": OpAdapter("torch.index_add", torch.index_add),
     "torch.index_copy_": OpAdapter(
-        "torch.index_copy_", _tensor_index_copy_, is_inplace=True
+        "torch.index_copy_",
+        _tensor_index_copy_,
+        is_inplace=True,
+        pre=_index_copy_pre,
+        reference=_tensor_index_copy_reference,
     ),
     "torch.masked_fill": OpAdapter("torch.masked_fill", torch.masked_fill),
     "torch.masked_fill_": OpAdapter(
