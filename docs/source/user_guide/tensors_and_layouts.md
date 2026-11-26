@@ -692,6 +692,50 @@ error is raised. Keeping every index below the current size is the caller's
 contract. Only one declared dimension per pool is supported, since a tensor
 declares only dimension 0 today (see the reservation rules above).
 
+#### A trip count read on the device: `active_count`
+
+Some loops run fewer trips than their static count, and only the device knows
+how many: the experts a batch picked in a mixture-of-experts layer, or how many
+tiles of tokens one expert received. `for_each_tile(..., active_count=cnt)`
+makes the loop read its trip count from the tensor `cnt` on the device, right
+before the loop, so the host never waits for the value:
+
+```
+def fn(x, routing):
+    cnt = routing_count(routing)      # [1, 32] float32, written on the device
+
+    def body(_carry, tiles):
+        (tile,) = tiles
+        return None, tile + 1.0
+
+    _carry, out = for_each_tile(
+        body, (x,), dims=(0,), tile_size=G, out_dim=0, active_count=cnt
+    )
+    return out
+```
+
+- The loop runs the first `cnt[0, 0]` tiles, at least one and at most its
+  static trip count; a larger value runs every tile, a value below one runs one.
+- The loop is still written for its static trip count, which is what runs on
+  CPU and in eager mode. Trips past the count must therefore be harmless: read a
+  pad row and write to a row nobody reads.
+- In a nested loop the count may move with the outer loops: each outer trip can
+  read its own row, as in `for_each_tile(outer, (x, cnt), dims=(0, Slice(0, 1)),
+  ...)` with an inner loop passed `active_count=` the outer tile of `cnt`.
+
+The count must be:
+
+- a float32 tensor holding a whole number, on the same device as the
+  operands, and not one of the operands the loop tiles;
+- one 128-byte stick per row (32 float32 values, the count in the first), in
+  standard element order;
+- written by a Spyre op in the same compiled kernel as the loop. A count passed
+  in straight from the host is not supported yet; compute it with one device op,
+  for example `active_count=cnt.abs()`.
+
+The loop must have a static trip count and `reverse=False`. Each of these is
+refused at compile time with an error naming the count.
+
 #### Data Semantics
 
 - **Round trip:** `.to("cpu")` (or `.cpu()`) copies only the tensor's current
