@@ -1843,6 +1843,62 @@ class TestSpyre(TestCase):
         with self.assertRaisesRegex(RuntimeError, "does not support dtype Double"):
             torch.compile(lambda t: t.to(torch.float64))(source)
 
+    @parametrize("case", ["transposed_view_dst", "strided_dst", "transposed_src"])
+    def test_h2d_copy_between_transposed_strides(self, case):
+        """H2D copy_ where host and device strides are a transpose of each other.
+
+        The copy scaled every stride_map value by one slice factor, which is
+        right for a slice but not for a transpose. A contiguous source into a
+        transposed view got only column 0 written, with no error; into an
+        empty_strided tensor it raised "Invalid device sizes and stride map";
+        and a transposed source into a contiguous tensor read past the host
+        buffer, which killed the process (SIGSEGV).
+        """
+        # Integers below 512 are exact on device, so the comparison is exact.
+        values = (torch.arange(256 * 128) % 509).reshape(256, 128).half()
+        src = values
+        if case == "transposed_view_dst":
+            dst = torch.empty(128, 256, dtype=torch.float16, device="spyre").t()
+        elif case == "strided_dst":
+            dst = torch.empty_strided(
+                (256, 128), (1, 256), dtype=torch.float16, device="spyre"
+            )
+        else:
+            dst = torch.empty(256, 128, dtype=torch.float16, device="spyre")
+            src = values.t().contiguous().t()
+        self.assertNotEqual(src.stride(), dst.stride())
+        dst.fill_(777.0)  # not a value of `values`: marks an unwritten element
+        dst.copy_(src)
+        self.assertEqual(dst.cpu(), values, atol=0, rtol=0)
+
+    # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/6404
+    # A missing feature: the plan pairs device dims with host dims from the
+    # source's strides, which fails for this layout with a transposed source.
+    # When the pairing comes from the destination this must copy correctly.
+    @_expect_raise(r"Invalid copy plan: it reaches host element")
+    def test_h2d_copy_transposed_source_into_head_major_layout(self):
+        """H2D copy_ of a sliced, transposed host view into a head-major tensor.
+
+        The head-major layout (the paged KV cache's, and issue #6404's) keeps a
+        host dim between the stick count and the stick. A plan built from a
+        transposed source's strides cannot pair that dim and reaches past the
+        host buffer; the copy is refused instead of reading out of bounds.
+        """
+        E, H, M = 2, 128, 128
+        # Integers below 512 are exact on device, so the comparison is exact.
+        host = (torch.arange(E * 2 * M * H) % 509).reshape(E, 2 * M, H).half()
+        view = host[:, :M, :].transpose(1, 2)  # [E, H, M], sliced and transposed
+        layout = self._head_major_kv_layout(E, H, M, torch.float16)
+        dst = torch.empty(
+            (E, H, M),
+            dtype=torch.float16,
+            device=torch.device("spyre"),
+            device_layout=layout,
+        )
+        dst.fill_(777.0)  # not a value of `host`: marks an unwritten element
+        dst.copy_(view)
+        self.assertEqual(dst.cpu(), view, atol=0, rtol=0)
+
     @parametrize(
         "sizes",
         [

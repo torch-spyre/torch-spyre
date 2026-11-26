@@ -736,6 +736,50 @@ auto get_device_stride_infos(
 }
 
 /*
+ * Refuse a data conversion that reaches past either buffer.
+ *
+ * The host-side conversion walks both buffers with the plan's sizes, strides
+ * and offsets and trusts them, so a plan that reaches past a buffer reads or
+ * writes out of bounds and kills the process. Raising here turns that into an
+ * error the caller can handle.
+ *
+ * The host buffer is read by pre_expand_dcsi_ (H2D) or written by
+ * post_slice_dcsi_ (D2H) when the plan stages through a padded buffer, and by
+ * dcsi_ otherwise; the device is always on the dcsi_ side.
+ *
+ * @param host_elements: elements in the host tensor's storage
+ * @param device_elements: elements in the device layout (device_size)
+ */
+void check_dci_in_bounds(const DataConversionInfo& dci, bool host2device,
+                         int64_t host_elements, int64_t device_elements) {
+  auto check = [](const std::vector<DataConversionStrideInfo>& infos,
+                  bool src_side, int64_t elements, const char* buffer) {
+    for (const auto& info : infos) {
+      const auto& strides = src_side ? info.stride_src_ : info.stride_dst_;
+      int64_t reach = src_side ? info.offset_src_ : info.offset_dst_;
+      bool empty = false;
+      for (size_t k = 0; k < info.size_.size() && k < strides.size(); k++) {
+        if (info.size_[k] <= 0) empty = true;
+        reach += (info.size_[k] - 1) * strides[k];
+      }
+      if (empty) continue;
+      TORCH_CHECK(reach < elements, "Invalid copy plan: it reaches ", buffer,
+                  " element ", reach, " but the ", buffer, " buffer holds ",
+                  elements, " elements");
+    }
+  };
+  if (host2device) {
+    check(dci.pre_expand_dcsi_.empty() ? dci.dcsi_ : dci.pre_expand_dcsi_,
+          /*src_side=*/true, host_elements, "host");
+    check(dci.dcsi_, /*src_side=*/false, device_elements, "device");
+  } else {
+    check(dci.post_slice_dcsi_.empty() ? dci.dcsi_ : dci.post_slice_dcsi_,
+          /*src_side=*/false, host_elements, "host");
+    check(dci.dcsi_, /*src_side=*/true, device_elements, "device");
+  }
+}
+
+/*
  * Generate description of data conversion for a tensor.
  *
  * @param cpu_tensor: CPU-side tensor (source for H2D, destination for D2H)
@@ -1034,7 +1078,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   if (host2device) {
     // If the dev_strides do not match the cpu_strides then the cpu_tensor is
-    // sliced and/or expanded.
+    // sliced, expanded and/or permuted.
     if (cpu_strides != dev_strides) {
       // In these cases we update the stride_map of the SpyreTensorLayout to
       // reflect the cpu_strides instead of the dma_strides.
@@ -1084,42 +1128,23 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
       stl.stride_map = dst_stride_map;
 
-      // Adjust the dst_stride_map for all sliced dimension by multiplying all
-      // other stride values greater than or equal to the sliced stride value
-      // by the amount sliced.
-      std::vector<int64_t> cpu_order(host_rank);
-      std::iota(cpu_order.begin(), cpu_order.end(), 0);
-      std::sort(cpu_order.begin(), cpu_order.end(),
-                [&cpu_strides, &cpu_sizes](int64_t i1, int64_t i2) {
-                  if (cpu_strides[i1] == cpu_strides[i2]) {
-                    if (cpu_sizes[i1] == 1 && cpu_sizes[i2] == 1) {
-                      return i1 < i2;
-                    }
-                    return cpu_sizes[i1] == 1;
-                  }
-                  return cpu_strides[i1] < cpu_strides[i2];
-                });
-
-      std::multimap<int64_t, int64_t> slices;
-      int64_t current_slices = 1;
-      for (const auto& i : cpu_order) {
+      // Re-express each stride_map value through the host dimension it tiles:
+      // a multiple of that dimension's dst_stride becomes the same multiple of
+      // its cpu_stride. Scaling per dimension covers a sliced host tensor and
+      // a permuted one (e.g. a transpose). One factor applied to every larger
+      // value, as before, is right only when the host keeps the device's
+      // dimension order: a transpose wrote one column or read past the host
+      // buffer.
+      for (int i = 0; i < host_rank; i++) {
         const int64_t cpu_stride = cpu_strides[i];
         const int64_t dev_stride = dst_strides[i];
         TORCH_CHECK(
             dev_stride > 0,
             "Invalid destination stride. Expected > 0, got: ", dev_stride);
-        const int64_t slice = cpu_stride / dev_stride / current_slices;
-        if (slice > 1) {
-          slices.insert({dev_stride, slice});
-          current_slices *= slice;
-        }
-      }
-
-      for (int i = 0; i < device_rank; i++) {
-        if (dst_stride_map[i] <= 0) continue;
-        for (const auto& [stride, slice] : slices) {
-          if (stl.stride_map[i] < stride) continue;
-          dst_stride_map[i] *= slice;
+        if (cpu_stride == 0) continue;  // expanded: zeroed above
+        for (const int& j : tile_map[i]) {
+          if (dst_stride_map[j] <= 0) continue;
+          dst_stride_map[j] = dst_stride_map[j] / dev_stride * cpu_stride;
         }
       }
 
@@ -1334,6 +1359,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.exportJson(s);
     SPYRE_RUNTIME_DEBUG() << "DataConversionInfo: " << s.str();
   }
+  check_dci_in_bounds(dci, host2device,
+                      static_cast<int64_t>(cpu_tensor->storage().nbytes()) /
+                          static_cast<int64_t>(cpu_tensor->element_size()),
+                      c10::multiply_integers(stl.device_size));
   return dci;
 }
 
