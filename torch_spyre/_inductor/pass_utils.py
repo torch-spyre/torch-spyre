@@ -18,7 +18,7 @@ import math
 import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -79,7 +79,7 @@ from .core_mapping import (
 )
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
     MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
@@ -133,6 +133,10 @@ _SPYRE_METADATA_ATTRS = (
     # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
     # since that module imports this one (through pass_utils).
     "_work_division_chosen_with_tiling",
+    # Marks an element-arrangement shuffle copy inserted by insert_ea_shuffle;
+    # passes find them by this tag, and must still see it after any
+    # rebuild of the buffer (e.g. when its input is redirected).
+    "ea_shuffle",
 )
 
 
@@ -1978,9 +1982,9 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     set membership on dep.index.free_symbols alone (see issue #3888): both are
     "in y and the output, but not in x".
 
-    op.loop_member.loop_tiled_dims (stamped by coarse-tiling before layout
-    propagation runs, per passes.py's pass ordering) lists, per nesting
-    level, the raw op.data.ranges positions this loop group tiles -- for the
+    Each of the op's loop levels' ``tiled_dims`` (``enclosing_loops``; coarse-tiling
+    records them before layout propagation runs, per passes.py's pass ordering)
+    lists the raw op.data.ranges positions this loop group tiles -- for the
     innermost tile-body op itself, this op's own write is already the
     tile-local slice, so loop_tiled_dims is the only surviving
     signal identifying which raw dims the enclosing loop nest tiles at all.
@@ -2803,7 +2807,7 @@ def select_work_division_transport_indexes(
     if write is None:
         raise Unsupported(f"{op.get_name()} has no MemoryDep write for work division")
     write_index = write.index
-    if is_keep_by_index(op):
+    if is_index_masking_op(op):
         reduction_vars = set(it_space) - write_index.free_symbols
         read_index = read_with_max_reduction_overlap(rw.reads, reduction_vars)
         if read_index is not None:
@@ -4629,12 +4633,12 @@ def is_topk(op: Operation) -> bool:
     )
 
 
-def is_keep_by_index(op: Operation) -> bool:
-    """Return True iff ``op`` is a ``ComputedBuffer`` computing a keep_by_index reduction."""
+def is_index_masking_op(op: Operation) -> bool:
+    """Return True iff ``op`` is a keep_by_index or mask_by_index reduction."""
     return (
         isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
-        and op.data.reduction_type == KEEP_BY_INDEX_OP
+        and op.data.reduction_type in INDEX_MASKING_OPS
     )
 
 
@@ -4664,7 +4668,8 @@ def read_with_max_reduction_overlap(
     return best_read
 
 
-class _ViewPrep(NamedTuple):
+@dataclass(frozen=True)
+class _ViewPrep:
     """Candidate-invariant precompute shared across every core-division
     candidate of one ``(op, dep, buf_name)``.
 
@@ -4693,6 +4698,14 @@ class _ViewPrep(NamedTuple):
     num_stick: int
     num_stick_stride: int
     is_matmul: bool
+    # Finished views of this ``(op, dep, buf_name)``, keyed by candidate (see
+    # ``_per_core_view_from_prep``). Every prep gets its own dict.
+    view_cache: dict = field(default_factory=dict, compare=False, repr=False)
+    # ``direct_axis_ownership_failure`` results, keyed by ``(sym, dev_dim,
+    # extent, sym's split, physical split)``: with the prep fixed, those
+    # determine every argument, and candidates that share them repeat the
+    # same proof.
+    ownership_proofs: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 def _prepare_per_core_view(
@@ -4781,7 +4794,40 @@ def _per_core_view_from_prep(
     *,
     ownership: TensorWorkDivision | None = None,
 ) -> tuple[PerCoreView, bool, bool]:
-    """Evaluate a view from complete symbol-keyed ownership or candidate splits."""
+    """Evaluate a view from complete symbol-keyed ownership or candidate splits.
+
+    Views from candidate splits are memoized on ``prep``: the same producer and
+    consumer candidates are viewed once per residency edge they take part in.
+    The result depends only on ``prep``, the splits, whether any reduction axis
+    is split, and the three config flags read below, and it is immutable.
+    """
+    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
+    if ownership is not None or prep is None:
+        return _per_core_view_from_prep_uncached(
+            prep, splits, has_partial_reduction, ownership=ownership
+        )
+    key = (
+        frozenset(splits.items()),
+        has_partial_reduction,
+        config.lx_planner_relayout,
+        config.lx_extended_ownership,
+        config.core_id_k_fast_emission,
+    )
+    result = prep.view_cache.get(key)
+    if result is None:
+        result = _per_core_view_from_prep_uncached(prep, splits, has_partial_reduction)
+        prep.view_cache[key] = result
+    return result
+
+
+def _per_core_view_from_prep_uncached(
+    prep: Optional[_ViewPrep],
+    splits: dict[sympy.Symbol, int],
+    has_partial_reduction: bool,
+    *,
+    ownership: TensorWorkDivision | None = None,
+) -> tuple[PerCoreView, bool, bool]:
+    """``_per_core_view_from_prep`` without the cache."""
     num_cores = (
         ownership.physical_core_count
         if ownership is not None
@@ -4988,13 +5034,22 @@ def _per_core_view_from_prep(
                 extent = padded_extent
             # Prove every logical partition, independent of the physical core
             # order. Step 4 preserves that order using the same partition IDs.
-            if reason := direct_axis_ownership_failure(
-                extent,
-                per_sym[sym],
-                prep.dep_device_coordinates[dev_dim].xreplace({sym: _LOOP_POINT}),
-                device_size[dev_dim],
-                split,
-            ):
+            proof_key = (sym, dev_dim, extent, per_sym[sym], split)
+            if proof_key in prep.ownership_proofs:
+                reason = prep.ownership_proofs[proof_key]
+            else:
+                reason = prep.ownership_proofs[proof_key] = (
+                    direct_axis_ownership_failure(
+                        extent,
+                        per_sym[sym],
+                        prep.dep_device_coordinates[dev_dim].xreplace(
+                            {sym: _LOOP_POINT}
+                        ),
+                        device_size[dev_dim],
+                        split,
+                    )
+                )
+            if reason:
                 logger.debug(
                     "cannot prove stride-selected ownership for iteration %s "
                     "on device dim %s: %s; require exact decomposition",
@@ -5116,7 +5171,6 @@ def _per_core_view_from_prep(
         core_to_slot=tuple(pruned_core_to_slot),
         num_cores=num_cores,
     )
-    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
     return (view, has_partial_reduction, True)
 
 
@@ -5492,8 +5546,8 @@ def format_operations(operations: list[Operation]) -> str:
             if dim_hints := getattr(op, "dim_hints", None):
                 buf.write(f"\n  dim_hints={dim_hints}")
             if levels := enclosing_loops(op):
-                # No induction: a node knows it, the flat path's stamp does not,
-                # and the two paths' dumps are compared.
+                # (group path, trip count, tiled dims, tiled reduction dims) per
+                # level; test_loop_scheduler_readers pins the format.
                 buf.write(
                     "\n  loop_levels="
                     f"{[(x.group_path, x.trip_count, x.tiled_dims, x.tiled_reduction_dims) for x in levels]}"

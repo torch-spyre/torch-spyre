@@ -52,6 +52,8 @@ from .constants import (
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
+    SHUFFLE_OP,
+    STAGGERED_EAS,
 )
 from . import config as _spyre_config
 from .core_mapping import (
@@ -118,6 +120,8 @@ from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
+
+_ALL_EAS = frozenset({ElementArrangement.STANDARD, *STAGGERED_EAS})
 
 
 class RValue(ABC):
@@ -282,6 +286,10 @@ class SpyreOpFuncs:
     @staticmethod
     def keep_by_index(x, indices):
         return ReductionOp("keepbyindex", [x, indices])
+
+    @staticmethod
+    def mask_by_index(x, indices):
+        return ReductionOp("maskbyindex", [x, indices])
 
     @staticmethod
     def layernormnorm(*args):
@@ -602,6 +610,47 @@ def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
     return placement.shard_device_bytes
 
 
+# TODO(#6175): share one symbol finder with sharded_hbm._shard_symbol
+# (and fold _reduced_input_dims in) when the matmul work shapes it.
+def _non_unified_shard_dim(
+    name: str,
+    layout: FixedTiledLayout,
+    it_space: dict[sympy.Symbol, sympy.Expr],
+    index: sympy.Expr,
+) -> sympy.Symbol | None:
+    """The shard-dim symbol of ``name``'s sharding in ``it_space``'s namespace.
+
+    The sharded planner pins the op's work split on the shard dim's iteration
+    symbol, but it traces read/writes before scheduling, and Inductor mints
+    fresh index symbols on every trace -- the planner's symbol and the
+    scheduler-node iteration space's symbol for the same dim can differ in
+    name (measured: planner ``d0`` vs iteration space ``c0``). So the symbol
+    is re-derived here, against the same iteration space the SDSC is emitted
+    from, by the shard dim's coefficient and extent in this tensor's access
+    index -- the same identification ``sharded_hbm._shard_symbol`` uses when
+    pinning the split. ``None`` when the tensor is not sharded storage.
+    """
+    placement = placement_of(name)
+    if placement is None:
+        return None
+    size = [int(s) for s in layout.size]
+    s = placement.shard_dim
+    if not 0 <= s < len(size):
+        raise Unsupported(f"{name}: shard dim {s} out of range for shape {size}")
+    stride = sympy.Integer(math.prod(size[s + 1 :]))
+    matches = [
+        sym
+        for sym, extent in it_space.items()
+        if index.coeff(sym) == stride and int(extent) == size[s]
+    ]
+    if len(matches) != 1:
+        raise Unsupported(
+            f"{name}: cannot identify the shard dim {s} in the iteration space "
+            f"by its stride {stride} and extent {size[s]} (candidates: {matches})"
+        )
+    return matches[0]
+
+
 def _matching_read_deps(
     read_deps: "list[MemoryDep]", name: str, mutation_real_name: "dict[str, str]"
 ) -> "list[tuple[int, MemoryDep]]":
@@ -624,6 +673,10 @@ def _matching_read_deps(
         for i, dep in enumerate(read_deps)
         if mutation_real_name.get(dep.name, dep.name) == name
     ]
+
+
+def _is_shuffle(in_ea, out_ea) -> bool:
+    return in_ea != out_ea and {in_ea, out_ea} <= _ALL_EAS
 
 
 class SpyreKernel(Kernel[CSEVariable]):
@@ -983,6 +1036,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
             non_unified_shard_bytes=_non_unified_shard_bytes(name, tensor.layout),
+            non_unified_shard_dim=_non_unified_shard_dim(
+                name, tensor.layout, it_space, tensor.index
+            ),
             stride_map=list(tensor.layout.device_layout.stride_map),
         )
         if (
@@ -1098,7 +1154,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 continue
             # Check if operation supports the argument's dtype
             if not (
-                op == IDENTITY_OP
+                op in (IDENTITY_OP, SHUFFLE_OP)
                 or (
                     op == RESTICKIFY_OP
                     and arg.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
@@ -1477,8 +1533,12 @@ class SpyreKernel(Kernel[CSEVariable]):
 
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
+            in_ea = args[-2].element_arrangement
+            out_ea = args[-1].element_arrangement
             if is_restickify_coords(in_coords, out_coords):
                 op = RESTICKIFY_OP
+            elif _is_shuffle(in_ea, out_ea) and not indirect_syms_used:
+                op = SHUFFLE_OP
             else:
                 op = IDENTITY_OP
             op_spec = self.create_op_spec(
@@ -1954,6 +2014,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         "count_symbol_sources="
                         f"{_serialize_value(op_spec.count_symbol_sources)},"
                     )
+                if op_spec.count_from_buffer is not None:
+                    buf.writeline(
+                        "count_from_buffer="
+                        f"{_serialize_value(op_spec.count_from_buffer)},"
+                    )
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)
@@ -2062,6 +2127,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(
                                     "non_unified_shard_bytes="
                                     f"{arg.non_unified_shard_bytes},"
+                                )
+                            if arg.non_unified_shard_dim is not None:
+                                buf.writeline(
+                                    "non_unified_shard_dim="
+                                    f"{sympy_str(arg.non_unified_shard_dim)},"
                                 )
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(

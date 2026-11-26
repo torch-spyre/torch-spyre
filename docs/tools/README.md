@@ -10,8 +10,8 @@ not hand-editing stale snippets from memory.
 
 Regenerates
 every IR/OpSpec/`bundle.mlir` snippet quoted in
-[`docs/source/compiler/coarse_tiling_loops.md`](../source/compiler/coarse_tiling_loops.md)'s
-"Small Example" section for the `for_each_tile`-driven version of the
+[`docs/source/compiler/loop_nodes.md`](../source/compiler/loop_nodes.md)'s
+"Worked example" section for the `for_each_tile`-driven version of the
 example (`y = a + b; z = y * c`, tiled along dim 0 with `for_each_tile`
 instead of nested `spyre_hint` scopes).
 
@@ -26,7 +26,7 @@ python3 docs/tools/capture_for_each_tile_ir.py > /tmp/for_each_tile_capture.txt 
 This produces three sections: the
 `graph.operations` IR dump, the generated OpSpec/LoopSpec Python wrapper
 source, and the generated `bundle.mlir` — for the single-level loop
-`for_each_tile` stamps directly via `_stamp_direct_loop_info`.
+`for_each_tile` records directly via `_stamp_direct_loop_info`.
 
 ### Backend-compiler mock
 
@@ -50,7 +50,7 @@ side effect fails that check even though the mocked subprocess "succeeded."
 | `--size-a` | `1024` | Size of dim 0 |
 | `--size-b` | `4096` | Size of dim 1 |
 | `--sencores` | `4` | `SENCORES` value (kept small so the dumped IR stays readable) |
-| `--debug` | off | Log at `DEBUG` instead of `INFO`; combine with `SPYRE_LOG_PASSES` for per-pass dumps, e.g. `SPYRE_LOG_PASSES=splice_while_loops` to see `loop_info` immediately after `for_each_tile`'s own stamping pass |
+| `--debug` | off | Log at `DEBUG` instead of `INFO`; combine with `SPYRE_LOG_PASSES` for per-pass dumps, e.g. `SPYRE_LOG_PASSES=splice_while_loops` to see the loop immediately after `for_each_tile`'s own splice pass |
 
 Changing the shape flags means
 re-deriving every quoted numeric value in the doc from a fresh capture,

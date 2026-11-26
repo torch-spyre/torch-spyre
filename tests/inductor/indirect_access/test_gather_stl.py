@@ -66,7 +66,6 @@ from utils_inductor import (
 )
 from conftest import (
     gap_one_core,
-    _xfail_existing,
     compare_mode,
     dl16_snap,
     expect_dynamic_true_refused,
@@ -103,11 +102,6 @@ _INDEX_EAGER = rejection(
     1219,
     "aten::index.Tensor_out is not registered on Spyre.",
     r"Could not run 'aten::index\.Tensor_out'",
-)
-_FP16_TO_FP32_EAGER = (
-    5856,
-    "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 
 
@@ -617,8 +611,6 @@ class TestGatherExplicitStl4Arg:
 
     def test_4arg_with_downstream_softmax(self, execution_mode):
         """4-arg STL + softmax(dim=-1) after KV gather; (512,8,64) stick-aligned shape."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         x = cached_randn((512, 8, 64), differentiation="e4arg07", dtype=torch.float16)
         idx = torch.randint(0, 512, (32,), dtype=torch.int64)
         self._run(
