@@ -24,6 +24,7 @@ from torch._inductor.graph import GraphLowering
 
 from .loop_node import LoopCarryRecord
 from .loop_node import LoopNode, all_ops, remove_op
+from .loop_node import _nodes_in as loop_nodes_in
 
 
 def live_operations(graph: GraphLowering) -> frozenset[str]:
@@ -43,6 +44,12 @@ def live_operations(graph: GraphLowering) -> frozenset[str]:
     live_bufs: set[str] = set(graph.get_output_names())
     live_bufs |= set(graph.graph_inputs)
     live_bufs |= set(graph.constants)
+    # A pass's flat view (OpsView) shows no LoopNode, so a loop's read of its
+    # device-read trip count is in no op's reads: keep each count buffer.
+    for node in loop_nodes_in(getattr(operations, "real", operations)):
+        source = getattr(node, "count_source", None)
+        if source is not None:
+            live_bufs.add(source.buffer)
     live_ops: set[str] = set()
     # Nothing edits an op while liveness is computed, so trace each op once
     # rather than once per fixed-point iteration.

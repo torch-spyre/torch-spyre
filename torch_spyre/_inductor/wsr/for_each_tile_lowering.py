@@ -3543,3 +3543,60 @@ def splice_while_loops(graph) -> None:
                 for loop_var, _trip, level_group_idx, _names in pending_levels
             },
         )
+        _take_active_counts(graph)
+
+
+def _take_active_counts(graph) -> None:
+    """Record each ``for_each_tile(active_count=...)`` count on its loop.
+
+    The marker (``spyre::active_count_marker``) is a one-element read of the
+    count in the body of the loop it counts. Its read, the count buffer and the
+    index over the enclosing loop variables, becomes the ``LoopNode``'s
+    ``count_source``, and the marker is removed: it is compile-time only.
+    """
+    from torch._inductor.dependencies import MemoryDep
+
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.loop_node import (
+        LoopCountSource,
+        LoopNode,
+        all_ops,
+        remove_op,
+    )
+
+    def is_marker(op) -> bool:
+        return getattr(op, "active_count_max", None) is not None
+
+    def visit(entries) -> None:
+        for node in [e for e in entries if isinstance(e, LoopNode)]:
+            visit(node.body)
+            markers = [op for op in node.body if is_marker(op)]
+            if not markers:
+                continue
+            if len(markers) > 1:
+                raise Unsupported(
+                    f"loop {node.get_name()} has {len(markers)} active_count "
+                    "markers; a loop has one trip count"
+                )
+            (marker,) = markers
+            reads = [
+                d for d in marker.get_read_writes().reads if isinstance(d, MemoryDep)
+            ]
+            if len(reads) != 1:
+                raise Unsupported(
+                    f"active_count marker {marker.get_name()} should read exactly "
+                    f"one buffer, reads {[d.name for d in reads]}"
+                )
+            (read,) = reads
+            node.count_source = LoopCountSource(
+                buffer=read.name,
+                index=read.index,
+                max_value=int(marker.active_count_max),
+            )
+            remove_op(graph.operations, marker)
+            graph.removed_buffers.add(marker.get_name())
+
+    visit(graph.operations)
+    stray = [op.get_name() for op in all_ops(graph.operations) if is_marker(op)]
+    if stray:
+        raise Unsupported(f"active_count marker(s) {stray} outside any loop")

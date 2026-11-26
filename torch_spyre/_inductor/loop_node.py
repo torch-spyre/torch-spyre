@@ -84,6 +84,23 @@ class LoopCarryRecord:
     storage_view: Any = field(default=None, compare=False, repr=False)
 
 
+@dataclass(frozen=True)
+class LoopCountSource:
+    """Where a loop whose trip count is read on the device finds that count.
+
+    Set by ``splice_while_loops`` from ``for_each_tile(active_count=...)``. The
+    count is the FP32 value at element ``index`` of ``buffer``; ``index`` is over
+    the enclosing loops' induction variables, so a nested loop can read a
+    different count on each outer trip. ``max_value`` is the static trip count,
+    the most trips the loop can take. Kernel codegen turns it into the loop's
+    ``CountSource`` once pooling has placed ``buffer``.
+    """
+
+    buffer: str
+    index: sympy.Expr
+    max_value: int
+
+
 @dataclass
 class LoopMember:
     """What a loop lowering says about an op it puts in a loop: ``op.loop_member``.
@@ -186,6 +203,9 @@ class LoopNode(ir.Operation):
         )
         self.stream_idx: int | None = None
         self.mempool: Any = None
+        # Set when the trip count is read on the device (``for_each_tile``'s
+        # ``active_count``); None for a loop that always runs ``trip_count`` trips.
+        self.count_source: LoopCountSource | None = None
 
     # ir.Operation's dataclass __eq__ compares (empty) field tuples, so any two
     # LoopNodes would compare equal and ``list.remove`` could take the wrong
@@ -239,7 +259,8 @@ class LoopNode(ir.Operation):
     def get_read_writes(self) -> dependencies.ReadWrites:
         """The plain union of the body's reads and writes, plus one ``StarDep``
         write per body mutation target, so a pass that judges liveness by
-        writes sees that the loop writes into storage it does not own."""
+        writes sees that the loop writes into storage it does not own, and a
+        ``StarDep`` read of the count buffer when ``count_source`` is set."""
         reads: OrderedSet[dependencies.Dep] = OrderedSet()
         writes: OrderedSet[dependencies.Dep] = OrderedSet()
         for op in self.body:
@@ -248,6 +269,10 @@ class LoopNode(ir.Operation):
             writes |= OrderedSet(rw.writes)
         for target in self.mutation_targets():
             writes.add(dependencies.StarDep(target))
+        if self.count_source is not None:
+            # The loop reads its count before every trip, so the count's
+            # producer stays live and runs first.
+            reads.add(dependencies.StarDep(self.count_source.buffer))
         return dependencies.ReadWrites(reads, writes, OrderedSet())
 
     def has_side_effects(self) -> bool:

@@ -12,17 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""for_each_tile(active_count=...): the keyword's checks, and the marker that
-reads the count once in the loop body so the capture keeps it.
+"""for_each_tile(active_count=...): the keyword's checks, the marker that reads
+the count once in the loop body so the capture keeps it, and the loop's
+``count_source`` that the splice makes from it, with its read edges.
 
-No device needed.
+No device needed: the IR is stand-ins.
 """
 
 import unittest
+from types import SimpleNamespace
 
+import sympy
 import torch
+from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep
+from torch.utils._ordered_set import OrderedSet
 
+from torch_spyre._inductor.deadcode_elimination import live_operations
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.loop_checker import find_violations
+from torch_spyre._inductor.loop_node import LoopCountSource, LoopNode, OpsView
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+from torch_spyre._inductor.wsr.for_each_tile_lowering import _take_active_counts
+
+
+U0, U1 = sympy.Symbol("u0", integer=True), sympy.Symbol("u1", integer=True)
+
+
+class _Op:
+    """A stub op: a name, the buffers it reads and the index it reads them at."""
+
+    def __init__(self, name, reads=(), index=sympy.Integer(0), **attrs):
+        self._name = name
+        self._reads = list(reads)
+        self._index = sympy.sympify(index)
+        self.__dict__.update(attrs)
+
+    def get_name(self):
+        return self._name
+
+    get_operation_name = get_name
+
+    def get_outputs(self):
+        return [self]
+
+    def get_read_writes(self):
+        reads = OrderedSet(MemoryDep(r, self._index, (), ()) for r in self._reads)
+        writes = OrderedSet([MemoryDep(self._name, sympy.Integer(0), (), ())])
+        return ReadWrites(reads, writes, OrderedSet())
+
+    def __repr__(self):
+        return f"_Op({self._name})"
+
+
+def _marker(name, count, index, max_value=4):
+    return _Op(name, reads=[count], index=index, active_count_max=max_value)
+
+
+def _node(name, body, induction=U0):
+    return LoopNode(name, body, induction=induction, trip_count=4)
+
+
+def _counted(name, body, buffer="cnt", index=sympy.Integer(0), induction=U0):
+    node = _node(name, body, induction)
+    node.count_source = LoopCountSource(buffer, index, 4)
+    return node
+
+
+def _graph(ops, inputs=()):
+    return SimpleNamespace(
+        operations=list(ops),
+        removed_buffers=set(),
+        graph_inputs={name: None for name in inputs},
+        constants={},
+        get_output_names=lambda: [],
+    )
 
 
 class TestTheSpelling(unittest.TestCase):
@@ -116,6 +179,67 @@ class TestTheMarker(unittest.TestCase):
     def test_fx_keeps_it_although_nothing_reads_it(self):
         op = torch.ops.spyre.active_count_marker.default
         self.assertIn(op, torch.fx.node._side_effectful_functions)
+
+
+class TestTheSplice(unittest.TestCase):
+    """Plan 2.3: the splice records the marker's read on its loop and removes
+    the marker."""
+
+    def test_the_read_becomes_the_loops_count_source(self):
+        marker = _marker("m", "cnt", 32 * U0)
+        inner = _node("inner", [_Op("t"), marker], induction=U1)
+        outer = _node("outer", [inner])
+        graph = _graph([_Op("cnt"), outer])
+        _take_active_counts(graph)
+        self.assertEqual(inner.count_source, LoopCountSource("cnt", 32 * U0, 4))
+        self.assertIsNone(outer.count_source)
+        self.assertNotIn(marker, inner.body)
+        self.assertIn("m", graph.removed_buffers)
+
+    def test_two_markers_in_one_loop_are_refused(self):
+        loop = _node("loop", [_marker("m1", "a", 0), _marker("m2", "b", 0)])
+        with self.assertRaisesRegex(Unsupported, "2 active_count markers"):
+            _take_active_counts(_graph([loop]))
+
+    def test_a_marker_outside_any_loop_is_refused(self):
+        with self.assertRaisesRegex(Unsupported, "outside any loop"):
+            _take_active_counts(_graph([_marker("m", "cnt", 0)]))
+
+
+class TestTheReadEdges(unittest.TestCase):
+    """Item 4: the loop reads its count, so the count's writer stays live and
+    runs first."""
+
+    def test_the_loop_node_reads_the_count(self):
+        loop = _counted("loop", [_Op("t")])
+        self.assertIn(StarDep("cnt"), loop.get_read_writes().reads)
+
+    def test_dead_code_elimination_keeps_the_count(self):
+        """A pass sees the leaves only (OpsView), and no leaf reads the count."""
+        graph = _graph([])
+        graph.operations = OpsView(
+            [_Op("cnt"), _counted("loop", [_Op("t", reads=["x"])])]
+        )
+        graph.get_output_names = lambda: ["t"]
+        self.assertIn("cnt", live_operations(graph))
+
+    def test_a_count_written_before_the_loop_is_fine(self):
+        ops = [_Op("cnt"), _counted("loop", [_Op("t")])]
+        self.assertEqual(find_violations(ops, inputs=set()), [])
+
+    def test_a_count_written_inside_the_loop_is_flagged(self):
+        ops = [_counted("loop", [_Op("cnt"), _Op("t")])]
+        problems = find_violations(ops, inputs=set())
+        self.assertTrue(any("written inside the loop" in p for p in problems))
+
+    def test_a_count_nothing_writes_is_flagged(self):
+        problems = find_violations([_counted("loop", [_Op("t")])], inputs=set())
+        self.assertTrue(any("no op writes" in p for p in problems))
+
+    def test_a_graph_input_count_is_not_a_structure_error(self):
+        """It is refused at codegen instead, with a message for the user."""
+        ops = [_counted("loop", [_Op("t")])]
+        self.assertEqual(find_violations(ops, inputs={"cnt"}), [])
 
 
 if __name__ == "__main__":
