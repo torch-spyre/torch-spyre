@@ -19,6 +19,38 @@ on:
         required: false
         type: string
         default: ops-core
+      # The six below complete the contract the Jenkins orchestrator dispatches with (the bench cell's
+      # config.gha.inputs in spyre-frameworks); GitHub 422s the whole dispatch on one this file omits.
+      repository:
+        description: Repository the ref belongs to (owner/name); empty = this one
+        required: false
+        type: string
+        default: ''
+      runner_label:
+        description: Standing runner-set label to target; empty = the default one-card set
+        required: false
+        type: string
+        default: ''
+      prebaked_image:
+        description: Image under test, recorded on the rows when the identity job derives nothing
+        required: false
+        type: string
+        default: ''
+      run_id:
+        description: Stored run id for the rows (the orchestrator's per-leg uuid); empty = the collector derives one
+        required: false
+        type: string
+        default: ''
+      purpose:
+        description: BENCH_PURPOSE recorded on the rows (nightly, weekly, on-demand)
+        required: false
+        type: string
+        default: on-demand
+      test_type:
+        description: Trigger type recorded on the rows
+        required: false
+        type: string
+        default: perf
       clickhouse_env:
         description: >-
           Which ClickHouse instance receives the rows: "dev" (default) or "prod". Prod only when
@@ -69,7 +101,7 @@ env:
   PREBAKED_VENV_PATH: /home/senuser/.venv
   RUNNER_SETUP_SCRIPT: /etc/profile.d/ibm-aiu-setup.sh
   BENCH_SELECTION: ${{ inputs.selection || 'ops-core' }}
-  BENCH_PURPOSE: on-demand
+  BENCH_PURPOSE: ${{ inputs.purpose || 'on-demand' }}
   BENCH_ENVIRONMENT: one-device
   BENCH_REUSE: never
   BENCH_INVOKER: gha
@@ -96,6 +128,7 @@ jobs:
       - name: Checkout the identity action, script and library
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.sha }}
           sparse-checkout: |
             .github/actions/derive-gha-artifact-id
@@ -115,7 +148,9 @@ jobs:
     name: On-demand op benchmarks (advisory)
     needs: [artifact_identity]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(inputs.smoke && '["ubuntu-latest"]' || '["x86_64","spyre_pf_x1","linux","image_spyre_backend"]') }}
+    # smoke wins (hosted, card-free); then a caller-named standing set; else the default one-card set.
+    runs-on: ${{ inputs.smoke && fromJSON('["ubuntu-latest"]') || inputs.runner_label != '' && fromJSON(format('["{0}"]', inputs.runner_label)) || fromJSON('["x86_64","spyre_pf_x1","linux","image_spyre_backend"]')
+      }}
     timeout-minutes: 240
     # Advisory: a failing benchmark never turns the workflow red or blocks anything.
     continue-on-error: true
@@ -147,6 +182,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.sha }}
           sparse-checkout: |
             .github
@@ -229,8 +265,11 @@ jobs:
         continue-on-error: true
         env:
           ARTIFACT_RECORD: ${{ needs.artifact_identity.outputs.record }}
+          PREBAKED_IMAGE: ${{ inputs.prebaked_image }}
         run: |
+          # The derived id when the identity job produced one, else the image the caller named.
           export BENCH_SUBJECT_ID="${ARTIFACT_RECORD%%|*}"
+          [ -n "${BENCH_SUBJECT_ID}" ] || export BENCH_SUBJECT_ID="${PREBAKED_IMAGE}"
           make bench-plan BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1
 
       # Card topology is refreshed exactly as the perf job does; the engine runs from its own venv, the
@@ -241,8 +280,10 @@ jobs:
         continue-on-error: true
         env:
           ARTIFACT_RECORD: ${{ needs.artifact_identity.outputs.record }}
+          PREBAKED_IMAGE: ${{ inputs.prebaked_image }}
         run: |
           export BENCH_SUBJECT_ID="${ARTIFACT_RECORD%%|*}"
+          [ -n "${BENCH_SUBJECT_ID}" ] || export BENCH_SUBJECT_ID="${PREBAKED_IMAGE}"
           set +u
           unset _IBM_AIU_SETUP
           rm -rf /tmp/etc/ibm/spyre/topo.json
@@ -287,10 +328,11 @@ jobs:
           workflow: bench-on-demand
           branch: ${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.ref || github.ref_name }}
           sha: ${{ inputs.ref || github.sha }}
-          run-id: ${{ steps.collect.outputs.run_id }}
+          # The orchestrator's per-leg uuid when it dispatched this run, so the rows join its leg.
+          run-id: ${{ inputs.run_id || steps.collect.outputs.run_id }}
           gha-run-id: ${{ github.run_id }}
           component: torch-spyre
-          trigger-type: perf
+          trigger-type: ${{ inputs.test_type || 'perf' }}
           platform: x86_64
           artifact-id: ${{ needs.artifact_identity.outputs.record }}
           torch-spyre-dir: ${{ github.workspace }}
@@ -332,7 +374,7 @@ jobs:
             }}
           # The ingest threads --run-id verbatim (RunId.for_args), so the engine run id is the stored one; the
           # target fails loudly when no row exists under it.
-          BENCH_RUN_ID: ${{ steps.collect.outputs.stored_run_id || steps.collect.outputs.run_id }}
+          BENCH_RUN_ID: ${{ inputs.run_id || steps.collect.outputs.stored_run_id || steps.collect.outputs.run_id }}
         run: make bench-verdict BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1
 
       # Counts and stage outcomes only: no measured values reach the public log or summary.
