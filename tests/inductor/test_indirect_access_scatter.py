@@ -1710,9 +1710,8 @@ class _ScatterScenarios:
         """out.index_fill_(0, idx, 0.0) -- scalar fill on the row dim.
 
         The scalar form used to reach the kernel as a rank-0 Constant and be
-        rejected ("store value of unexpected type Constant"); the
-        materialize_scalar_fill pass turns the broadcast scalar into a `full`
-        and scatters that, so this is an ordinary indirect store
+        rejected ("store value of unexpected type Constant"); spyre_index_fill
+        builds the fill block with `full` and scatters that, so this is an ordinary indirect store
         (torch-spyre#4446, #4472). This is the KV-cache padding shape: zero the
         unused cache slots.
         """

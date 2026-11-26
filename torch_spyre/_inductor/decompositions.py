@@ -4278,43 +4278,49 @@ def spyre_index_add(
     return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
 
 
-@register_spyre_decompositions([torch.ops.aten.index_fill.int_Tensor])
+@register_spyre_decompositions(
+    [torch.ops.aten.index_fill.int_Scalar, torch.ops.aten.index_fill.int_Tensor]
+)
 def spyre_index_fill(
     self: torch.Tensor,
     dim: int,
     index: torch.Tensor,
-    value: torch.Tensor,
+    value: Union[int, float, bool, torch.Tensor],
 ) -> torch.Tensor:
-    """`index_fill.int_Tensor` as an overwrite-scatter of a materialized block.
+    """`index_fill` as an overwrite-scatter of a materialized fill block.
 
-    The upstream reference broadcasts the 0-d `value` with `expand` and
-    scatters it via `index_copy`, so the store reads a stride-0 view that has
-    no dimension advancing with the indexed rows. Adding `value` to a real
-    block gives the scatter a source buffer, the shape `index_copy` already
-    handles.
+    The upstream reference broadcasts the value with `expand` (a
+    `scalar_tensor(value)` for the scalar overload) and scatters it via
+    `index_copy`. The store then reads a stride-0 view with no buffer behind
+    it, which reaches codegen as a bare `Constant` ("store value of unexpected
+    type"). Building the block with `torch.full` (or `zeros + value` for a
+    tensor value) gives the scatter a real source buffer, the shape
+    `index_copy` already handles.
 
-    The scalar overload (`int_Scalar`) is not registered here: upstream builds
-    it from `scalar_tensor(value).expand(...)`, which the
-    `materialize_scalar_fill` post-grad pass rewrites to a `full`. That pass
-    does not match a tensor `value`, which is why this overload still needs
-    its own decomposition.
+    The `_out` overloads need no entry: functionalization rewrites them to
+    these functional overloads plus a copy, so the eager `index_fill_` kernel
+    (routed through `index_fill.out(out=self)`) is covered too.
     """
     torch._check(
         index.dim() <= 1,
         lambda: f"Index should have dimension 1 or 0 (got {index.dim()})",
     )
-    torch._check(
-        value.dim() == 0,
-        lambda: "Only supports 0-dimensional value tensor. "
-        f"Got a tensor with {value.dim()} dimensions.",
-    )
+    if isinstance(value, torch.Tensor):
+        torch._check(
+            value.dim() == 0,
+            lambda: "Only supports 0-dimensional value tensor. "
+            f"Got a tensor with {value.dim()} dimensions.",
+        )
     # Treat a 0-d self as shape [1], as the upstream reference does.
     y = self.unsqueeze(0) if self.dim() == 0 else self
     dim = dim % y.dim()
     index = index.reshape(-1)
     shape = list(y.shape)
     shape[dim] = index.numel()
-    block = torch.zeros(shape, dtype=y.dtype, device=y.device) + value.to(y.dtype)
+    if isinstance(value, torch.Tensor):
+        block = torch.zeros(shape, dtype=y.dtype, device=y.device) + value.to(y.dtype)
+    else:
+        block = torch.full(shape, value, dtype=y.dtype, device=y.device)
     out = torch.index_copy(y, dim, index, block)
     return out.squeeze(0) if self.dim() == 0 else out
 
@@ -4324,12 +4330,12 @@ def spyre_index_fill(
 # A write whose value is a bare number reaches ``SpyreKernel.store`` as an
 # ``ops.constant`` and is rejected ("store value of unexpected type Constant"):
 # codegen can only store from an allocated buffer. The fix is always to
-# materialize the number into a real tensor first, but where that belongs
-# depends on how the op carries it:
+# materialize the number into a real tensor first, with a decomposition of the
+# op that carries it:
 #
+#   * ``index_fill`` -- :func:`spyre_index_fill` above builds a ``full`` block.
 #   * ``scatter.value`` -- no decomposition exists upstream, so the number stays
-#     an argument of the op and never becomes a node. A pass has nothing to
-#     match; only rewriting the op itself works, which is what this does.
+#     an argument of the op; this rewrites it to ``scatter.src``.
 #
 # ``masked_fill`` needs no entry: it decomposes to ``where``, handled by the
 # ``where.Scalar*`` decompositions above.
