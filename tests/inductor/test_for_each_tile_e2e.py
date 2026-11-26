@@ -101,6 +101,8 @@ from for_each_tile_fixtures import (
     upcast_add_tiled_reference,
     add_tiled_fn,
     add_tiled_reference,
+    gate_up_silu_tiled_fn,
+    gate_up_silu_tiled_reference,
     batched_online_softmax_fn,
     carried_expert_sum_fn,
     carried_reduction_fn,
@@ -866,6 +868,31 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
 
         compiled = torch.compile(abs_tiled_fn, backend="inductor", fullgraph=True)
         out = compiled(A_spyre, 128)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_gate_up_silu_chunk_tiled_multi_stick(self):
+        """#6329: silu(gate) * up, splitting the tile's last dim with `chunk`
+        inside the body. The upper half's load index is a loop symbol plus
+        the chunk-boundary offset within the same tile dimension, which used
+        to fail to delinearize back into per-dim marker coordinates.
+
+        Each half of the chunk is a full 64-element stick wide
+        (STICK_COLS=128 // 2): a chunk boundary narrower than one stick hits
+        a separate, unrelated restickify-padding limitation (not this bug;
+        `LoopStructureError`/`counted loop ... not all members of it`), so
+        this fixture is only exercised at the stick-aligned size.
+        """
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = gate_up_silu_tiled_reference(X.float())
+
+        compiled = torch.compile(
+            gate_up_silu_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 128)
 
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
