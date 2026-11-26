@@ -88,4 +88,4 @@ jobs:
             'dashboard_chlogins_writer\tINSERT\tch_mgmt\tlogin_requests' \
             'dashboard_chlogins_writer\tSELECT\tch_mgmt\tlogin_events' \
             'dashboard_chlogins_writer\tSELECT\tch_mgmt\tlogin_requests' > grants.expected
-          diff grants.expected grants.actual
+          diff <(sort grants.expected) <(sort grants.actual)
