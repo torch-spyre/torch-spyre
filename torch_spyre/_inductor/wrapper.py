@@ -37,7 +37,7 @@ from .sharded_hbm import placement_of
 # .ktir(...) kernel definitions evaluate their OpSpec source text against.
 SPYRE_WRAPPER_IMPORTS = """
                 from torch_spyre._inductor.op_spec import wrapper_sympify as sympify
-                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
+                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, CountSource, spyre_constant_tensor, spyre_arange_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout, _spyre_empty_sharded
                 import subprocess
@@ -125,6 +125,15 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
         device = node.layout.device
         self.writeline(
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
+        )
+
+    def generate_arange_tensor_fallback(self, node):
+        length, column = node.constant_args
+        dtype = node.layout.dtype
+        device = node.layout.device
+        self.writeline(
+            f"{node.get_name()} = spyre_arange_tensor({length}, "
+            f'torch.device("{device}"), {dtype}, column={column})'
         )
 
     def _generate_extern_kernel_alloc_helper(self, extern_kernel, args):

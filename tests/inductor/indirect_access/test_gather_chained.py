@@ -62,16 +62,6 @@ _MATMUL_MISMATCH = (
     "compile gather followed by matmul / linear numerical mismatch.",
     r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_LN_MIXED_EA = rejection(
-    4714,
-    "compile LayerNorm after gather: multi-arg pointwise with mixed EA.",
-    r"Multi-arg pointwise with mixed EA",
-)
-_LN_EAGER_MISMATCH = (
-    5856,
-    "Eager LayerNorm after gather (fp16 to fp32 cast) mismatches CPU.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
-)
 _SCATTER_STICK = (
     4395,
     "compile gather followed by scatter_add produces numerical mismatch vs CPU.",
@@ -149,9 +139,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
     @gap_one_core
     def test_gather_then_layer_norm(self, execution_mode):
         """Gather output into layer_norm; end-to-end embedding + norm."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4714
-        _xfail_existing(execution_mode, eager=_LN_EAGER_MISMATCH, compiled=_LN_MIXED_EA)
         emb = cached_randn((256, 128), differentiation="ch04e", dtype=torch.float16)
         idx = torch.randint(0, 256, (32,), dtype=torch.int64)
         compare_mode(
