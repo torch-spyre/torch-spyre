@@ -1469,7 +1469,7 @@ def _lower_sum_impl(x, axis, keepdim, dtype=None):
     # When the caller requests a wider float output dtype (e.g. fp16.sum(dtype=fp32)),
     # widen comp_dtype so the accumulation runs in that wider type rather than reducing
     # in fp16 and upcasting only after.  This avoids large precision loss on fp16 inputs
-    # (max abs err ~50 on (8, 4096) inputs before this fix).
+    # (max abs err ~50 on (8, 4096) inputs when reduced in fp16).
     if dtype is not None and dtype.is_floating_point:
         comp_dtype = torch.promote_types(comp_dtype, dtype)
 

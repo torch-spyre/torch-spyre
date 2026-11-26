@@ -12159,7 +12159,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_count_nonzero_float_dim0(self):
         # count_nonzero is (x != 0).sum(0). The reduction runs over a non-stick dim.
-        # The staggered readback order issue (#4393) was fixed on main.
         x = cached_randint((67, 256), high=2).to(torch.float16)
         self.compare_with_cpu(
             lambda x: torch.count_nonzero(x, dim=0),
@@ -12179,7 +12178,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_count_nonzero_bool_dim0(self):
         # count_nonzero on a host bool, reduced over a non-stick dim.
-        # The staggered readback order issue (#4393) was fixed on main.
         x = cached_randint((67, 256), high=2) > 0
         self.compare_with_cpu(
             lambda x: torch.count_nonzero(x, dim=0),
