@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS login_requests
 (
     login                    String,
-    version                  DateTime64(3, 'UTC'), -- no default: the writer supplies a strictly increasing value per login
+    version                  DateTime64(3, 'UTC'), -- writer-supplied, strictly increasing per login
     requester                String,
     owner                    String,
     tier                     UInt8,
@@ -19,7 +19,6 @@ CREATE TABLE IF NOT EXISTS login_requests
     old_password_valid_until Nullable(DateTime64(3, 'UTC')),
     created_at               DateTime64(3, 'UTC'),
     updated_by               String,
-
     CONSTRAINT chk_status CHECK status IN ('pending', 'active', 'revoked', 'deleted', 'rejected'),
     CONSTRAINT chk_tier CHECK tier IN (1, 2)
 )

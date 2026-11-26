@@ -22,7 +22,6 @@ from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 
 CH_MGMT_DIR = SCHEMA_DIR.parent / "schema-ch-mgmt"
 LOGIN = "app_nightly"
-SECRET = r"password|digest|hash|secret|token"
 
 
 def _tables():
@@ -83,20 +82,22 @@ def test_ch_mgmt_is_separate_from_spyre_v2_schema():
     }
 
 
-def test_no_column_can_hold_a_secret(chdb_session):
-    cols = _rows(
+REQUEST_COLUMNS = {
+    "login", "version", "requester", "owner", "tier", "grants", "status", "approver",
+    "reason", "host", "expires_at", "needs_approval", "password_issued",
+    "last_rotated_at", "old_password_valid_until", "created_at", "updated_by",
+}  # fmt: skip
+EVENT_COLUMNS = {"event_id", "ts", "login", "actor", "action", "detail", "reason"}
+
+
+def test_the_columns_are_exactly_the_contract_so_no_secret_can_be_added(chdb_session):
+    got: dict = {}
+    for c in _rows(
         chdb_session,
-        "SELECT name, type FROM system.columns WHERE database = currentDatabase()",
-    )
-    assert cols
-    flags = {"password_issued": "UInt8"}
-    stamps = {"old_password_valid_until"}
-    for c in cols:
-        if not re.search(SECRET, c["name"], re.I):
-            continue
-        assert flags.get(c["name"]) == c["type"] or (
-            c["name"] in stamps and "DateTime64" in c["type"]
-        ), c
+        "SELECT table, name FROM system.columns WHERE database = currentDatabase()",
+    ):
+        got.setdefault(c["table"], set()).add(c["name"])
+    assert got == {"login_requests": REQUEST_COLUMNS, "login_events": EVENT_COLUMNS}
 
 
 def test_engines_and_sort_keys(chdb_session):
@@ -145,14 +146,14 @@ def test_roles_file_is_not_applied_and_grants_exactly_the_contract():
     assert {s.split()[0] for s in stmts} == {"CREATE", "GRANT"}
 
 
-def test_the_latest_version_of_a_login_wins(chdb_session):
+def test_the_latest_version_of_a_login_wins_whatever_the_insert_order(chdb_session):
     s = chdb_session
-    _insert(s, "login_requests", _request())
     _insert(
         s,
         "login_requests",
         _request(version="2026-11-26 11:00:00.000", status="active", approver="bob"),
     )
+    _insert(s, "login_requests", _request())
     got = _rows(
         s, "SELECT login, status, approver FROM login_requests FINAL ORDER BY login"
     )
@@ -166,25 +167,22 @@ def test_never_expires_is_null_and_host_defaults_to_any(chdb_session):
     assert got == [{"never": 1, "host": "ANY"}]
 
 
-def test_a_request_with_an_unknown_status_or_tier_is_refused(chdb_session):
-    for bad in ({"status": "expired"}, {"tier": 3}):
-        with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
-            _insert(chdb_session, "login_requests", _request(**bad))
-
-
-def test_events_are_appended_in_login_order(chdb_session):
+def test_status_and_tier_accept_exactly_the_contract_values(chdb_session):
     s = chdb_session
-    for i, action in enumerate(("request", "approve", "claim")):
-        _insert(
-            s,
-            "login_events",
-            {
-                "login": LOGIN,
-                "ts": f"2026-11-26 10:0{i}:00.000",
-                "actor": "alice@ibm.com",
-                "action": action,
-            },
-        )
-    got = _rows(s, "SELECT action, detail, reason FROM login_events ORDER BY ts")
-    assert [r["action"] for r in got] == ["request", "approve", "claim"]
-    assert {(r["detail"], r["reason"]) for r in got} == {("", "")}
+    for n, status in enumerate(("pending", "active", "revoked", "deleted", "rejected")):
+        _insert(s, "login_requests", _request(login=f"app_{n}", status=status))
+    for n, tier in enumerate((1, 2)):
+        _insert(s, "login_requests", _request(login=f"app_t{n}", tier=tier))
+    for bad in ({"status": "expired"}, {"status": ""}, {"tier": 0}, {"tier": 3}):
+        with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
+            _insert(s, "login_requests", _request(login="app_bad", **bad))
+
+
+def test_an_event_needs_only_login_actor_and_action(chdb_session):
+    s = chdb_session
+    _insert(s, "login_events", {"login": LOGIN, "actor": "alice", "action": "request"})
+    got = _rows(
+        s,
+        "SELECT detail, reason, event_id != toUUIDOrZero('') AS has_id FROM login_events",
+    )
+    assert got == [{"detail": "", "reason": "", "has_id": 1}]
