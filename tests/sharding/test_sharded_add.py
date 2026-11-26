@@ -50,8 +50,30 @@ from torch.distributed.tensor import Shard
 from torch_spyre._inductor import config as spyre_config
 
 from torch_spyre.execution import kernel_runner
+from torch_spyre.ops.fallbacks import register_fallback
 
 _STRIDE_REJECTION = "whole device dims of whole sticks"
+
+
+@torch.library.custom_op("spyre::test_sharding_host_copy", mutates_args=())
+def _host_copy(x: torch.Tensor) -> torch.Tensor:
+    """A copy that always runs on the host, as a fallback kernel in a graph.
+
+    The fallback-consumer test needs an op that falls back to the host. A real
+    op on the fallback list leaves it once it gains a Spyre implementation, so
+    the test owns one instead.
+    """
+    return x.clone()
+
+
+@_host_copy.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@register_fallback(["spyre::test_sharding_host_copy"])
+def _host_copy_fallback(x, **kwargs):
+    return x.clone()
 
 
 def expects_raise(test):
@@ -964,17 +986,6 @@ def test_scaled_unsharded_operand_fails_at_compile():
 def test_fallback_consumer_fails_at_compile():
     """An op that lowers to a fallback kernel is rejected at compile, not at
     launch with an error that names neither the op nor the sharding."""
-    from torch_spyre.ops.fallbacks import fallback_ops
-
-    # The op must still be a Spyre fallback. An op that gets a lowering
-    # becomes a ComputedBuffer, which the op-kind check rejects first, so
-    # this test would no longer reach the fallback-consumer check
-    # (torch.cumsum, used in the mixed-placement test above, decomposes to
-    # a matmul with an unsharded triu_mask operand).
-    assert torch.ops.aten.tril.default in fallback_ops, (
-        "aten.tril is no longer a Spyre fallback; pick another op from "
-        "torch_spyre/ops/fallbacks.py"
-    )
     n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
@@ -987,7 +998,9 @@ def test_fallback_consumer_fails_at_compile():
     with pytest.raises(
         RuntimeError, match="shard-local reductions on sharded operands only"
     ):
-        torch.compile(lambda x: torch.tril(x), dynamic=False)(a)
+        torch.compile(
+            lambda x: torch.ops.spyre.test_sharding_host_copy(x), dynamic=False
+        )(a)
 
 
 @requires_emulation
