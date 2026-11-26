@@ -267,6 +267,19 @@ def generate_bundle(
         specs_list, iter(compiled), [], affine_map_index, affine_map_loop_var_indices
     )
 
+    # A count that moves with its enclosing loop is one more affine access, so
+    # its stride key joins the tensors' map table and its #map is written with
+    # theirs at the top of the module.
+    count_maps: list[str | None] = []
+    for src in loop_sources:
+        if src is None or src.outer_stride <= 0:
+            count_maps.append(None)
+            continue
+        count_key = (src.outer_stride,)
+        if count_key not in affine_map_index:
+            affine_map_index[count_key] = len(affine_map_index)
+        count_maps.append(f"#map_{affine_map_index[count_key]}")
+
     compiled_iter = iter(compiled)
     addr_counter = [0]
 
@@ -510,7 +523,9 @@ def generate_bundle(
         # a symbolic one becomes "to <dim> step <G>"; a device-read one reads
         # its bound right before the loop. See _loop_level.
         loop_levels = [
-            _loop_level(lb, lb_idx, loop_dim_ssa, loop_sources[lb_idx])
+            _loop_level(
+                lb, lb_idx, loop_dim_ssa, loop_sources[lb_idx], count_maps[lb_idx] or ""
+            )
             for lb_idx, lb in enumerate(loop_bounds)
         ]
 
@@ -925,9 +940,9 @@ class LoopLevel:
     lines are written right before this level's ``scf.for``, for a value that
     only exists once the ops before the loop have run.
 
-    ``outer_stride``, when set, makes a device-read count's address move with
-    the directly enclosing loop. _emit_specs writes that address right before
-    ``pre_loop``, since only it knows the enclosing loop's variable.
+    ``count_map``, when set, names the affine map of a device-read count whose
+    address moves with the directly enclosing loop. _emit_specs applies it right
+    before ``pre_loop``, since only it knows the enclosing loop's variable.
     """
 
     setup: "tuple[str, ...]"
@@ -935,7 +950,7 @@ class LoopLevel:
     step: str
     stride_scale: int
     pre_loop: "tuple[str, ...]" = ()
-    outer_stride: int = 0
+    count_map: str = ""
 
 
 def _count_scale(count: sympy.Expr) -> int:
@@ -959,6 +974,7 @@ def _loop_level(
     lb_idx: int,
     loop_dim_ssa: "dict[str, str]",
     source: "CountSource | None" = None,
+    count_map: str = "",
 ) -> LoopLevel:
     """Pick the ``scf.for`` form for one loop level.
 
@@ -991,6 +1007,8 @@ def _loop_level(
         loop_dim_ssa: Symbol name to the SSA value its ``input_arg`` extracted
             to, so a symbolic bound can be wired to its parameter.
         source: Where a device-read count sits in the pool, or None.
+        count_map: The affine map of a device-read count that moves with its
+            enclosing loop, or "" when the count does not move.
 
     Returns:
         The level's setup lines, pre-loop lines, bound, step and stride scale.
@@ -1001,7 +1019,7 @@ def _loop_level(
             a device-read count does not match its loop.
     """
     if source is not None:
-        return _device_read_loop_level(count, lb_idx, source)
+        return _device_read_loop_level(count, lb_idx, source, count_map)
 
     if isinstance(count, (sympy.Integer, int)):
         return LoopLevel(
@@ -1049,11 +1067,13 @@ def _device_read_loop_level(
     count: sympy.Expr,
     lb_idx: int,
     source: CountSource,
+    count_map: str = "",
 ) -> LoopLevel:
     """The ``scf.for`` form for a loop whose count is read from device memory.
 
     Refuses rather than emits whenever the loop and its source disagree, since
-    the backend plans every such loop for ``max_value`` trips.
+    the backend plans every such loop for ``max_value`` trips. ``count_map``
+    names the affine map of a count that moves with its enclosing loop.
     """
     if not isinstance(count, (sympy.Integer, int)):
         raise Unsupported(
@@ -1085,13 +1105,12 @@ def _device_read_loop_level(
         )
     offset = f"%cnt_off_{lb_idx} = arith.constant {source.pool_offset} : index"
     setup: "tuple[str, ...]"
-    if source.outer_stride:
-        # The address moves with the enclosing loop, so only its base and step
-        # are constants here; _emit_specs writes the address inside that loop.
+    if count_map:
+        # The address moves with the enclosing loop, so only its base is a
+        # constant here; _emit_specs applies the count's map inside that loop.
         setup = (
             offset,
             f"%cnt_base_{lb_idx} = arith.addi %pool, %cnt_off_{lb_idx} : index",
-            f"%cnt_step_{lb_idx} = arith.constant {source.outer_stride} : index",
         )
     else:
         setup = (
@@ -1100,7 +1119,7 @@ def _device_read_loop_level(
         )
     return LoopLevel(
         setup=setup,
-        outer_stride=source.outer_stride,
+        count_map=count_map,
         pre_loop=(
             f"%n_{lb_idx} = sdscbundle.load_value_at_address %cnt_addr_{lb_idx} "
             f"{{granularity = {source.granularity}, "
@@ -1215,16 +1234,13 @@ def _emit_specs(
             )
             bound = level.bound if level is not None else f"%loop_bound_{lb_idx}"
             step = level.step if level is not None else "%c1"
-            if level is not None and level.outer_stride:
-                # base + outer_stride * the directly enclosing loop's variable;
-                # generate_bundle has checked that such a loop exists.
+            if level is not None and level.count_map:
+                # base + outer_stride * the directly enclosing loop's variable,
+                # through the count's affine map; generate_bundle has checked
+                # that such a loop exists.
                 f.write(
-                    f"{tab}%cnt_dx_{lb_idx} = arith.muli {loop_vars[-1]}, "
-                    f"%cnt_step_{lb_idx} : index\n"
-                )
-                f.write(
-                    f"{tab}%cnt_addr_{lb_idx} = arith.addi %cnt_base_{lb_idx}, "
-                    f"%cnt_dx_{lb_idx} : index\n"
+                    f"{tab}%cnt_addr_{lb_idx} = affine.apply {level.count_map}"
+                    f"({loop_vars[-1]})[%cnt_base_{lb_idx}]\n"
                 )
             for line in level.pre_loop if level is not None else ():
                 f.write(f"{tab}{line}\n")

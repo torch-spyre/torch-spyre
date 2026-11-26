@@ -611,33 +611,32 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
         bundle = self._run_ops([_op_spec(), self._in_experts(self._strided_loop())], 2)
 
         for line in (
+            f"#map_0 = affine_map<(d0)[s0] -> (s0 + {self.STICK}*d0)>",
             f"%cnt_off_1 = arith.constant {self.COUNT_OFFSET} : index",
             "%cnt_base_1 = arith.addi %pool, %cnt_off_1 : index",
-            f"%cnt_step_1 = arith.constant {self.STICK} : index",
-            "%cnt_dx_1 = arith.muli %i_0, %cnt_step_1 : index",
-            "%cnt_addr_1 = arith.addi %cnt_base_1, %cnt_dx_1 : index",
+            "%cnt_addr_1 = affine.apply #map_0(%i_0)[%cnt_base_1]",
             "%n_1 = sdscbundle.load_value_at_address %cnt_addr_1 ",
             "scf.for %i_1 = %c0 to %n_1 step %c1",
         ):
             self.assertIn(line, bundle)
 
     def test_the_constants_sit_at_the_top_and_the_address_in_the_outer_body(self):
-        """The base and the step never change, so they are set up once; the
+        """The map and the base never change, so they are set up once; the
         address uses the outer loop's variable, so it is computed inside it."""
         bundle = self._run_ops([_op_spec(), self._in_experts(self._strided_loop())], 2)
 
         outer_loop = "scf.for %i_0 = %c0 to %loop_bound_0 step %c1"
         order = [
-            "%cnt_step_1 = arith.constant",
+            "#map_0 = affine_map",
+            "%cnt_base_1 = arith.addi",
             outer_loop,
-            "%cnt_dx_1 = arith.muli",
-            "%cnt_addr_1 = arith.addi",
+            "%cnt_addr_1 = affine.apply",
             "%n_1 = sdscbundle.load_value_at_address",
             "scf.for %i_1",
         ]
         positions = [bundle.index(marker) for marker in order]
         self.assertEqual(positions, sorted(positions), bundle)
-        for marker in order[2:]:
+        for marker in order[3:]:
             self.assertEqual(
                 self._depth(bundle, marker), self._depth(bundle, outer_loop) + 1
             )
@@ -653,7 +652,7 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
 
         self.assertEqual(explicit, default)
         self.assertIn("%cnt_addr_1 = arith.addi %pool, %cnt_off_1 : index", explicit)
-        for absent in ("%cnt_base_", "%cnt_step_", "arith.muli"):
+        for absent in ("%cnt_base_", "affine_map", "affine.apply"):
             self.assertNotIn(absent, explicit)
 
     def test_a_count_written_inside_the_outer_loop_is_addressed_after_it(self):
@@ -667,8 +666,7 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
         order = [
             outer_loop,
             'sdsc_filename="sdsc_0.json"',
-            "%cnt_dx_1 = arith.muli %i_0",
-            "%cnt_addr_1 = arith.addi",
+            "%cnt_addr_1 = affine.apply #map_0(%i_0)",
             "%n_1 = sdscbundle.load_value_at_address",
             "scf.for %i_1",
             'sdsc_filename="sdsc_2.json"',
@@ -689,8 +687,8 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
 
         bundle = self._run_ops([_op_spec(), batch], 2)
 
-        self.assertIn("%cnt_dx_2 = arith.muli %i_1, %cnt_step_2 : index", bundle)
-        self.assertNotIn("arith.muli %i_0", bundle)
+        self.assertIn("%cnt_addr_2 = affine.apply #map_0(%i_1)[%cnt_base_2]", bundle)
+        self.assertNotIn("affine.apply #map_0(%i_0", bundle)
 
     def test_two_moving_counts_keep_their_own_names_and_bases(self):
         loop = self._in_experts(
@@ -702,7 +700,9 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
 
         for idx, offset in ((1, self.COUNT_OFFSET), (2, self.COUNT_OFFSET * 2)):
             self.assertIn(f"%cnt_off_{idx} = arith.constant {offset} : index", bundle)
-            self.assertIn(f"%cnt_dx_{idx} = arith.muli %i_0, %cnt_step_{idx}", bundle)
+            self.assertIn(
+                f"%cnt_addr_{idx} = affine.apply #map_0(%i_0)[%cnt_base_{idx}]", bundle
+            )
             self.assertIn(
                 f"%n_{idx} = sdscbundle.load_value_at_address %cnt_addr_{idx} ", bundle
             )
@@ -720,7 +720,7 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
 
         bundle = self._run_ops([_op_spec(), loop], 2, pool_size=pool_size)
 
-        self.assertIn("%cnt_dx_1 = arith.muli %i_0", bundle)
+        self.assertIn("%cnt_addr_1 = affine.apply #map_0(%i_0)", bundle)
 
     @expects_raise
     def test_a_negative_outer_stride(self):
