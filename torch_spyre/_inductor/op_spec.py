@@ -488,7 +488,8 @@ class CountSource:
     The count stays in device memory, so the host never needs to see it. It is
     an FP32 value holding a whole number of trips. Only a count stored in the
     bundle's pool is supported for now, as the first value of a stick, typically
-    written by an earlier op in the same bundle.
+    written by an earlier op in the same bundle. The code that builds a
+    CountSource checks that stick alignment from the count buffer's layout.
 
     Plain integers only, so the record survives the generated-code round trip.
 

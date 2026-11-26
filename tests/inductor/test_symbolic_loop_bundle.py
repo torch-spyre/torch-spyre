@@ -553,15 +553,11 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
         self.assertIn("only supported from the bundle's pool", str(caught.exception))
 
     @expects_raise
-    def test_a_pool_offset_that_is_not_at_a_stick_start(self):
-        """The count is the first value of a stick, so an offset inside a stick
-        would read some other value as the count."""
-        for offset in (4100, -128):
-            with self.subTest(pool_offset=offset):
-                self._refuses(
-                    self._device_read_loop(source=self._source(pool_offset=offset)),
-                    f"pool_offset={offset} is not at the start of a",
-                )
+    def test_a_negative_pool_offset(self):
+        self._refuses(
+            self._device_read_loop(source=self._source(pool_offset=-128)),
+            "pool_offset=-128 is negative",
+        )
 
     @expects_raise
     def test_a_fixed_count_past_the_pool_end(self):
@@ -571,14 +567,14 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
             f"ends at byte {self.POOL_SIZE + 4}, past the {self.POOL_SIZE}-byte pool",
         )
 
-    def test_a_fixed_count_in_the_last_stick_of_the_pool(self):
-        """Ending exactly at the pool end is inside it."""
-        last_stick = self.POOL_SIZE - 128
+    def test_a_fixed_count_in_the_last_four_bytes_of_the_pool(self):
+        """Its 4 bytes ending exactly at the pool end is inside it."""
+        last = self.POOL_SIZE - 4
         bundle = self._run_with_producer(
-            self._device_read_loop(source=self._source(pool_offset=last_stick))
+            self._device_read_loop(source=self._source(pool_offset=last))
         )
 
-        self.assertIn(f"%cnt_off_0 = arith.constant {last_stick} : index", bundle)
+        self.assertIn(f"%cnt_off_0 = arith.constant {last} : index", bundle)
 
 
 class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
@@ -727,14 +723,9 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
         self.assertIn("%cnt_dx_1 = arith.muli %i_0", bundle)
 
     @expects_raise
-    def test_a_stride_that_is_not_a_whole_stick(self):
-        for stride in (100, -self.STICK):
-            with self.subTest(stride=stride):
-                loop = self._in_experts(self._strided_loop(outer_stride=stride))
-                self._refuses(
-                    [_op_spec(), loop],
-                    f"outer_stride={stride} is not a whole number of",
-                )
+    def test_a_negative_outer_stride(self):
+        loop = self._in_experts(self._strided_loop(outer_stride=-self.STICK))
+        self._refuses([_op_spec(), loop], f"outer_stride={-self.STICK} is negative")
 
     @expects_raise
     def test_no_enclosing_loop_to_step_over(self):

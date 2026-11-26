@@ -42,7 +42,6 @@ from torch_spyre._inductor.pass_utils import decompose_tiled_count
 logger = get_inductor_logger("sdsc_compile")
 sdsc_log = get_inductor_logger("sdsc")
 
-_STICK_BYTES = 128  # fixed HW stick size in bytes for every DataFormats
 _COUNT_BYTES = torch.float32.itemsize  # a device-read count is one FP32 value
 
 # ---------------------------------------------------------------------------
@@ -1076,15 +1075,13 @@ def _device_read_loop_level(
             f"device-read loop count max_value={source.max_value} is not a "
             f"multiple of granularity={source.granularity}"
         )
-    if source.pool_offset < 0 or source.pool_offset % _STICK_BYTES:
+    if source.pool_offset < 0:
         raise Unsupported(
-            f"device-read loop count pool_offset={source.pool_offset} is not at the "
-            f"start of a {_STICK_BYTES}-byte stick"
+            f"device-read loop count pool_offset={source.pool_offset} is negative"
         )
-    if source.outer_stride < 0 or source.outer_stride % _STICK_BYTES:
+    if source.outer_stride < 0:
         raise Unsupported(
-            f"device-read loop count outer_stride={source.outer_stride} is not a "
-            f"whole number of {_STICK_BYTES}-byte sticks"
+            f"device-read loop count outer_stride={source.outer_stride} is negative"
         )
     offset = f"%cnt_off_{lb_idx} = arith.constant {source.pool_offset} : index"
     setup: "tuple[str, ...]"
