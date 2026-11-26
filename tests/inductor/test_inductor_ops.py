@@ -15551,13 +15551,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_fill_index_patterns_cpu(self):
         """Eager index_fill_ matches CPU across index patterns, #4414."""
-        for name, (fn, x, index) in self._index_fill_pattern_cases().items():
+        for name, (fn, x, index) in TestOps._index_fill_pattern_cases().items():
             with self.subTest(case=name):
                 self.compare_with_cpu(fn, x, index, run_compile=False, run_eager=True)
 
     def test_index_fill_index_patterns_compiled_cpu(self):
         """torch.compile'd index_fill_ matches CPU across index patterns, #4414."""
-        for name, (fn, x, index) in self._index_fill_pattern_cases().items():
+        for name, (fn, x, index) in TestOps._index_fill_pattern_cases().items():
             with self.subTest(case=name):
                 torch._dynamo.reset()
                 self.compare_with_cpu(fn, x, index)
