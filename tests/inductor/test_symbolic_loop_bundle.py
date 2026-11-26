@@ -736,6 +736,24 @@ class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
             pool_size=end - 1,
         )
 
+    def test_the_count_shares_a_tensor_map_with_the_same_stride(self):
+        """A tensor in the expert loop that steps 128 bytes per expert already
+        has s0 + 128*d0, so the count applies that map instead of adding one."""
+        loop = self._in_experts(_op_spec(), self._strided_loop())
+        tensor = TestEveryPassScalesANestedLevelTheSameWay._addressed_entry(
+            [{_sym(): self.STICK}]
+        )
+        entries = [self._pool_entry(0), tensor, self._pool_entry(2)]
+
+        bundle, _kinds = self._run([_op_spec(), loop], entries, self.POOL_SIZE)
+
+        self.assertEqual(bundle.count("= affine_map<"), 1, bundle)
+        self.assertIn(
+            f"#map_0 = affine_map<(d0)[s0] -> (s0 + {self.STICK}*d0)>", bundle
+        )
+        self.assertIn("%addr_0 = affine.apply #map_0(%i_0)", bundle)
+        self.assertIn("%cnt_addr_1 = affine.apply #map_0(%i_0)[%cnt_base_1]", bundle)
+
     def test_two_moving_counts_keep_their_own_names_and_bases(self):
         loop = self._in_experts(
             self._strided_loop(),
@@ -852,6 +870,15 @@ class TestADeviceReadCountSurvivesTheRealSerializer(unittest.TestCase):
         self.assertIn("outer_strides=(128,)", text)
         self.assertEqual(reloaded.count_from_buffer, source)
 
+    def test_strides_for_two_loops_come_back_intact(self):
+        source = CountSource(pool_offset=4096, max_value=16, outer_strides=(1024, 128))
+        spec = LoopSpec(count=sympy.Integer(16), body=[], count_from_buffer=source)
+
+        (reloaded,), text = self._round_trip(spec)
+
+        self.assertIn("outer_strides=(1024, 128)", text)
+        self.assertEqual(reloaded.count_from_buffer, source)
+
 
 class TestTheCacheKeySeparatesADeviceReadCount(unittest.TestCase):
     """The read and its address live in the bundle, not in any SDSC JSON, so
@@ -888,6 +915,18 @@ class TestTheCacheKeySeparatesADeviceReadCount(unittest.TestCase):
         self.assertNotEqual(
             self._key(CountSource(pool_offset=0, max_value=16)),
             self._key(CountSource(pool_offset=0, max_value=16, outer_strides=(128,))),
+        )
+
+    def test_the_order_of_the_strides_matters(self):
+        """(1024, 128) and (128, 1024) read different counts, so they are
+        different bundles."""
+        self.assertNotEqual(
+            self._key(
+                CountSource(pool_offset=0, max_value=16, outer_strides=(1024, 128))
+            ),
+            self._key(
+                CountSource(pool_offset=0, max_value=16, outer_strides=(128, 1024))
+            ),
         )
 
     def test_the_same_source_does_share_one(self):
