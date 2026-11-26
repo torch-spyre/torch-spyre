@@ -271,10 +271,13 @@ INDIRECT_RESTICKIFY_ARGS = _xfail(
     "restickify of an indirect store keeps its index arg in op_spec",
     "restickify op_spec has 3 args",
 )
-SCATTER_IA_RETILE = _xfail(
+# With the scatter re-tile fixed, the decode combine gets to restickify padding,
+# where the restickify writes into a slice of another buffer.
+SLICED_RESTICKIFY_PADDING = _xfail(
     InductorError,
-    "scatter-IA index buffer has no size-1 stick target for re-tiling",
-    "cannot re-tile .* no size-1 stick target",
+    "#6163: restickify written into a slice of another buffer cannot be padded "
+    "in place",
+    "cannot be padded in place",
 )
 FLOAT_IDS_AS_INDEX = _xfail(
     RuntimeError,
@@ -1118,7 +1121,7 @@ def test_G4_GM_003_grouped_mm_expert_ffn(execution_mode, T):
         ),
         decode_eager=TOPK_STAGGERED_INPUT,
         compiled=INDIRECT_RESTICKIFY_ARGS,
-        decode_compiled=SCATTER_IA_RETILE,
+        decode_compiled=SLICED_RESTICKIFY_PADDING,
     ),
 )
 def test_G4_GM_004_inverse_permute_fp32_combine(execution_mode, T):
