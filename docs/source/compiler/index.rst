@@ -51,13 +51,14 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    adding_operations
    indirect_access
    indirect_access_work_division
+   element_arrangement
 
 .. toctree::
    :maxdepth: 2
    :caption: Optimization passes
 
    working_set_reduction
-   coarse_tiling_loops
+   loop_nodes
    marker_resolution
    layout_optimization
    cost_model

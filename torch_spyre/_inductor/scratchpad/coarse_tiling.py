@@ -44,7 +44,8 @@ from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
-from ..loop_facts import counted_loop_path
+from ..loop_facts import counted_loop_path, is_looped
+from ..loop_node import request_loop_nodes
 from ..pass_utils import (
     _prepare_per_core_view,
     iteration_space_from_op,
@@ -57,13 +58,20 @@ from ..views import convert_modular_indexing
 from ..work_division_constraints import JOINT_TILING_AND_DIVISION_ATTR
 from ..wsr.coarse_tile import (
     _loop_var_to_reduction_ranges_pos,
-    coarse_tile_post_stickify,
     reduction_loop_vars,
+    reject_nested_loops,
     validate_coarse_tile_groups,
 )
+from ..wsr.loop_tiling_lowering import tile_groups
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .plan_solver import CoreDivisionBuffer, TileSpec
 from .utils import buffer_not_read_in_full
+
+# The deepest nest the allocator's search may propose. The lowering builds one
+# standalone loop per group and refuses a group with more levels
+# (``reject_nested_loops``, #6088); under the SA co-optimizer a refusal is a
+# compile failure, so the search must not offer what the lowering will refuse.
+MAX_SEARCH_TILE_DEPTH = 1
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
 
@@ -424,7 +432,7 @@ def _is_spliced(op: Operation) -> bool:
     set to every op of each level; no other tiling source sets that field
     (see ``loop_var_ranges_from_dim_hints`` in pass_utils.py).
     """
-    return getattr(op, "loop_info", None) is not None and any(
+    return is_looped(op) and any(
         h.loop_var is not None and h.loop_var_range is not None
         for h in getattr(op, "dim_hints", None) or []
     )
@@ -481,7 +489,7 @@ def derive_tiling_groups(
     breaks whenever an op is untiled (absent from ``choices`` or mapped to the
     empty spec) or its nest differs from the run's. Contiguity is a hard
     requirement, not an optimization -- ``validate_coarse_tile_groups`` and
-    ``_apply_plan`` both rely on each group occupying one contiguous stretch of
+    the lowering both rely on each group occupying one contiguous stretch of
     the operation list.
 
     Two non-adjacent runs on the same nest are therefore **two groups**, each
@@ -733,7 +741,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
         return
     # A for_each_tile region's tiling is the user's and already stamped;
     # re-tiling one of its ops would overwrite that op's dim_hints and
-    # loop_info.  Candidate selection is expected to hold region ops
+    # its loop's tiling.  Candidate selection is expected to hold region ops
     # untiled, so reaching this is a bug upstream of the pass.
     region_ops = {
         name for region in prescribed_regions(graph.operations) for name in region.names
@@ -767,6 +775,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
             )
         groups.append((group_ops, levels))
     validate_coarse_tile_groups(groups)
+    reject_nested_loops(groups, "allocator coarse tiling")
     # This pass runs inside scratchpad/LX planning -- after stickification
     # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
     # every op already carries a committed FixedTiledLayout. Use the
@@ -778,7 +787,10 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
         for group_ops, _levels in groups
         for op in group_ops
     }
-    coarse_tile_post_stickify(graph, groups=groups, group_idx_offset=group_idx_offset)
+    request_loop_nodes(
+        graph,
+        tile_groups(graph, groups=groups, group_idx_offset=group_idx_offset),
+    )
     for op in graph.operations:
         was = untiled_symbols.get(op.get_name())
         if was is None or not isinstance(op, ComputedBuffer):
@@ -796,7 +808,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
     tiled = {name for name, spec in choices.items() if not spec.is_untiled}
     for op in graph.operations:
         name = op.get_operation_name()
-        added = name not in before and getattr(op, "loop_info", None) is not None
+        added = name not in before and is_looped(op)
         if name in tiled or added:
             setattr(op, JOINT_TILING_AND_DIVISION_ATTR, True)
 

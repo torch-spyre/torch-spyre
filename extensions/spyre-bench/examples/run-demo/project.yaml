@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Runnable with the stub in this folder: `spyre-bench plan --catalog examples/run-demo --central examples/central ...`,
+# then `spyre-bench run --plan plan.json --workdir examples/run-demo`. Environments and policy are central.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: run-demo}
+spec:
+  packs: [{name: kernel, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [ops]
+  default_environment: ref-1card
+  visibility: public
+  series_labels: [env.label.device.count, env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: ops}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke}
+spec:
+  cases: [op_add_fp16]
+  run: {repeats_min: 1}

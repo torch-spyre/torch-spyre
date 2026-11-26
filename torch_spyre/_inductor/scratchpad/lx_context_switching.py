@@ -45,6 +45,7 @@ from torch._inductor.lowering import clone as clone_lowering
 from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
+from torch_spyre._inductor.loop_node import move_after, move_before
 from torch_spyre._inductor.pass_utils import (
     copy_op_metadata,
     register_operation_after_graph_edit,
@@ -238,11 +239,9 @@ def _dump_buffers(
         dump_buf.name = graph.register_buffer(dump_buf)
         register_operation_after_graph_edit(graph, dump_buf)
 
-        # Reposition into graph.operations right before target_op
-        # (remove()+insert(), same pattern GraphEditor.push_allocation_with_clone
-        # uses). target_op's own index drifts as we insert; recompute it.
-        graph.operations.remove(dump_buf)
-        graph.operations.insert(graph.operations.index(target_op), dump_buf)
+        # Reposition into graph.operations right before target_op; the
+        # lowering appended it at the end.
+        move_before(graph.operations, target_op, dump_buf)
 
         dumped[buf.get_name()] = (dump_fx, dump_buf)
         logger.info(
@@ -307,8 +306,7 @@ def _restore_buffers(
         restore_buf.name = graph.register_buffer(restore_buf)
         register_operation_after_graph_edit(graph, restore_buf)
 
-        graph.operations.remove(restore_buf)
-        graph.operations.insert(graph.operations.index(target_op) + 1, restore_buf)
+        move_after(graph.operations, target_op, restore_buf)
 
         restored.append(restore_buf)
         logger.info(

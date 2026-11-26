@@ -14,7 +14,7 @@
 
 # Helper methods to handle views
 
-from dataclasses import dataclass, astuple
+from dataclasses import dataclass
 import functools
 import math
 import sympy
@@ -168,10 +168,14 @@ def convert_modular_indexing(expr: sympy.Expr) -> sympy.Expr:
         return expr
 
 
-# NOTE: this is intentionally a local copy of pass_utils.concretize_expr.
-# views.py cannot import from pass_utils because pass_utils imports
-# compute_coordinates from views (circular dependency).  The duplication
-# is acceptable because both are thin wrappers around V.graph.sizevars.optimization_hint.
+# NOTE: deliberately a local copy of pass_utils.concretize_expr. A module-level
+# import would cycle, because pass_utils imports compute_coordinates from here,
+# so the helper it needs is imported inside the function instead. The two must
+# agree on how a symbol resolves, both preferring a declared ceiling over the
+# warm-up hint: a comparison here that picks its branch at one size while the
+# geometry around it is built at another is a silent wrong answer. This copy
+# also handles the sympy.oo sentinels that only the algorithms below produce,
+# which is why it is not a thin forwarder.
 def _concretize_for_cmp(expr):
     """Return a concrete numeric value for use in comparison operators only.
 
@@ -184,6 +188,11 @@ def _concretize_for_cmp(expr):
     in ``add_term`` when the index has a non-zero storage offset, e.g. for
     slice / split ops).  ``int(sympy.oo)`` would raise; ``math.inf`` works
     correctly in ``<`` / ``>`` comparisons against ints and sympy values.
+
+    A symbol from a ``tensor.to("spyre", dynamic=...)`` declaration resolves to
+    its declared maximum rather than to this call's hint, so a branch taken here
+    matches the geometry ``concretize_expr`` builds around it. A symbol that went
+    dynamic by ``mark_dynamic`` alone is not declared and still takes the hint.
 
     TODO(issue#1373): once these algorithms use sympy predicates or
     SizeVarAllocator guards, this function can be removed.
@@ -200,6 +209,14 @@ def _concretize_for_cmp(expr):
     if isinstance(expr, float):
         return expr  # passthrough (incl. math.inf); avoids int(math.inf) error
     if hasattr(expr, "free_symbols") and expr.free_symbols:
+        # Local import: pass_utils imports compute_coordinates from this module,
+        # so a module-level import would cycle. build_alignment_inputs below
+        # reaches for the same helper the same way.
+        from .pass_utils import declared_max_or_none
+
+        at_max = declared_max_or_none(expr)
+        if at_max is not None:
+            return at_max
         return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 
@@ -247,6 +264,56 @@ def _decompose_constant_offset(
     for d, digit in digits:
         coordinates[d] += digit
     return True
+
+
+def _has_misaligned_step(index, vars, var_ranges, size, stride) -> bool:
+    """Whether a linear ``index`` has a variable whose step is not a multiple of
+    the largest stride not exceeding it.
+
+    ``96 * a + b`` over strides ``[64, 128, 1]`` is such an index: ``96 * a``
+    lands on the 64 stride with a remainder of 32 for odd ``a``.
+    """
+    if index.atoms(sympy.Mod, sympy.floor, FloorDiv, ModularIndexing):
+        return False
+    for var in vars:
+        if var not in var_ranges:
+            continue
+        term = index.xreplace(dict.fromkeys(vars - {var}, 0))
+        step = sympy.sympify(term.xreplace({var: 1}))
+        if term != var * step or not (step.is_Integer and step > 0):
+            continue
+        range_val = _concretize_for_cmp(var_ranges[var])
+        if range_val <= 1:
+            continue
+        primary = max(
+            (
+                _concretize_for_cmp(stride[d])
+                for d in range(len(size))
+                if size[d] > 1 and 0 < _concretize_for_cmp(stride[d]) <= int(step)
+            ),
+            default=0,
+        )
+        if primary and int(step) % primary:
+            return True
+    return False
+
+
+def _minimal_wrap_chain(strides: list) -> list:
+    """Reduce strides (descending) to the wrap chain used by the coordinate modulo.
+
+    ``Mod(Mod(x, a), b) == Mod(x, b)`` when ``b`` divides ``a``, so a stride that a
+    later, smaller one divides adds nothing and is dropped.  This is done here
+    instead of relying on sympy, which folds the chain wrongly (it turns
+    ``Mod(64*Mod(d0, 12), 256)`` into ``64*Mod(Mod(d0, 12)**2, 4)``).  Shared by
+    the per-variable and the whole-index coordinate paths.
+    """
+    wraps: list = []
+    for s in strides:
+        if wraps and wraps[-1] % s == 0:
+            wraps[-1] = s
+        else:
+            wraps.append(s)
+    return wraps
 
 
 def compute_coordinates(
@@ -382,14 +449,7 @@ def _compute_coordinates_uncached(
     if repeat_info_out is not None:
         repeat_info_out.update(repeat_info)
 
-    # find stride immediately strictly larger that dim stride
     n = len(size)
-    next_stride: list[int | float] = [math.inf] * n
-    for i in range(n):
-        for j in range(n):
-            # n^2 is ok since n is small
-            if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
-                next_stride[i] = stride[j]
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
 
@@ -421,33 +481,49 @@ def _compute_coordinates_uncached(
                 f"be expressed as a device coordinate"
             )
 
+        def _wrap_and_project(target_stride):
+            # Wrap by every larger stride the variable's range crosses, from the
+            # largest down, then project onto ``target_stride``.  Wrapping by the
+            # next larger stride alone is exact only when the strides divide each
+            # other; for [8, 65] (strides 64, 65, 1) the stick coordinate must
+            # also be wrapped by the row stride 65: Mod(Mod(c0, 65), 64).
+            enclosing = sorted(
+                {
+                    _concretize_for_cmp(stride[j])
+                    for j in range(n)
+                    if size[j] > 1
+                    and _concretize_for_cmp(stride[j]) > target_stride
+                    and _concretize_for_cmp(stride[j]) < concrete_limit
+                },
+                reverse=True,
+            )
+            # Mod(Mod(x, a), b) == Mod(x, b) when b divides a, so a stride that a
+            # later one divides adds nothing.  Dropping it keeps the chain minimal
+            # and does not rely on sympy folding it: sympy turns
+            # Mod(64*Mod(d0, 12), 256) into 64*Mod(Mod(d0, 12)**2, 4), which is
+            # wrong.
+            term = var * step
+            for s in _minimal_wrap_chain(enclosing):
+                term = term % s
+            return term // target_stride
+
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
         for dim in range(n):
             if size[dim] == 1:
                 continue  # ignore dim with size 1
-            st = stride[dim]
+            st = _concretize_for_cmp(stride[dim])
             if st <= concrete_step and st > primary_stride:
                 # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
             elif st > concrete_step and st < concrete_limit:
                 # var range intersects dim, add term
-                if next_stride[dim] < concrete_limit:
-                    # var range overflows dim
-                    coordinates[dim] += var * step % next_stride[dim] // st
-                else:
-                    coordinates[dim] += var * step // st
+                coordinates[dim] += _wrap_and_project(st)
         # add term for primary dim
         if primary_stride > 0:
-            if next_stride[primary_dim] < concrete_limit:
-                coordinates[primary_dim] += (
-                    # var range overflows primary dim
-                    var * step % next_stride[primary_dim] // primary_stride
-                )
-            else:
-                coordinates[primary_dim] += var * step // primary_stride
+            coordinates[primary_dim] += _wrap_and_project(primary_stride)
 
     vars = index.free_symbols
     offset = index.xreplace(dict.fromkeys(vars, 0))
@@ -460,6 +536,36 @@ def _compute_coordinates_uncached(
         handled = _decompose_constant_offset(offset, size, stride, coordinates)
         if not handled:
             add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
+
+    if not repeat_info and _has_misaligned_step(index, vars, var_ranges, size, stride):
+        # A step that is not a whole number of the stride it lands on leaves a
+        # remainder that carries into the smaller dims, and the carry depends on
+        # the other variables too, so the coordinates cannot be built one
+        # variable at a time.  Decompose the whole index position instead.
+        limit = sum(
+            _concretize_for_cmp(index.xreplace({v: 1, **dict.fromkeys(vars - {v}, 0)}))
+            * (_concretize_for_cmp(var_ranges[v]) - 1)
+            for v in vars
+            if v in var_ranges
+        )
+        for dim in range(n):
+            st = _concretize_for_cmp(stride[dim])
+            if size[dim] == 1 or st <= 0 or st > limit:
+                continue
+            term = index
+            for enclosing in _minimal_wrap_chain(
+                sorted(
+                    {
+                        _concretize_for_cmp(stride[j])
+                        for j in range(n)
+                        if size[j] > 1 and st < _concretize_for_cmp(stride[j]) <= limit
+                    },
+                    reverse=True,
+                )
+            ):
+                term = term % enclosing
+            coordinates[dim] += term // st
+        return coordinates
 
     for var in vars:
         # Skip symbols that are not loop variables (e.g. size symbols
@@ -543,8 +649,8 @@ def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bo
     """
     if expr.free_symbols == {v} and coord.free_symbols == {v}:
         # Strip constant offsets if both have them
-        expr_offset = expr.subs(v, 0)
-        coord_offset = coord.subs(v, 0)
+        expr_offset = expr.xreplace({v: 0})
+        coord_offset = coord.xreplace({v: 0})
         if expr_offset != coord_offset:
             return False
         expr = expr - expr_offset
@@ -693,8 +799,14 @@ def normalize_coordinates(
                 num = den = mod = sympy.S.One
                 terms.append(Term(num, den, var, mod, dim_size, offset))
             else:
-                assert offset == 0
-                terms.append(Term(None, None, None, None, dim_size))
+                # A constant coordinate on the last (stick) dim is valid: the offset
+                # is the HBM base address baked into the device coordinate by the
+                # layout engine.  Keep it in the Term so downstream code can use it
+                # as a constant address contribution.  Any other size-1 dim must
+                # have a zero offset: such a term is dropped when fusing, so a
+                # nonzero offset would be silently lost.
+                assert dim_idx == len(size) - 1 or offset == 0
+                terms.append(Term(None, None, None, None, dim_size, offset))
             continue
         # If any free symbols are not loop vars, check if they're indirect symbols
         # with known sizes (from indirect_sizes). If so, treat them like loop vars.
@@ -921,16 +1033,24 @@ class UnalignedStickSplit(Unsupported):
         variable: sympy.Symbol,
         boundary: int,
         stick_size: int,
+        hint: str | None = None,
     ) -> None:
         self.tensor_index = tensor_index
         self.variable = variable
         self.boundary = boundary
         self.stick_size = stick_size
-        super().__init__(
+        message = (
             "tensor alignment boundary "
             f"{boundary} for {variable} cuts tensor {tensor_index}'s "
             f"physical stick of {stick_size} elements"
         )
+        # Call-site-specific guidance, e.g. SpyreKernel._check_indirect_index_step
+        # naming the documented remedy for its own checks, rather than leaving the
+        # reader only this generic, internal-symbol-name message. Omitted by other
+        # call sites, whose alignment failures aren't tied to one documented fix.
+        if hint:
+            message = f"{message}. {hint}"
+        super().__init__(message)
 
 
 def build_alignment_inputs(
@@ -1062,18 +1182,18 @@ def align_tensors_pure(
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
     for i, terms in enumerate(all_terms):
-        for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
-            if var is not None:
-                if den != stick_size[i] or var != stick_dim[i]:
+        for term in terms:
+            if term.var is not None:
+                if term.den != stick_size[i] or term.var != stick_dim[i]:
                     # add den to splits unless stick dim and stick size
-                    splits[var].add(den)
+                    splits[term.var].add(term.den)
                 if (
-                    mod != stick_size[i]
-                    or var != stick_dim[i]
-                    or var in repeat_info.keys()
+                    term.mod != stick_size[i]
+                    or term.var != stick_dim[i]
+                    or term.var in repeat_info.keys()
                 ):
                     # add mod to splits unless stick dim and stick size
-                    splits[var].add(mod)
+                    splits[term.var].add(term.mod)
 
     # Insert restored size-1 dimensions with offset/gap to the other tensors
     for var in new_vars:
@@ -1178,9 +1298,13 @@ def align_tensors_pure(
     for j, terms in enumerate(all_terms):
         size = []
         coordinates = []
-        for num, den, var, mod, dim_size, offset in [
-            astuple(term) for term in terms[:-1]
-        ]:
+        for term in terms[:-1]:
+            num = term.num
+            den = term.den
+            var = term.var
+            mod = term.mod
+            dim_size = term.dim_size
+            offset = term.offset
             # for each term except last one (stick dim)
             if var is None:
                 # offset holds either 0 (broadcast/scalar dim) or an IndirectAccess
@@ -1212,16 +1336,21 @@ def align_tensors_pure(
             if var == stick_dim[j] and den == stick_size[j] and den not in splits[var]:
                 # outer stick dim
                 size[-1] //= den
-                (offset, term) = coordinates[-1].as_coeff_Add()
-                coordinates[-1] = term // den + offset
+                (offset, rest) = coordinates[-1].as_coeff_Add()
+                coordinates[-1] = rest // den + offset
             # normalize_coordinates realizes any stride (num > 1) on a
             # non-stick dim as an explicit gap term, so nothing is left here.
             assert num == 1, f"unexpected stride {num} on non-stick term for {var}"
         # add stick dim
-        num, den, var, mod, dim_size, offset = astuple(terms[-1])
-        size.append(dim_size)
+        stick_term = terms[-1]
+        size.append(stick_term.dim_size)
         coordinates.append(
-            (var % dim_size if var is not None else sympy.S.Zero) + offset
+            (
+                stick_term.var % stick_term.dim_size
+                if stick_term.var is not None
+                else sympy.S.Zero
+            )
+            + stick_term.offset
         )
         new_tensors.append({"size": size, "coordinates": coordinates})
 
@@ -1334,7 +1463,7 @@ def tiling_expr_to_device_expr(
     for var in vars:
         # step must be var's own coefficient, not index's value at var=1 --
         # those only coincide when index has zero constant term. `index` can
-        # legitimately carry one here: _general_tile_advance builds it from
+        # legitimately carry one here: _index_tile_advance builds it from
         # dep.index, which bakes in literal offsets from Python-level slicing
         # (e.g. key[..., start:end, :] for KV-block >= 1 contributes a
         # constant +start*row_stride term alongside the tiled-dim symbol).

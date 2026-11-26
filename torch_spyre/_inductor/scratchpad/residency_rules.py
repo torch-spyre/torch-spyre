@@ -143,7 +143,7 @@ BUFFER_RESIDENCY_RULES = (
         ("fixed LX address",),
         (
             "LX addresses cannot use affine.apply symbols. The write or read "
-            "advances per tile; loop_info supplies the tile geometry."
+            "advances per tile; the loop node supplies the tile geometry."
         ),
         (
             "TestLoopCarryLxEligibility",
@@ -395,6 +395,21 @@ TRANSFER_CERTIFICATES = (
         ),
     ),
     TransferCertificate(
+        "Post-loop sum of a loop carry",
+        "torch_spyre._inductor.scratchpad.lx_relayout._relayout_consumer_kind_supported",
+        "co-optimizing solve that decides relayouts; carry storage with an FX "
+        "origin and no writer after its loop; a sum outside every loop; in-loop "
+        "accesses keep the carry's own ownership; movement, capacity and price "
+        "gates unchanged",
+        (
+            "test_solver_relayout_candidates.py::test_a_sum_takes_a_relayout_only_from_a_loop_carry",
+            "test_solver_relayout_candidates.py::test_an_edge_needs_an_fx_origin_at_both_ends",
+        ),
+        (
+            "test_solver_relayout_e2e.py::test_post_loop_sum_reads_a_relayout_of_a_grouped_carry",
+        ),
+    ),
+    TransferCertificate(
         "Contained local LX read",
         "torch_spyre._inductor.scratchpad.lx_relayout.local_lx_emission_contract",
         "ownership flag ON; shared graph and compact-read geometry gate; "
@@ -403,7 +418,10 @@ TRANSFER_CERTIFICATES = (
             "test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected",
             "test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access",
         ),
-        ("test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition",),
+        (
+            "test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition",
+            "test_solver_relayout_e2e.py::test_gate_up_halves_read_the_matmul_output_in_place",
+        ),
     ),
     TransferCertificate(
         "Full-parent copy for local subranges",

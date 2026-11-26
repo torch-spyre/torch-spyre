@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import dataclasses
+import functools
 import math
 import threading
 from typing import Any, Literal, Sequence
 
-from sympy import Symbol, Expr, Function, sympify
+from sympy import Symbol, Expr, Function, Integer, sympify
+from sympy.core.parameters import global_parameters
 from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
@@ -44,6 +46,36 @@ class IndirectAccess(Function):
     @classmethod
     def eval(cls, name):  # noqa: ARG003
         return None  # keep unevaluated
+
+
+# Bounded so that a long-lived process compiling many shapes cannot grow it
+# without limit; a Granite 3.3 8B start parses about 105 distinct strings.
+@functools.lru_cache(maxsize=4096)
+def _cached_sympify(text: str, flags: tuple[bool, bool, bool]) -> Any:
+    # ``flags`` only keys the cache: sympify reads the same global parameters
+    # (evaluate, distribute, exp_is_pow), and each one changes its result.
+    return sympify(text)
+
+
+def wrapper_sympify(a: Any, *args: Any, **kwargs: Any) -> Any:
+    """``sympify`` as imported by generated Spyre wrapper modules.
+
+    The wrapper emits ``sympify('<expr>')`` for every index expression, and each
+    load of a cached wrapper module re-parses those strings. A plain ``str``
+    argument is parsed once per process and the parsed expression is shared;
+    sympy expressions are immutable, so sharing them is safe. Anything else
+    goes straight to ``sympy.sympify``.
+    """
+    if not args and not kwargs and type(a) is str:
+        return _cached_sympify(
+            a,
+            (
+                global_parameters.evaluate,
+                global_parameters.distribute,
+                global_parameters.exp_is_pow,
+            ),
+        )
+    return sympify(a, *args, **kwargs)
 
 
 # --- Source-to-kernel provenance schema -------------------------------------
@@ -178,16 +210,21 @@ class TensorWorkDivision:
 
         if not isinstance(other, TensorWorkDivision):
             return False
-        # core_mapping imports this module's TensorWorkDivision.
-        from .core_mapping import same_owner_maps
+        key = self.ownership_key
+        return key is not None and key == other.ownership_key
 
-        return same_owner_maps(
-            self.work_slices,
-            self.core_id_to_work_slice,
-            self.physical_core_count,
-            other.work_slices,
-            other.core_id_to_work_slice,
-            other.physical_core_count,
+    @functools.cached_property
+    def ownership_key(self) -> "tuple | None":
+        """This division's :func:`~.core_mapping.ownership_key`, computed once.
+
+        Cached on the instance, so ``work_slices`` and ``core_id_to_work_slice``
+        must not be changed after the first ownership comparison.
+        """
+        # core_mapping imports this module's TensorWorkDivision.
+        from .core_mapping import ownership_key
+
+        return ownership_key(
+            self.work_slices, self.core_id_to_work_slice, self.physical_core_count
         )
 
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
@@ -215,7 +252,7 @@ class TensorWorkDivision:
         for core in range(num_cores):
             slots = {}
             for dim, expression in self.core_id_to_work_slice.items():
-                value = sympify(expression).subs(core_id, core)
+                value = sympify(expression).xreplace({core_id: Integer(core)})
                 if value.free_symbols or value.is_integer is not True:
                     raise ValueError(
                         f"core {core} owns non-integral {dim} slot {value}"
@@ -243,6 +280,9 @@ class TensorArg:
         device_size: The device size (as per SpyreTensorLayout) of the Tensor
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
+        stride_map: The ``stride_map`` of the SpyreTensorLayout the coordinates were
+                derived from: each device dim's host stride, 0 for a dim holding no
+                host elements.  ``None`` when the arg was not built from a layout.
         allocation: dict tagging where this Tensor's data lives. Mirrors
                 layout.allocation and carries exactly one of three
                 mutually-exclusive keys:
@@ -256,12 +296,12 @@ class TensorArg:
                   docs/source/compiler/hbm_pool_planning.md.
         device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
             unit step of each tiled Inductor iteration symbol (d0, d1, ...), built by
-            SpyreKernel._general_tile_advance from CoarseTileInfo.tiled_dims_per_read /
-            output_tiled_dims's per-level (dim, extent) decisions: one term per nesting
-            level, substituted with that level's own minted symbol, reprojected to
+            SpyreKernel._index_tile_advance from the coefficient of each loop's
+            variable in the access's index: one term per nesting level, in that
+            level's own symbol, reprojected to
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
-            ops without loop_info/coarse tiling.
+            ops in no counted loop.
         work_division: Optional tensor-specific ownership used when it differs
             from the operation's work division.
         kernel_local: True when nothing outside the kernel that produced this
@@ -283,6 +323,17 @@ class TensorArg:
             sharded storage (core c reads or writes only chunk c, through its
             own start address, ``nonUnifiedAllocInHBM_``; see sharded_hbm.py);
             0 for ordinary storage. Checked against the real tensor at launch.
+        non_unified_shard_dim: The iteration-space symbol of the shard dim of
+            this tensor's sharding, when the tensor is sharded storage; None
+            otherwise. The sharded planner pins the work split on the shard
+            dim, and the codegen guard (``verify_non_unified_split``) checks
+            the committed split against this symbol, so a later pass that
+            re-divides the op on any other dim is rejected. Derived from the
+            tensor's placement against the same iteration space the SDSC is
+            emitted from (Inductor mints fresh index symbols per trace, so a
+            symbol captured at planning time can be renamed by scheduling);
+            the SDSC layer maps it to the emitted dim label alongside every
+            other symbol.
     """
 
     is_input: bool
@@ -300,6 +351,8 @@ class TensorArg:
     kernel_local: bool = False
     replicated_scalar: bool = False
     non_unified_shard_bytes: int = 0
+    non_unified_shard_dim: Symbol | None = None
+    stride_map: list[int] | None = None
 
     @property
     def non_unified(self) -> bool:
@@ -356,7 +409,7 @@ class OpSpec:
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
         tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
-            to its own nesting level's trip count (CoarseTileInfo.loop_count
+            to its own nesting level's trip count (LoopMember.loop_count
             for that level). Used by SDSC codegen to compute each tiled
             tensor's full pre-tiling extent as
             (per-unit-step device element advance) * trip_count, without
@@ -378,8 +431,8 @@ class OpSpec:
         default_factory=dict
     )
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
-    # Populated by compute_symbolic_bounds during
-    # create_op_spec; empty for concrete dims.
+    # create_op_spec no longer populates it (it refuses mark_dynamic(max=...)
+    # sizes outside for_each_tile), so it is empty in every compile.
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
@@ -428,6 +481,29 @@ class UnimplementedOp:
     op: str
 
 
+@dataclasses.dataclass(frozen=True)
+class CountSource:
+    """Where a loop reads its trip count from device memory at run time.
+
+    The count stays in device memory, so the host never needs to see it. It is
+    an FP32 value holding a whole number of trips. Only a count stored in the
+    bundle's pool is supported for now, as the first value of a stick, typically
+    written by an earlier op in the same bundle.
+
+    Plain integers only, so the record survives the generated-code round trip.
+
+    Attributes:
+        pool_offset: Byte offset of the count in the bundle's pool.
+        max_value: Largest count that can be read. The loop is planned for this
+            many trips, so it equals the owning ``LoopSpec.count``.
+        granularity: A number the count is always a multiple of.
+    """
+
+    pool_offset: int
+    max_value: int
+    granularity: int = 1
+
+
 @dataclasses.dataclass
 class LoopSpec:
     """A counted loop whose body is a sequence of ops, possibly nested.
@@ -436,6 +512,20 @@ class LoopSpec:
         count: Trip count of the loop. May be a symbolic shape expression.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
+        count_symbol_bounds: For a symbolic ``count``, the ``(max_value,
+            tile_size)`` of each symbol in it, keyed by name. Resolved by the
+            scheduler while the ShapeEnv exists and carried from there, because
+            codegen also runs in a reload phase where it is gone. Empty for a
+            concrete count.
+        count_symbol_sources: For a symbolic ``count``, the ``(arg_index,
+            dim_index)`` each symbol's value is read from at launch, keyed by
+            name. Resolved during kernel codegen, where the launch argument
+            ordering is still live. A symbol that cannot be placed is left out,
+            and bundle generation then refuses to declare a parameter for it.
+        count_from_buffer: When set, the loop runs as many trips as a count
+            read from device memory right before the loop starts. ``count``
+            then stays the static maximum, so every pass that reads it is
+            unchanged. None for every other loop.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -448,6 +538,26 @@ class LoopSpec:
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    count_symbol_bounds: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
+    count_symbol_sources: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
+    count_from_buffer: CountSource | None = None
+
+
+def walk_loop_specs(specs):
+    """Every LoopSpec in a spec tree, outer before inner.
+
+    Lives here rather than in either consumer because kernel codegen and bundle
+    generation both walk the same tree for the same reason, and a second copy is
+    a second thing to keep in step.
+    """
+    for spec in specs:
+        if isinstance(spec, LoopSpec):
+            yield spec
+            yield from walk_loop_specs(spec.body)
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
@@ -518,6 +628,117 @@ def spyre_constant_tensor(const_val, device, dtype=torch.float16):
             _CONSTANT_TENSOR_CACHE.popitem(last=False)  # Remove oldest (LRU)
 
         return t
+
+
+# Smallest coordinate buffer built, in elements.  Growth starts here and
+# doubles, so every cached length is a whole number of sticks at either served
+# width and a shorter request slices out of one without narrowing a stick.  Set
+# above one stick because a coordinate is small next to what reads it: 256
+# elements is 512 bytes at fp16, and starting there spares the doublings a mask
+# of ordinary extent would otherwise walk through on its first pass.
+_ARANGE_SEED_LEN = 256
+
+# Longest coordinate kept, per form.  A cached buffer lives for the process, so
+# without a bound one long request would pin its memory for good.  A longer
+# coordinate is assembled in the graph from the bound's, so it is never
+# requested here (``_arange_ramp`` in decompositions.py).  The
+# column is the costly form: a ``[N, 1]`` buffer spends a whole stick on each
+# element (128 bytes), against 2 or 4 for the ramp.  Its readers are mask rows,
+# which float16 and bfloat16 tile into blocks of at most 1024, so a few blocks'
+# worth covers them; the ramp's bound is 4 MB at float32.  Both are a seed
+# multiple by a power of two, so growth by doubling lands on them exactly.
+_ARANGE_MAX_LEN = {False: 1 << 20, True: 1 << 13}
+
+# One entry per (device, dtype, form), each holding the longest coordinate built
+# so far, up to its form's ``_ARANGE_MAX_LEN``.  Requests shorter than that are
+# served as slices, so an entry only ever grows: a coordinate buffer is a
+# prefix of every longer one, which a per-length cache cannot exploit.  The
+# ramp and the column are kept apart so a plain ``arange`` never builds the
+# costlier column.
+_ARANGE_TENSOR_CACHE: dict[tuple, tuple[int, torch.Tensor]] = {}
+
+
+def clear_arange_tensor_cache():
+    """Release every cached coordinate buffer.
+
+    Companion to ``clear_constant_tensor_cache`` for test isolation: a cached
+    coordinate outlives ``torch.compiler.reset()`` the same way a scalar
+    constant does.
+    """
+    _ARANGE_TENSOR_CACHE.clear()
+
+
+def _build_arange_tensor(length, device, dtype, column):
+    host = torch.arange(length, dtype=dtype)
+    if column:
+        host = host.unsqueeze(-1).clone()
+    return host.to(device)
+
+
+def spyre_arange_tensor(length, device, dtype=torch.float16, column=False):
+    """A cached coordinate of ``length``: the ramp, or a mask's row coordinate.
+
+    ``column=False`` gives the ``[length]`` ramp ``[0, length)``; ``column=True``
+    gives the ``[length, 1]`` form ``out[i][0] = i``.  The column is a distinct
+    buffer rather than a view of the ramp because a ``[N]`` vector admits exactly
+    one device layout (stick on its only dim), leaving ``ramp[:, None]`` against
+    ``ramp[None, :]`` with no feasible assignment.
+
+    WARNING: returns a view of a buffer shared across every forward pass, which
+    MUST NEVER be mutated in place.  Inductor upholds this via
+    ``SpyreArangeFallback.should_allocate() == False`` and its empty
+    ``get_mutation_names()``; any pass that changes that contract must update
+    this function.
+
+    The slice is taken here rather than left to the caller because
+    ``SpyreArangeFallback`` declares its device layout from the requested
+    length, so the result must be exactly that long while the buffer behind it
+    may be longer.  Slicing the column's leading dim keeps its trailing stick
+    dim whole.
+
+    Each form keeps only its longest request, up to ``_ARANGE_MAX_LEN``, and a
+    shorter one is served as a slice of it.  A request past that bound is
+    refused: the decomposition assembles a longer coordinate on device instead.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    if device.type != "spyre":
+        # Reached only from generated wrapper code, which emits the device the
+        # node was laid out for.
+        raise ValueError(f"spyre_arange_tensor requires a spyre device, got {device}")
+
+    length = int(length)
+    column = bool(column)
+    max_len = _ARANGE_MAX_LEN[column]
+    if length > max_len:
+        raise ValueError(
+            f"spyre_arange_tensor serves at most {max_len} elements, got {length}"
+        )
+
+    cache_key = ((device.type, device.index), dtype, column)
+
+    with _CACHE_LOCK:
+        cached = _ARANGE_TENSOR_CACHE.get(cache_key)
+
+    if cached is None or cached[0] < length:
+        # Build outside the lock: the host arange and the H2D copy are the
+        # expensive part and need no exclusion, and a duplicate build on a race
+        # is wasteful but correct.
+        grown = _ARANGE_SEED_LEN
+        while grown < length:
+            grown *= 2
+        entry = (grown, _build_arange_tensor(grown, device, dtype, column))
+
+        with _CACHE_LOCK:
+            cached = _ARANGE_TENSOR_CACHE.get(cache_key)
+            if cached is None or cached[0] < grown:
+                # A shorter entry is replaced rather than kept: any slice already
+                # handed out keeps its own reference, so the old buffer lives
+                # exactly as long as it is still read.
+                _ARANGE_TENSOR_CACHE[cache_key] = entry
+                cached = entry
+
+    return cached[1][:length]
 
 
 def find_unimplemented(specs: list) -> UnimplementedOp | None:

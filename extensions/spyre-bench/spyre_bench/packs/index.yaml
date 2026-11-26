@@ -1,0 +1,2 @@
+# Built-in pack search list. Other packs register at run time with --pack DIR (or a Python entry point).
+packs: [llm-serving, spyre, kernel, comms]

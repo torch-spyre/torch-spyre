@@ -8,7 +8,7 @@
 # shape group, assign it to whichever shard keeps the jobs balanced.
 
 test_suite_config:
-  labels: [unit, regression, trunk]
+  labels: [unit, regression, integration, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
       unlisted_test_mode: skip
@@ -36,7 +36,15 @@ test_suite_config:
             # views that split the stick dim into (heads, D) and then slice or
             # stride D, incl. rotate_half on a transposed q/k (issue #4050)
             - TestOps::test_view_split_stick_slice.*
+            # a stick-dim gather written at an offset inside a wider stick
+            - TestOps::test_stick_gather_at_offset.*
+            # a strided slice of the stick dim, gathered
+            - TestOps::test_strided_stick_slice.*
+            - TestOps::test_interleaved_rope_single_head.*
             - TestOps::test_rope_on_split_stick_view.*
+            # reads whose row or slice boundary falls inside a stick (issues
+            # #5197, #5198, #5227, #5872)
+            - TestOps::test_stick_splitting_read.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

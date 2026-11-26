@@ -1,0 +1,69 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# trace-demo: how a decode benchmark scales with card count, and which card is the slow one. Synthetic placeholders.
+# Validate with  spyre-bench validate examples/trace-demo --pack examples/packs/trace-example
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: trace-demo}
+spec:
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}, {name: trace-example, version: "0.2"}]
+  default_suites: [decode]
+  default_environment: cards-1
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core]}
+    - {name: suite, ordered: false, cardinality: many}
+  series_labels: [env.label.node_class, env.label.device.count]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: decode}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: node-a}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: node-a}}
+  host_profile: {governor: performance, smt: "on"}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: cards-1, description: "one card on a node-a host"}
+spec:
+  devices:
+    requests:
+      - {name: cards, device_class: spyre/pf, count: 1, selectors: [{attribute: spyre.profile, eq: a}]}
+  host: {node_class: node-a, arch: x86_64, exclusive: true}
+  labels: {node_class: node-a, device.count: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: cards-2}
+spec:
+  base: cards-1
+  patch: {devices: {requests: [{name: cards, device_class: spyre/pf, count: 2, selectors: [{attribute: spyre.profile, eq: a}]}]}, labels: {device.count: 2}}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: cards-4}
+spec:
+  base: cards-1
+  patch: {devices: {requests: [{name: cards, device_class: spyre/pf, count: 4, selectors: [{attribute: spyre.profile, eq: a}]}]}, labels: {device.count: 4}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-a-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-llm-a", revision: 8f2c4a6e1b3d5f708192a3b4c5d6e7f8091a2b3c}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-llm-a}
+spec: {assets: [{role: weights, asset: demo-llm-a-weights}], family: demo, architecture: decoder-only}

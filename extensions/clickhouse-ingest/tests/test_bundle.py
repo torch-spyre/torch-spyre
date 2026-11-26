@@ -304,7 +304,9 @@ def _resolution(aid, arch="s390x", component="torch-spyre"):
 @pytest.fixture
 def online(monkeypatch):
     """--from-bundle against a fake spyre_v2: `calls` holds each `results` argv."""
-    state = SimpleNamespace(client=FakeClient(), calls=[], resolved=AID, by_spec={})
+    state = SimpleNamespace(
+        client=FakeClient(), calls=[], trusts=[], resolved=AID, by_spec={}
+    )
     from spyre_clickhouse_ingest import client, resolver
 
     def resolve(spec, arch, **kw):
@@ -315,8 +317,9 @@ def online(monkeypatch):
     monkeypatch.setattr(resolver, "resolve", resolve)
     monkeypatch.setattr(
         bundle, "write_junit",
-        lambda db, root, meta, aid, rid, props, strict: state.calls.append(
-            bundle.results_argv(meta, root, aid, rid, props, strict)
+        lambda db, root, meta, aid, rid, props, strict: (
+            state.calls.append(bundle.results_argv(meta, root, aid, rid, props, strict)),
+            state.trusts.append(props.get("run.trust")),
         ),
     )  # fmt: skip
     monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")

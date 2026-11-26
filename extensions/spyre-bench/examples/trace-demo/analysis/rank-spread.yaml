@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Slow-card detection: the same case, build and environment id, varying only the card (rank). Evaluated on stored rows,
+# where run.rank is a property of each per-rank row (schema 87); the engine's own `analyze` does not read it.
+apiVersion: bench/v1alpha1
+kind: Analysis
+metadata: {name: rank-spread, owner: example-team}
+spec:
+  select: {benchmarks: [decode-scaling]}
+  metric: llm.batch_latency.mean
+  hold: ["case.*", "system.*", "input.*", "subject.id", "env.id", run.world_size]
+  vary: [run.rank]
+  output: {controlled_sets: true, rank_variables: false, noise: series_floor, chart: dots-per-vary-key}

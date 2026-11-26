@@ -34,7 +34,8 @@ from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
 from torch_spyre._inductor import config
-from utils_inductor import _compile_and_run, compare_with_cpu
+from torch._inductor.exc import InductorError
+from utils_inductor import _compile_and_run, compare_with_cpu, expects_raise
 
 DEVICE = torch.device("spyre")
 S = 128  # must be a multiple of 64
@@ -1828,6 +1829,40 @@ def test_strict_transpose_0_last_clone(shape, dtype):
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
+# Regression coverage for issue #5216: the second half of x.split(704, dim=-1)
+# reads the source at host offset 704, which simplifies the device stick
+# expression Mod(d0 + 704, stick_size) down to Mod(d0, stick_size) because 704
+# is an exact multiple of every supported stick size (32 and 64 elements) --
+# but compute_restickify_target_layout's coord/expr offset-compatibility check
+# compared the chunk's raw, unreduced offset (704) against the already-reduced
+# expression's offset (0) and rejected the restickify as misaligned even though
+# 704 is itself stick-aligned. The downstream .transpose(0, 1) forces the stick
+# onto a different axis than the source, so this is the only geometry that
+# reaches that check (a pointwise/sum consumer with no transpose keeps the same
+# stick axis and never needs a restickify, regardless of chunk offset).
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
+def test_split_offset_transpose_restickify(dtype):
+    # Small dyadic values survive device conversion exactly for every dtype
+    # here; a wrong row or chunk must fail an exact comparison, not hide in a
+    # tolerance.
+    gen = torch.Generator().manual_seed(5216)
+    if dtype.is_floating_point:
+        x = torch.randint(-16, 17, (256, 1408), generator=gen).to(dtype) / 8
+    else:
+        x = torch.randint(-1000, 1000, (256, 1408), generator=gen, dtype=dtype)
+
+    def fn(t):
+        chunks = t.split(704, dim=-1)
+        return torch.stack([c.transpose(0, 1) for c in chunks])
+
+    got = torch.compile(fn, dynamic=False, fullgraph=True)(x.to(DEVICE)).cpu()
+    torch.testing.assert_close(got, fn(x), atol=0, rtol=0)
+
+
 # -------- torch.cat on the target-model shapes (#1094) ----------
 #
 # ``torch.cat`` lowers to two slice writes into one freshly cloned buffer, so a
@@ -2458,6 +2493,118 @@ def test_broadcast_input_transpose_clone():
     _strict(fn, x)
 
 
+# A clone that broadcasts a 1d input into a new stick dim (#4648):
+# ``x.unsqueeze(1).expand(T, K).clone()`` writes stick d1, which the input
+# ``x[d0]`` does not index.  One copy cannot move d0 from the stick and fill d1,
+# so _clone_layout fn restickifies x onto a size-1 stick first and the
+# clone becomes an identity broadcast/interleave/splash fill.
+# repeat_interleave on a 1d tensor decomposes to this pattern.
+BROADCAST_NEW_STICK = [
+    (torch.int32, (64, 8)),
+    (torch.int32, (64, 32)),
+    (torch.int32, (67, 8)),
+    (torch.int64, (64, 8)),
+    (torch.float16, (64, 8)),
+    (torch.float16, (64, 64)),
+    (torch.float16, (64, 67)),
+]
+
+
+@pytest.mark.parametrize(
+    "dtype, shape",
+    BROADCAST_NEW_STICK,
+    ids=[f"{str(d).split('.')[-1]}-{t}x{k}" for d, (t, k) in BROADCAST_NEW_STICK],
+)
+def test_broadcast_new_stick_clone(dtype, shape):
+    T, K = shape
+    x = _arange(T, dtype=dtype)
+    _strict(lambda x: x.unsqueeze(1).expand(T, K).clone(), x)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.int64, torch.float16], ids=lambda d: str(d).split(".")[-1]
+)
+def test_repeat_interleave_1d(dtype):
+    x = _arange(64, dtype=dtype)
+    _strict(lambda x: x.repeat_interleave(8), x)
+
+
+def test_broadcast_new_stick_plan():
+    """The broadcast clone takes the size-1 split, not a zero-cost restickify.
+
+    Exactly one restickify is planned, and its target stick is a size-1 dim:
+    stride_map[-1] == 0, one element per stick (a size-1 dim maps to no host
+    stride, as in dim_map_to_stride_map in spyre_tensor_impl.cpp).
+    """
+    T, K = 64, 8
+    x = _arange(T)
+
+    def fn(x):
+        return x.unsqueeze(1).expand(T, K).clone()
+
+    spyre, plan = _compile_and_run_plan_capture(fn, x)
+    assert torch.equal(spyre.cpu(), fn(x))
+    entries = [e for es in plan.values() for e in es]
+    assert len(entries) == 1, f"expected one restickify, got {plan}"
+    dl = entries[0].target_layout.device_layout
+    sm_last = int(list(dl.stride_map)[-1])
+    assert sm_last == 0, (
+        f"expected a size-1 target stick, got stride_map={list(dl.stride_map)} "
+        f"device_size={list(dl.device_size)}"
+    )
+
+
+# multi-dim inputs broadcast into a new last (stick) dim: the size-1 restickify
+# goes through the multi-dim branches of
+# compute_size1_restickify_layout (old stick var on an outer device dim for an
+# unaligned M, a size-1 outer device dim for an aligned M).
+BROADCAST_NEW_STICK_ND = [
+    (torch.float16, (8, 64), 8),
+    (torch.float16, (8, 67), 8),
+    (torch.int32, (8, 64), 4),
+    (torch.float16, (2, 4, 64), 8),
+]
+
+
+@pytest.mark.parametrize(
+    "dtype, in_shape, k",
+    BROADCAST_NEW_STICK_ND,
+    ids=[
+        f"{str(d).split('.')[-1]}-{'x'.join(map(str, s))}x{k}"
+        for d, s, k in BROADCAST_NEW_STICK_ND
+    ],
+)
+def test_broadcast_new_stick_clone_nd(dtype, in_shape, k):
+    x = _arange(*in_shape, dtype=dtype)
+    _strict(lambda x: x.unsqueeze(-1).expand(*in_shape, k).clone(), x)
+
+
+def test_broadcast_new_stick_clone_bool():
+    """A bool clone builds its layout from the input's device format
+    (bool_layout_dtype), while the size-1 target takes its stick size from the
+    host dtype; both must agree for the split to be correct.
+    """
+    T, K = 64, 8
+    x = _arange(T, dtype=torch.int32) % 3 == 0
+    _strict(lambda x: x.unsqueeze(1).expand(T, K).clone(), x)
+
+
+@expects_raise
+def test_broadcast_new_stick_clone_offset():
+    """Broadcast clone of an offset view (x[3:]).
+
+    TODO(#4648 follow-up): _clone_layout's offset path has no one-value-per-stick
+    split, so this is rejected before the split is tried.  Make this a positive
+    test when it lands.
+    """
+    T, K = 64, 8
+    x = _arange(T + 3, dtype=torch.int32)
+    with pytest.raises(
+        InductorError, match="No supported layout found for stick expression"
+    ):
+        _strict(lambda x: x[3:].unsqueeze(1).expand(T, K).clone(), x)
+
+
 # Matmul with a SUB-STICK contraction dim (D) reached through a permuted key,
 # k.permute(0,2,3,1), which restickifies k into [B,H,D,Lk] with the sub-stick D
 # demoted to a non-stick device dim.  When D does not fill a whole stick (D=48)
@@ -2761,17 +2908,17 @@ def test_restickify_broadcast_into_stick(shape, bwidth):
 #
 # A restickify whose old stick has host size 1 collapses one operand's
 # within-stick coordinate to a constant, so that operand's STL carries the old
-# stick as a size-1 ``stride_map == -1`` singleton dim, while the restore
+# stick as a size-1 ``stride_map == 0`` singleton dim, while the restore
 # (_restickify_restore_elided_dim) rebuilds the descriptor to sweep a full
 # 64-plane stick.  The grow is two coupled halves: padding._pad_elided_dim
-# prepends an outermost size-64 ``-1`` gap dim to the (intact) operand's STL so
+# prepends an outermost size-64 ``0`` gap dim to the (intact) operand's STL so
 # the allocation covers the sweep, and the restore REUSES that dim (binds the
 # shared iteration symbol to it) rather than inserting its own, keeping the
 # descriptor total equal to the grown allocation.  These tests pin each half
 # against the real STL / OpSpec APIs, without a device (the functional
 # lane-displacement checks are the *_stick_crossing_* tests above).
 _SIZE1_COLLAPSED_DEVICE_SIZE = [67, 1, 1, 64]
-_SIZE1_COLLAPSED_STRIDE_MAP = [7, 64, -1, 1]
+_SIZE1_COLLAPSED_STRIDE_MAP = [7, 64, 0, 1]
 _SIZE1_HOST_SIZE = [1, 67, 7]
 _SIZE1_HOST_STRIDE = [469, 7, 1]
 _SIZE1_STICK = 64  # SEN169_FP16 elems_per_stick
@@ -2810,10 +2957,10 @@ def test_size1_grow_prepends_size64_gap_dim():
     _pad_elided_dim(buf)
 
     dl = buf.layout.device_layout
-    # An outermost size-64 gap dim (stride_map -1) is prepended; the original
+    # An outermost size-64 gap dim (stride_map 0) is prepended; the original
     # device dims follow unchanged.
     assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
-    assert list(dl.stride_map) == [-1, *_SIZE1_COLLAPSED_STRIDE_MAP]
+    assert list(dl.stride_map) == [0, *_SIZE1_COLLAPSED_STRIDE_MAP]
     # Allocation is 128B/stick * prod(device_size[:-1]) (get_device_size_in_bytes
     # in spyre_tensor_impl.cpp); the prepended dim grows it exactly 64x.
     alloc_bytes = 128 * math.prod(list(dl.device_size)[:-1])
@@ -2829,7 +2976,7 @@ def _size1_restickify_op_spec():
     from torch_spyre._C import DataFormats
     from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
-    def tensor_arg(is_input, arg_index, device_size, coords):
+    def tensor_arg(is_input, arg_index, device_size, stride_map, coords):
         return TensorArg(
             is_input=is_input,
             arg_index=arg_index,
@@ -2837,6 +2984,7 @@ def _size1_restickify_op_spec():
             device_size=list(device_size),
             device_coordinates=list(coords),
             allocation={"hbm": 0x400000000 + arg_index * 0x1000},
+            stride_map=list(stride_map),
         )
 
     c = sympy.Symbol("c")
@@ -2846,6 +2994,7 @@ def _size1_restickify_op_spec():
         is_input=True,
         arg_index=0,
         device_size=[67, 1, 1, 64],
+        stride_map=[7, 0, 469, 0],
         coords=[c, sympy.Integer(0), sympy.Integer(0), sympy.Integer(0)],
     )
     # Intact OUTPUT: the grow prepended an outermost size-64, symbol-less gap dim;
@@ -2854,6 +3003,7 @@ def _size1_restickify_op_spec():
         is_input=False,
         arg_index=1,
         device_size=[64, 67, 1, 64],
+        stride_map=[0, 7, 469, 1],
         coords=[sympy.Integer(0), c, sympy.Integer(0), sympy.Mod(c, 64)],
     )
     return OpSpec(
@@ -2898,10 +3048,63 @@ def test_size1_restore_asserts_when_phantom_absent():
     out_arg = op_spec.args[1]
     # Drop the prepended gap dim to simulate the un-grown STL.
     out_arg.device_size = [67, 1, 64]
+    out_arg.stride_map = out_arg.stride_map[1:]
     out_arg.device_coordinates = out_arg.device_coordinates[1:]
 
     with pytest.raises(AssertionError, match="padding-prepended"):
         _restickify_restore_elided_dim(op_spec)
+
+
+def _sum_plus_dense(rows):
+    """``x.sum(-1) + y[64, rows]``: ``x.sum(-1)`` is sparse (one value per stick),
+    so ``y`` is restickified from it to dense: a size-1 restickify whose target
+    needs exactly one size-64 gap dim; a second multiplied the allocation and the
+    sweep by 64 (#6105).
+    Exact: the values are small integers, sums stay under 1024.
+    """
+    x = ((torch.arange(rows * 64) * 7 + 3) % 5 - 2).to(torch.float16).reshape(rows, 64)
+    y = ((torch.arange(64 * rows) * 3 + 1) % 257).to(torch.float16).reshape(64, rows)
+    return (lambda a, b: a.sum(-1) + b), x, y
+
+
+def _restickify_output_sizes(fn, *args):
+    """Run ``fn`` compiled and return (CPU result, the device size of every
+    size-1 restickify's output after the padding pass)."""
+    import torch_spyre._inductor.padding as _padding
+    from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+
+    sizes = []
+    run_one_pass = CustomPreSchedulingPasses._run_one_pass
+
+    def capturing_run_one_pass(self, graph, pipeline, pass_fn, pass_name):
+        run_one_pass(self, graph, pipeline, pass_fn, pass_name)
+        if pass_fn is not _padding.insert_restickify_padding:
+            return
+        for op in graph.operations:
+            if _padding.is_restickify_op(op, graph):
+                sizes.append(list(op.get_layout().device_layout.device_size))
+
+    with patch.object(
+        CustomPreSchedulingPasses, "_run_one_pass", capturing_run_one_pass
+    ):
+        result = _compile_and_run(fn, args, DEVICE)
+    return result, sizes
+
+
+def test_sparse_to_dense_restickify_has_one_size64_dim():
+    fn, x, y = _sum_plus_dense(256)
+    result, sizes = _restickify_output_sizes(fn, x, y)
+    torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
+    # One gap dim: [64, 4, 64], not [64, 64, 4, 64].
+    assert sizes == [[64, 4, 64]]
+
+
+def test_sparse_to_dense_restickify_above_4mib():
+    # 8 MiB of sparse data. With two gap dims each core swept 64 x 64 x rows / 64
+    # sticks, over the backend's 256 MiB address offset above 4 MiB.
+    fn, x, y = _sum_plus_dense(65536)
+    result = _compile_and_run(fn, (x, y), DEVICE)
+    torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
 
 
 def test_round_up_to_stick_geometry():

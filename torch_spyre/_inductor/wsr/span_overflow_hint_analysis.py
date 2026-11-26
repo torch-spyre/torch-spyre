@@ -172,7 +172,7 @@ _MAX_AUTO_TILE_SPLIT_COUNT = 64
 
 # Non-matmul reduction types whose partial results recombine associatively
 # through coarse_tile's identity-fill + per-tile combine + drain path
-# (see coarse_tile._reduction_identity_value / _insert_combine_op).  A
+# (see coarse_tile._reduction_identity_value / _make_combine_buffer).  A
 # reduction whose type is in this set and which has exactly one reduction
 # range is eligible for an automatic reduction-range ("K-style") coarse tile,
 # the same mechanism BMM K already uses.  Intentionally excluded: ``mean``
@@ -361,8 +361,7 @@ def _post_tile_resize_error(
     ``_resize_device_layout`` call, which raises on e.g. a device dim folding
     two host dims. The full buffer the tiles are gathered into needs no check:
     it is not grown back from the tile, it takes the layout planning recorded
-    (``PropagationPlan.full_device_layout`` for a copy-out,
-    ``ReductionPlan.full_output_device_layout`` for an accumulator). A symbolic
+    (for a copy-out the full buffer's layout, for an accumulator the reduction's). A symbolic
     size is read at its compile-time value, which the device layout was built
     from."""
     layout = op.layout
@@ -687,7 +686,7 @@ def _coordinate_span_elems(
         if range_size % split_count != 0:
             return None
         range_size //= split_count
-        term = coord.subs(dict.fromkeys(coord.free_symbols - {sym}, 0))
+        term = coord.xreplace(dict.fromkeys(coord.free_symbols - {sym}, 0))
         if term.has(sympy.Mod):
             mod_atoms = term.atoms(sympy.Mod)
             if any(mod.args[0] != sym for mod in mod_atoms):
@@ -708,12 +707,12 @@ def _coordinate_span_elems(
             candidate_points = {min(range_size, modulus) - 1 for modulus in moduli}
             candidate_points.add(0)
             candidate_points.add(range_size - 1)
-            values = [int(term.subs(sym, point)) for point in candidate_points]
+            values = [int(term.xreplace({sym: point})) for point in candidate_points]
             per_core_max += max(values)
             per_core_min += min(values)
             continue
-        per_core_max += int(term.subs(sym, range_size - 1))
-        per_core_min += int(term.subs(sym, 0))
+        per_core_max += int(term.xreplace({sym: range_size - 1}))
+        per_core_min += int(term.xreplace({sym: 0}))
     return per_core_max - per_core_min + 1
 
 
@@ -1099,9 +1098,9 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
     ``plan_span_overflow_tile``), unaffected by the config check here.
 
     Without this check (and when not disabled) the span is silently dropped,
-    ``span_reduction_pass`` cannot split the reduced axis either (multi-axis
-    plain reductions are pinned to split=1), and the op reaches the backend
-    over the limit.
+    the span floors (``work_division.span_floors``) cannot split the reduced
+    axis either (multi-axis plain reductions are pinned to split=1), and the
+    op reaches the backend over the limit.
     """
     if not isinstance(op.data, Reduction) or _supports_reduction_range_tiling(op):
         return False

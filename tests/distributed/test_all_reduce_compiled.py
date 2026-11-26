@@ -151,6 +151,24 @@ def _split_k_then_flat_allreduce(x: torch.Tensor, y: torch.Tensor) -> torch.Tens
     return torch.ops._c10d_functional.wait_tensor(reduced).reshape(acc.shape)
 
 
+def _split_k_then_squeezed_allreduce(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The traced MoE's expert sum: a [1, M, N] carry squeezed, reduced, then read."""
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + (x_tile @ y_tile).unsqueeze(0), None
+
+    acc, _ = for_each_tile(
+        body,
+        (x, y),
+        dims=(-1, 0),
+        tile_size=64,
+        init=torch.zeros(1, _CARRY_M, _CARRY_N, device=x.device, dtype=x.dtype),
+    )
+    reduced = torch.ops._c10d_functional.all_reduce(acc.squeeze(0), "sum", _GROUP_NAME)
+    return torch.ops._c10d_functional.wait_tensor(reduced) * 2.0
+
+
 def _loop_update_allocations(source: str) -> list[str]:
     """Allocation kinds of the carry update, the first ``add`` in the LoopSpec."""
     loop = source[source.index("LoopSpec(") :]
@@ -487,6 +505,28 @@ class TestAllReduceCompiled(TestCase):
         result, sources = run_and_get_code(
             compiled, (x * scale).to(DEVICE), y.to(DEVICE)
         )
+
+        torch.testing.assert_close(result.cpu().float(), expected, atol=0, rtol=0)
+        self.assertIn("allreduce_run(", "\n".join(sources))
+
+    def test_allreduce_of_squeezed_loop_carry_with_lx_planning(self):
+        """The all_reduce_ copy-back writes the carry storage, so the LX planner
+        must give it the storage's core division; it ran on 2 cores against the
+        storage's 32 and failed to compile."""
+        g = torch.Generator().manual_seed(0)
+        x = torch.randint(0, 2, (_CARRY_M, _CARRY_K), generator=g).half()
+        y = torch.randint(0, 2, (_CARRY_K, _CARRY_N), generator=g).half()
+        scale = self.comm_rank + 1
+        rank_sum = self.comm_size * (self.comm_size + 1) / 2
+        expected = (x.float() @ y.float()) * rank_sum * 2.0
+
+        compiled = torch.compile(_split_k_then_squeezed_allreduce, fullgraph=True)
+        with spyre_config.patch(
+            {"lx_planning": True, "co_optimizing_lx_planning": True}
+        ):
+            result, sources = run_and_get_code(
+                compiled, (x * scale).to(DEVICE), y.to(DEVICE)
+            )
 
         torch.testing.assert_close(result.cpu().float(), expected, atol=0, rtol=0)
         self.assertIn("allreduce_run(", "\n".join(sources))

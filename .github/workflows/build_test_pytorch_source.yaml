@@ -73,11 +73,15 @@ jobs:
       # stage: torch_build" write below is what creates the row. Available
       # because the caller invokes this reusable workflow with
       # `secrets: inherit`.
+      # REMAINING V1 WRITER (pytorch_ci_dispatches has no v2 table): uses the legacy *_DEV secrets;
+      # their steps are non-fatal, so removing the secrets would fail silently.
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
       CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+      CLICKHOUSE_SCHEMA_USER: ${{ secrets.CLICKHOUSE_SCHEMA_USER_DEV }}
+      CLICKHOUSE_SCHEMA_PASSWORD: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD_DEV }}
     outputs:
       pytorch_build_seconds: ${{ steps.compute_durations.outputs.pytorch_build_seconds }}
       torch_spyre_build_seconds: ${{ steps.compute_durations.outputs.torch_spyre_build_seconds }}
@@ -297,11 +301,15 @@ jobs:
       actions: write
       id-token: write
     env:
+      # REMAINING V1 WRITER (pytorch_ci_dispatches has no v2 table): uses the legacy *_DEV secrets;
+      # their steps are non-fatal, so removing the secrets would fail silently.
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
       CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+      CLICKHOUSE_SCHEMA_USER: ${{ secrets.CLICKHOUSE_SCHEMA_USER_DEV }}
+      CLICKHOUSE_SCHEMA_PASSWORD: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD_DEV }}
     steps:
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
