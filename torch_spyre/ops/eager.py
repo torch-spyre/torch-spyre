@@ -975,6 +975,59 @@ def spyre__cumsum_(
     return self
 
 
+def _triangular_out(op, self: torch.Tensor, diagonal: int, out: torch.Tensor):
+    """``op(self, diagonal, out=out)``; ``out`` may alias ``self``."""
+    _check_same_device([(out, True), (self, False)])
+    if out.dtype != self.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {self.dtype}, but got {out.dtype} "
+            "instead"
+        )
+    return _copy_into_out(op(self, diagonal), out)
+
+
+def _copy_into_out(result: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Resize ``out`` to ``result``'s shape, as aten's out= does, and copy it in."""
+    if out.shape != result.shape:
+        out.resize_(result.shape)
+    out.copy_(result)
+    return out
+
+
+# The decompositions of arange, tril and triu cover the functional overloads;
+# out= runs the functional op on device and copies into ``out``, in its dtype.
+def _arange_out(start, end, step, out: torch.Tensor) -> torch.Tensor:
+    """``arange(start, end, step, out=out)`` in ``out``'s dtype."""
+    result = torch.arange(start, end, step, dtype=out.dtype, device=out.device)
+    return _copy_into_out(result, out)
+
+
+@torch.library.register_kernel("aten::arange.out", ["spyre"])  # type:ignore
+def spyre__arange_out(end, *, out: torch.Tensor) -> torch.Tensor:
+    return _arange_out(0, end, 1, out)
+
+
+@torch.library.register_kernel("aten::arange.start_out", ["spyre"])  # type:ignore
+def spyre__arange_start_out(start, end, step=1, *, out: torch.Tensor) -> torch.Tensor:
+    return _arange_out(start, end, step, out)
+
+
+@torch.library.register_kernel("aten::tril.out", ["spyre"])  # type:ignore
+def spyre__tril_out(
+    self: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor
+) -> torch.Tensor:
+    """``tril(self, diagonal, out=out)``."""
+    return _triangular_out(torch.tril, self, diagonal, out)
+
+
+@torch.library.register_kernel("aten::triu.out", ["spyre"])  # type:ignore
+def spyre__triu_out(
+    self: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor
+) -> torch.Tensor:
+    """``triu(self, diagonal, out=out)``."""
+    return _triangular_out(torch.triu, self, diagonal, out)
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
