@@ -55,9 +55,11 @@ import sympy
 import torch
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, Operation, Pointwise
+from torch._inductor.ir import ComputedBuffer, IRNode, Operation, Pointwise, TensorBox
 from torch._inductor.ops_handler import WrapperHandler
+from torch._inductor.utils import gather_origins
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
 from .errors import Unsupported
 from .logging_utils import get_inductor_logger
@@ -194,6 +196,32 @@ def _index_fx_node(graph: GraphLowering, name: str) -> torch.fx.Node | None:
     return node
 
 
+def _lower_offsets_cast(
+    graph: GraphLowering, node: torch.fx.Node, scaled: TensorBox
+) -> TensorBox:
+    """Lower ``node`` (float32 offsets -> index dtype) without a trunc.
+
+    Every offset is a whole number below 2**24, exact in float32, so the cast
+    needs no trunc (``to_dtype``'s ``skip_trunc``). With one, the trunc's
+    abs/floor/mul fuse into a kernel that ``split_multi_ops`` cannot split,
+    which codegen rejects. ``prims.convert_element_type`` takes no
+    ``skip_trunc``, so the lowering is called directly, with the origins
+    ``run_node`` would give it: ``node`` plus its input's (the multiply's), so
+    ``split_multi_ops`` can still split the fused body, as in
+    ``pass_utils``'s direct ``lower_constant_pad_nd`` call.
+    """
+    # Imported here, as every other pass does, to avoid an import cycle.
+    from .lowering import to_dtype
+
+    dtype = node.args[1]
+    with (
+        IRNode.current_origins(OrderedSet([node]) | gather_origins((scaled,), {})),
+        V.set_current_node(node),
+        graph.set_current_node(node),
+    ):
+        return to_dtype(scaled, dtype, skip_trunc=True)
+
+
 def _lower_rows(
     graph: GraphLowering, op: ComputedBuffer, plan: _FoldPlan
 ) -> tuple[str, list[Operation]] | None:
@@ -204,8 +232,9 @@ def _lower_rows(
     ``arange`` decomposition (it ran before this pass), and ``aten.arange`` has
     no host fallback (#4647), so emit what the decomposition produces, as
     ``strided_stick_slice_to_index_select`` does: the cached device ramp
-    ``spyre.arange`` in float32, scaled by the step, converted to the index
-    dtype. Returns (rows buffer name, new operations).
+    ``spyre.arange`` in float32, scaled by the step (held in a constant buffer,
+    see below), converted to the index dtype without a trunc. Returns (rows
+    buffer name, new operations).
     """
     index_fx = _index_fx_node(graph, plan.index_name)
     anchor = op.get_origin_node() or (next(iter(op.origins)) if op.origins else None)
@@ -235,10 +264,28 @@ def _lower_rows(
             args=(plan.extent, torch.float32, device),
         )
         ramp_fx.meta["val"] = ramp_val
-        scaled_fx = fx_graph.create_node(
-            "call_function", aten.mul.Tensor, args=(ramp_fx, float(plan.step))
-        )
-        scaled_fx.meta["val"] = ramp_val
+        new_nodes = [ramp_fx]
+        scaled_fx = ramp_fx
+        if plan.step != 1:
+            # Scale by a constant buffer, not a Python float: this mul lowers
+            # as a lone pointwise op, which split_multi_ops never splits, so an
+            # inline ops.constant operand would reach SpyreKernel.store, which
+            # takes tensor operands only. aten.full lowers to a
+            # SpyreConstantFallback buffer, as lower_sub does for alpha.
+            step_fx = fx_graph.create_node(
+                "call_function",
+                aten.full.default,
+                args=([plan.extent], float(plan.step)),
+                kwargs={"dtype": torch.float32, "device": device},
+            )
+            step_fx.meta["val"] = ramp_val
+            scaled_fx = fx_graph.create_node(
+                "call_function", aten.mul.Tensor, args=(ramp_fx, step_fx)
+            )
+            scaled_fx.meta["val"] = ramp_val
+            new_nodes += [step_fx, scaled_fx]
+        # A plain convert_element_type node in the graph, but lowered below with
+        # skip_trunc, not through run_node; the node gives it an FX origin.
         offsets_fx = fx_graph.create_node(
             "call_function",
             torch.ops.prims.convert_element_type.default,
@@ -253,8 +300,12 @@ def _lower_rows(
             "call_function", aten.add.Tensor, args=(index_fx, view_fx)
         )
         rows_fx.meta["val"] = torch.empty(size, dtype=dtype, device=device)
-    for node in (ramp_fx, scaled_fx, offsets_fx, view_fx, rows_fx):
-        graph.env[node] = graph.run_node(node)
+        new_nodes += [offsets_fx, view_fx, rows_fx]
+    for node in new_nodes:
+        if node is offsets_fx:
+            graph.env[node] = _lower_offsets_cast(graph, node, graph.env[scaled_fx])
+        else:
+            graph.env[node] = graph.run_node(node)
     rows_tb = graph.env[rows_fx]
     rows_tb.realize()
     return rows_tb.get_name(), graph.operations[ops_before:]
