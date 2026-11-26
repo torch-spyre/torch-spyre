@@ -582,7 +582,11 @@ ALL_DTYPES = [
 ALL_DTYPE_PAIRS = [(src, dst) for src in ALL_DTYPES for dst in ALL_DTYPES if src != dst]
 
 TO_DTYPE_OP_SHAPES_UNALIGNED = [
-    (100,),  # 1D unaligned: not a multiple of 64; (68,) was a lucky case that passes
+    (100,),  # 1D unaligned; staggered sums are rejected (#4014)
+    (68,),  # 1D unaligned, 4 past a stick: one tail run of padding, so it is correct
+    (60,),  # 1D unaligned, 4 short of a stick
+    (65,),  # 1D unaligned, 1 past a stick
+    (4, 60),  # 2D unaligned, 4 short of a stick
     (4, 16),
     (4, 68),
     (4, 32),  # exactly 1 fp32 stick -- shape[-1] < 32 check should NOT apply here
@@ -7269,9 +7273,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "bool_2d": (cached_randint((67, 256), high=2) > 0,),
                 # Unaligned bool: the bool→fp32 upcast produces a staggered
                 # DL16_TO_FP32 tensor; the compiler rejects (Unsupported) a
-                # reduction of a staggered input whose stick-dim size is not a
-                # multiple of 64, because the backend returns a wrong result
-                # (#4014).
+                # reduction of a staggered input whose stick-dim size is not within
+                # 4 of a multiple of 64, because the backend returns a wrong
+                # result (#4014).
                 "bool_1d_unaligned": (cached_randint((100,), high=2) > 0,),
                 "bool_2d_unaligned": (cached_randint((1, 855), high=2) > 0,),
                 # Full sum() of a 2-D tensor has two reduction variables, so
@@ -8842,11 +8846,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # The EA shuffle that writes the upcast into d writes one float32 stick
             # past d's last stick, so the result is right or wrong depending on what
             # lies behind d's buffer (#6693). A strict xfail would turn that into
-            # a flaky failure, so these are non-strict. The unaligned 1D shape is
-            # 100 elements here (it was 68 on main), hence the _100 key.
+            # a flaky failure, so these are non-strict. Only the 68- and 100-element
+            # 1D shapes are listed.
             "expect_fail_unstable": {
-                f"{dtype}_to_float32_100": "the EA shuffle writes past d, #6693"
+                f"{dtype}_to_float32_{n}": "the EA shuffle writes past d, #6693"
                 for dtype in ("float16", "bfloat16")
+                for n in (68, 100)
             },
         },
         (

@@ -2572,17 +2572,28 @@ def _multi_arg_pointwise_layouts(
     return results
 
 
+# Elements per group in a staggered stick; see _prune_unaligned_staggered_inputs.
+_STAGGER_GROUP = 4
+
+
 def _prune_unaligned_staggered_inputs(
     op: Operation, arg: "PropArg", output_dep: MemoryDep
 ) -> None:
     """Remove staggered STL candidates where the reduction is over the stick
-    and the stick dimension is not a multiple of the stagger unit (64 elements).
+    and the stick dimension's padding is not one tail run (see below).
 
     Issue #4014: for a staggered (``DL16_TO_FP32`` or ``FP32_TO_DL16``) input,
     when a reduction variable lives on the stick dimension and that dimension's
     size is not a multiple of 64 (the stagger unit), the backend's coordinate
     masking emits a single tail-interval which covers the wrong lanes and
     silently returns an incorrect result.
+
+    The tail interval is still right when the last stagger unit holds at most
+    one group of four live elements (``n % 64 <= 4``) or lacks at most one group
+    of four (``n % 64 >= 60``): the padding lanes are then one run at the end of
+    the dimension, as in a standard arrangement. Both arrangements have this
+    property (checked against the permutations in #4014 and on device, e.g.
+    N=60, 63, 68 are correct and N=59, 69, 100 are not), so those sizes are kept.
 
     Every reduced variable is considered: a reduction can have several (a full
     ``sum()`` of a 2-D tensor reduces both dims), and the guard fires when any
@@ -2621,7 +2632,9 @@ def _prune_unaligned_staggered_inputs(
         if stick_dim is None:
             continue
         n = concretize_expr(arg.layout.size[stick_dim])
-        if n % stagger_unit != 0:
+        r = n % stagger_unit
+        if min(r, stagger_unit - r) > _STAGGER_GROUP:
+            # Padding lanes are not one tail run; the mask names the wrong lanes.
             bad[id(stl)] = n
 
     if not bad:
@@ -2633,8 +2646,8 @@ def _prune_unaligned_staggered_inputs(
         n = bad[id(stl)]
         raise Unsupported(
             f"{op.get_name()} ({op.data.reduction_type}): reduction of a staggered "
-            f"({stl.element_arrangement}) input whose stick-dim size {n} is not a "
-            f"multiple of {stagger_unit} (issue #4014)"
+            f"({stl.element_arrangement}) input whose stick-dim size {n} is not "
+            f"within {_STAGGER_GROUP} of a multiple of {stagger_unit} (issue #4014)"
         )
     arg.layouts[:] = kept
 

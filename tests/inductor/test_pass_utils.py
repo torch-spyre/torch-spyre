@@ -890,3 +890,40 @@ def test_unaligned_staggered_guard_considers_every_reduction_var(
 
     with pytest.raises(Unsupported, match="issue #4014"):
         _prune_unaligned_staggered_inputs(op, PropArg(dep, host, [stl]), scalar_out)
+
+
+@pytest.mark.parametrize(
+    "ea, dtype",
+    [
+        (ElementArrangement.DL16_TO_FP32, torch.float32),
+        (ElementArrangement.FP32_TO_DL16, torch.float16),
+    ],
+)
+@pytest.mark.parametrize(
+    "n, rejected",
+    [(59, True), (60, False), (63, False), (64, False), (65, False)]
+    + [(68, False), (69, True), (100, True), (125, False), (133, True)],
+)
+def test_unaligned_staggered_guard_allows_tail_run_sizes(ea, dtype, n, rejected):
+    """The guard keeps sizes within 4 of a multiple of 64 (#4014).
+
+    There the padding lanes are one run at the end of the dimension, so the
+    backend's single tail interval masks the right lanes (checked on device:
+    N=60, 63, 68 are correct, N=59, 69, 100 are not).
+    """
+    i = sympy_index_symbol("c0")
+    stl = SpyreTensorLayout([n], dtype).with_element_arrangement(ea)
+    host = FixedLayout(torch.device("cpu"), dtype, [n], [1])
+    dep = MemoryDep("x", i, (i,), (n,))
+    scalar_out = MemoryDep("y", sympy.S.Zero, (), ())
+    op = mock.MagicMock()
+    op.get_name.return_value = "buf1"
+    op.data.reduction_type = "sum"
+    arg = PropArg(dep, host, [stl])
+
+    if rejected:
+        with pytest.raises(Unsupported, match="issue #4014"):
+            _prune_unaligned_staggered_inputs(op, arg, scalar_out)
+    else:
+        _prune_unaligned_staggered_inputs(op, arg, scalar_out)
+        assert arg.layouts == [stl]
