@@ -1584,6 +1584,30 @@ def scatter_carry_old_value_fn(values, indices, output):
     )
 
 
+def cast_fp32_to_int32_tiled_fn(x, *, tile_size):
+    """A plain ``fp32 -> int32`` cast on each tile -- issue #6410.
+
+    The device has no truncation op, so ``lower_trunc`` synthesizes the cast
+    as ``floor(|x|) * clip(x, -1, 1)``. Outside a loop, ``split_multi_ops``
+    decomposes that fused body into separate buffers after the fact. Inside
+    a ``for_each_tile`` body, the body is lowered against the ``while_loop``
+    HOP's own FX subgraph (see upstream ``ir.WhileLoop.create``); once
+    ``splice_while_loops`` flattens that body into the top-level graph, the
+    op's origin still names a node in the now-disconnected subgraph, so
+    ``split_multi_ops``'s ``origin_in_graph`` lookup finds nothing and
+    silently skips it (see that pass's own origin-scoping comment). The
+    fused ``floor(abs(x))`` then reaches ``SpyreKernel.store`` undecomposed,
+    which rejects it as an unsupported argument to ``mul``.
+    """
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(_carry, tiles):
+        return None, tiles[0].to(torch.int32)
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Graph-shape fixtures: for_each_tile bodies that interact with other passes
 # (restickify, views, broadcast, outside consumers, E-tiled matmul, carried

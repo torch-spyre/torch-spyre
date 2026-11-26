@@ -2249,10 +2249,22 @@ def lower_trunc(x):
     since the device multiply makes no negative zero. An integer or bool input
     comes back as a copy, since an op's result must not alias its input.
 
-    The clip is Spyre's single clip op (lower_clamp). It and the product are
-    realized with origins of their own, so split_multi_ops can split the bodies
-    that read them: the product reads x twice, which split_multi_ops allows over
-    a view only as a body's last op.
+    The clip is Spyre's single clip op (lower_clamp). It, |x|, floor(|x|),
+    and the product are all realized with origins of their own: each is
+    forced into its own buffer directly, rather than left fused for
+    split_multi_ops to pull apart later. split_multi_ops cannot be relied on
+    for that here -- a for_each_tile loop body is lowered against the
+    while_loop body's own FX subgraph, and once splice_while_loops flattens
+    that body's ops into the top-level graph, their origins still name nodes
+    in the now-disconnected subgraph rather than the top-level graph
+    split_multi_ops searches. Its `origin_in_graph` lookup then silently
+    finds nothing and skips the op (see issue #6410), leaving `abs` and
+    `floor` fused into one buffer (which SpyreKernel.store rejects as an
+    unsupported argument to `floor`) and that buffer fused again into the
+    product's body (rejected as an argument to `mul`). Realizing every term
+    here instead sidesteps that gap entirely: every op ends up combining only
+    already-materialized buffers, so there is nothing left for
+    split_multi_ops to split, whether or not it can see this op's origin.
     """
     if not x.get_dtype().is_floating_point:
         # Upstream's clone keeps x's layout; ours forces the standard one.
@@ -2261,7 +2273,11 @@ def lower_trunc(x):
     origin_args = () if origin is None else (origin,)
     sign = lower_clamp(x, -1.0, 1.0)
     _ensure_synthetic_origin(sign, torch.ops.aten.clamp.default, origin_args)
-    result = lowering.mul(lowering.floor(lowering.abs(x)), sign)
+    abs_x = lowering.abs(x)
+    _ensure_synthetic_origin(abs_x, torch.ops.aten.abs.default, origin_args)
+    floor_abs = lowering.floor(abs_x)
+    _ensure_synthetic_origin(floor_abs, torch.ops.aten.floor.default, origin_args)
+    result = lowering.mul(floor_abs, sign)
     _ensure_synthetic_origin(result, torch.ops.aten.trunc.default, origin_args)
     return result
 

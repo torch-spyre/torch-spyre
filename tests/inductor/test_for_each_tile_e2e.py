@@ -104,6 +104,7 @@ from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     carried_expert_sum_fn,
     carried_reduction_fn,
+    cast_fp32_to_int32_tiled_fn,
     embedding_restickify_inputs,
     embedding_restickify_table_fn,
     fill_add_tiled_fn,
@@ -454,6 +455,38 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                     sums.cpu().float(), torch.stack(old_sums), atol=0, rtol=0
                 )
                 torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
+
+    def test_cast_fp32_to_int32_in_tile_body_matches_eager(self):
+        """Regression test for issue #6410.
+
+        `cast_fp32_to_int32_tiled_fn`'s per-tile ``fp32 -> int32`` cast is
+        lowered inside a `for_each_tile` body, where `lower_trunc`'s fused
+        ``floor(|x|) * clip(x, -1, 1)`` synthesis of the cast used to reach
+        `SpyreKernel.store` undecomposed (see that fixture's docstring) and
+        raise `InductorError: ... unexpected argument
+        PointwiseOp(op='floor', ...) to mul`. Reverting the `lower_trunc`
+        fix (realizing ``abs(x)``/``floor(|x|)`` eagerly instead of leaving
+        them fused for `split_multi_ops` to split later) reproduces the
+        crash here.
+
+        Values include both positive and negative fractions so the fix is
+        checked against `trunc`-toward-zero value semantics, not just that
+        compilation succeeds.
+        """
+        torch.manual_seed(6410)
+        rows, cols, tile_size = 128, 64, 64
+
+        x = (torch.rand(rows, cols) * 200 - 100).to(torch.float32)
+        expected = x.to(torch.int32)
+
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            cast_fp32_to_int32_tiled_fn, fullgraph=True, dynamic=False
+        )
+        with torch.inference_mode():
+            actual = compiled(x.to(DEVICE_NAME), tile_size=tile_size)
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
     def test_computed_where_condition_in_broadcast_tile(self):
         from torch_spyre.ops.fallbacks import FallbackWarning
