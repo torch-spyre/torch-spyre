@@ -18,7 +18,7 @@ import math
 import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -79,7 +79,7 @@ from .core_mapping import (
 )
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
     MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
@@ -108,7 +108,7 @@ _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
     "iteration_space_ownership",
-    "loop_info",
+    "loop_member",
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
@@ -133,6 +133,10 @@ _SPYRE_METADATA_ATTRS = (
     # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
     # since that module imports this one (through pass_utils).
     "_work_division_chosen_with_tiling",
+    # Marks an element-arrangement shuffle copy inserted by insert_ea_shuffle;
+    # passes find them by this tag, and must still see it after any
+    # rebuild of the buffer (e.g. when its input is redirected).
+    "ea_shuffle",
 )
 
 
@@ -171,6 +175,12 @@ def copy_op_metadata(
     for attr in attrs:
         if hasattr(src, attr):
             setattr(dst, attr, getattr(src, attr))
+    if getattr(src, "_loop_chain", ()):
+        # ``src`` is a member of built loop nodes (they, not an attribute, hold
+        # that). ``dst`` is a copy of it: when a loop_node helper places ``dst``
+        # in those nodes it becomes a member that tiles what ``src`` tiles, unless
+        # the pass clears this (a drain or a hoisted clone is not a member).
+        dst._member_like = src  # type: ignore[attr-defined]
 
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -1366,6 +1376,30 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(eff, output_dep, sizes)
 
 
+def restickify_sweep_dim(
+    device_size: Sequence[int],
+    stride_map: Sequence[int] | None,
+    device_coords: Sequence[Expr],
+    elems_per_stick: int,
+) -> int | None:
+    """Index of the gap dim a size-1 restickify sweeps on its intact operand, if any.
+
+    When the host dim on one side of a restickify has size 1, the padding pass
+    (``_pad_elided_dim``) gives the other, intact operand an outermost
+    size-``elems_per_stick`` dim that holds no data (``stride_map`` 0) and that
+    nothing indexes (coordinate 0). Codegen (``_restickify_restore_elided_dim``)
+    later binds a loop variable to it, and the kernel sweeps all its slices on
+    every core.  Work division and codegen both find the dim through this rule, so
+    the span check counts the same dim the kernel sweeps.  Without a stride map
+    there is no gap dim to find.
+    """
+    if stride_map is None:
+        return None
+    if len(device_size) < 2 or device_size[0] != elems_per_stick:
+        return None
+    return 0 if stride_map[0] == 0 and device_coords[0] == 0 else None
+
+
 def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
 
@@ -1948,9 +1982,9 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     set membership on dep.index.free_symbols alone (see issue #3888): both are
     "in y and the output, but not in x".
 
-    op.loop_info.loop_tiled_dims (stamped by coarse-tiling before layout
-    propagation runs, per passes.py's pass ordering) lists, per nesting
-    level, the raw op.data.ranges positions this loop group tiles -- for the
+    Each of the op's loop levels' ``tiled_dims`` (``enclosing_loops``; coarse-tiling
+    records them before layout propagation runs, per passes.py's pass ordering)
+    lists the raw op.data.ranges positions this loop group tiles -- for the
     innermost tile-body op itself, this op's own write is already the
     tile-local slice, so loop_tiled_dims is the only surviving
     signal identifying which raw dims the enclosing loop nest tiles at all.
@@ -2589,7 +2623,8 @@ def unrepresentable_splits_by_index_coeff(
     :func:`finalize_work_division_for_scheduler` (which must never see a
     non-empty result once those checks hold, and raises if it does).
     """
-    reduction_syms = {sym for sym in it_space if write_index.coeff(sym) == 0}
+    write_index_syms = write_index.free_symbols
+    reduction_syms = {sym for sym in it_space if sym not in write_index_syms}
     problems: list[str] = []
     for label, index, symbols in (
         ("output", write_index, [s for s in it_space if s not in reduction_syms]),
@@ -2665,9 +2700,10 @@ def splits_by_index_coeff(
     """
     skip = lambda v: v <= 1  # noqa: E731
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
-    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
+    write_index_syms = write_index.free_symbols
+    # Reduction splits: symbols not in write_index but in read_index
     reduction_only = {
-        sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
+        sym: val for sym, val in splits.items() if sym not in write_index_syms
     }
     reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
     return output_splits, reduction_splits
@@ -2771,7 +2807,7 @@ def select_work_division_transport_indexes(
     if write is None:
         raise Unsupported(f"{op.get_name()} has no MemoryDep write for work division")
     write_index = write.index
-    if is_keep_by_index(op):
+    if is_index_masking_op(op):
         reduction_vars = set(it_space) - write_index.free_symbols
         read_index = read_with_max_reduction_overlap(rw.reads, reduction_vars)
         if read_index is not None:
@@ -3264,15 +3300,12 @@ def is_sparse_stl(stl) -> bool:
 
 
 def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]:
-    """Returns STL to transform the input into the canonical representation the output.
+    """The canonical dense STL of ``output``, and whether ``in_stl`` needs a restickify
+    into it.
 
-    If the input is sparse and the canonical output is not, an extra stick-size dimension
-    is added to the front of the canonical output representation so that restickify can
-    transpose the sparse stick dimension to make it contiguous. The index expression already
-    does the required slicing on the result.
-
-    If the input is not sparse or the output is also sparse no transformation is required
-    the canonical output STL is returned.
+    A sparse input restickifies into the dense canonical layout. That restickify is
+    size-1 on the sparse side, so the padding pass gives the target the size-64 gap
+    dim its sweep needs (``_pad_elided_dim``), as for any other size-1 restickify.
     """
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -3288,18 +3321,7 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
         assert not out_is_sparse
 
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
-
-    if restick:
-        eps = in_stl.elems_per_stick()
-        out_stl = SpyreTensorLayout(
-            [eps] + out_stl.device_size,
-            [c_stride[0] * c_size[0]] + out_stl.stride_map,
-            out_stl.device_dtype,
-            prepend_dim_valid_elements(out_stl, eps),
-        )
-        return True, out_stl
-
-    return False, out_stl
+    return restick, out_stl
 
 
 def sparse_stl_from_host(
@@ -4611,12 +4633,12 @@ def is_topk(op: Operation) -> bool:
     )
 
 
-def is_keep_by_index(op: Operation) -> bool:
-    """Return True iff ``op`` is a ``ComputedBuffer`` computing a keep_by_index reduction."""
+def is_index_masking_op(op: Operation) -> bool:
+    """Return True iff ``op`` is a keep_by_index or mask_by_index reduction."""
     return (
         isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
-        and op.data.reduction_type == KEEP_BY_INDEX_OP
+        and op.data.reduction_type in INDEX_MASKING_OPS
     )
 
 
@@ -4646,7 +4668,8 @@ def read_with_max_reduction_overlap(
     return best_read
 
 
-class _ViewPrep(NamedTuple):
+@dataclass(frozen=True)
+class _ViewPrep:
     """Candidate-invariant precompute shared across every core-division
     candidate of one ``(op, dep, buf_name)``.
 
@@ -4675,6 +4698,14 @@ class _ViewPrep(NamedTuple):
     num_stick: int
     num_stick_stride: int
     is_matmul: bool
+    # Finished views of this ``(op, dep, buf_name)``, keyed by candidate (see
+    # ``_per_core_view_from_prep``). Every prep gets its own dict.
+    view_cache: dict = field(default_factory=dict, compare=False, repr=False)
+    # ``direct_axis_ownership_failure`` results, keyed by ``(sym, dev_dim,
+    # extent, sym's split, physical split)``: with the prep fixed, those
+    # determine every argument, and candidates that share them repeat the
+    # same proof.
+    ownership_proofs: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 def _prepare_per_core_view(
@@ -4763,7 +4794,40 @@ def _per_core_view_from_prep(
     *,
     ownership: TensorWorkDivision | None = None,
 ) -> tuple[PerCoreView, bool, bool]:
-    """Evaluate a view from complete symbol-keyed ownership or candidate splits."""
+    """Evaluate a view from complete symbol-keyed ownership or candidate splits.
+
+    Views from candidate splits are memoized on ``prep``: the same producer and
+    consumer candidates are viewed once per residency edge they take part in.
+    The result depends only on ``prep``, the splits, whether any reduction axis
+    is split, and the three config flags read below, and it is immutable.
+    """
+    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
+    if ownership is not None or prep is None:
+        return _per_core_view_from_prep_uncached(
+            prep, splits, has_partial_reduction, ownership=ownership
+        )
+    key = (
+        frozenset(splits.items()),
+        has_partial_reduction,
+        config.lx_planner_relayout,
+        config.lx_extended_ownership,
+        config.core_id_k_fast_emission,
+    )
+    result = prep.view_cache.get(key)
+    if result is None:
+        result = _per_core_view_from_prep_uncached(prep, splits, has_partial_reduction)
+        prep.view_cache[key] = result
+    return result
+
+
+def _per_core_view_from_prep_uncached(
+    prep: Optional[_ViewPrep],
+    splits: dict[sympy.Symbol, int],
+    has_partial_reduction: bool,
+    *,
+    ownership: TensorWorkDivision | None = None,
+) -> tuple[PerCoreView, bool, bool]:
+    """``_per_core_view_from_prep`` without the cache."""
     num_cores = (
         ownership.physical_core_count
         if ownership is not None
@@ -4970,13 +5034,22 @@ def _per_core_view_from_prep(
                 extent = padded_extent
             # Prove every logical partition, independent of the physical core
             # order. Step 4 preserves that order using the same partition IDs.
-            if reason := direct_axis_ownership_failure(
-                extent,
-                per_sym[sym],
-                prep.dep_device_coordinates[dev_dim].xreplace({sym: _LOOP_POINT}),
-                device_size[dev_dim],
-                split,
-            ):
+            proof_key = (sym, dev_dim, extent, per_sym[sym], split)
+            if proof_key in prep.ownership_proofs:
+                reason = prep.ownership_proofs[proof_key]
+            else:
+                reason = prep.ownership_proofs[proof_key] = (
+                    direct_axis_ownership_failure(
+                        extent,
+                        per_sym[sym],
+                        prep.dep_device_coordinates[dev_dim].xreplace(
+                            {sym: _LOOP_POINT}
+                        ),
+                        device_size[dev_dim],
+                        split,
+                    )
+                )
+            if reason:
                 logger.debug(
                     "cannot prove stride-selected ownership for iteration %s "
                     "on device dim %s: %s; require exact decomposition",
@@ -5098,7 +5171,6 @@ def _per_core_view_from_prep(
         core_to_slot=tuple(pruned_core_to_slot),
         num_cores=num_cores,
     )
-    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
     return (view, has_partial_reduction, True)
 
 
@@ -5362,8 +5434,9 @@ def _per_core_view_on_buf(
 
     prep = _prepare_per_core_view(op, dep, buf_name)
     write_index = prep.write_index if prep is not None else sympy.S.Zero
+    write_index_syms = write_index.free_symbols
     reduction_splits = {
-        sym: split for sym, split in splits.items() if write_index.coeff(sym) == 0
+        sym: split for sym, split in splits.items() if sym not in write_index_syms
     }
     result = _per_core_view_from_prep(
         prep,
@@ -5395,11 +5468,11 @@ def completed_reduction_split_on_buf(
     ownership = getattr(op, "iteration_space_ownership", None)
     if prep is None or ownership is None:
         return None
+    write_index_syms = prep.write_index.free_symbols
     reduction_splits = [
         int(ownership.work_slices.get(sym, 1))
         for sym in prep.iter_space
-        if prep.write_index.coeff(sym) == 0
-        and int(ownership.work_slices.get(sym, 1)) > 1
+        if sym not in write_index_syms and int(ownership.work_slices.get(sym, 1)) > 1
     ]
     if len(reduction_splits) != 1 or prep.stick_host_stride is None:
         return None
@@ -5472,8 +5545,13 @@ def format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  op_it_space_splits={readable_splits}")
             if dim_hints := getattr(op, "dim_hints", None):
                 buf.write(f"\n  dim_hints={dim_hints}")
-            if loop_info := getattr(op, "loop_info", None):
-                buf.write(f"\n  loop_info={loop_info}")
+            if levels := enclosing_loops(op):
+                # (group path, trip count, tiled dims, tiled reduction dims) per
+                # level; test_loop_scheduler_readers pins the format.
+                buf.write(
+                    "\n  loop_levels="
+                    f"{[(x.group_path, x.trip_count, x.tiled_dims, x.tiled_reduction_dims) for x in levels]}"
+                )
             buf.write(f"\n  {_strip_stack_traces(str(op.data))}")
         buf.write("\n\n")
     return buf.getvalue()

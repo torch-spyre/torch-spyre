@@ -122,8 +122,8 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
 def counted_loop_group_path(op: Operation) -> tuple[int, ...]:
     """The counted-loop group path ``op`` runs in, outermost first; ``()`` if none.
 
-    Mirrors scheduler._loop_group_id: only SchedulerNodes join a counted loop.
-    An extern kernel keeps its loop_info (e.g. a loop-body constant that
+    Only SchedulerNodes join a counted loop.
+    An extern kernel keeps its loop membership (e.g. a loop-body constant that
     dedup_and_promote_constants hoisted to the graph head) but runs once,
     outside the loop.
     """
@@ -416,7 +416,7 @@ def _is_tiled_advancing(op: Operation) -> bool:
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
         return False
-    # The loop fact (False without a loop_info) lives in loop_facts; the layout
+    # The loop fact (False for an op in no loop) lives in loop_facts; the layout
     # gate above is an LX question and stays here.
     return output_advances_anywhere(op)
 

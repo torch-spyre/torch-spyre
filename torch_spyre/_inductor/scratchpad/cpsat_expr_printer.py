@@ -35,7 +35,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import sympy
+from sympy.core.function import AppliedUndef
 from sympy.printing.printer import Printer
+
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
 
 if TYPE_CHECKING:
     from ortools.sat.python import cp_model, cp_model_helper
@@ -265,6 +268,8 @@ class _SympyExprToCpSat(Printer):
 
         if expr.is_Piecewise and expr.args[-1][1] != sympy.true:
             return None  # Preserve the ordinary printer's required default.
+        if isinstance(expr, AppliedUndef):
+            return None  # An implemented function is _print_AppliedUndef's lookup.
         args = (
             [part for pair in expr.args for part in pair]
             if expr.is_Piecewise
@@ -277,34 +282,10 @@ class _SympyExprToCpSat(Printer):
         owner = owners[0] if owners else None
         if any(other is not owner for other in owners):
             return None
-        values = [value[1] for value in evaluated]
-        if expr.is_Add:
-            result = sum(values)
-        elif expr.is_Mul:
-            result = math.prod(values)
-        elif expr.is_Pow:
-            result = values[0] ** values[1]
-        elif isinstance(expr, (sympy.Min, sympy.Max)):
-            operation = np.minimum if isinstance(expr, sympy.Min) else np.maximum
-            result = values[0]
-            for value in values[1:]:
-                result = operation(result, value)
-        elif expr.is_Relational:
-            result = _operator_map[expr.rel_op](*values)
-        elif expr.func in (sympy.And, sympy.Or):
-            operation = np.logical_and if expr.func is sympy.And else np.logical_or
-            result = values[0]
-            for value in values[1:]:
-                result = operation(result, value)
-        elif expr.is_Piecewise:
-            result = values[-2]
-            for value, cond in reversed(list(zip(values[:-2:2], values[1:-2:2]))):
-                result = np.where(cond, value, result)
-        elif expr.func is sympy.KroneckerDelta:
-            result = np.equal(*values)
-        else:
-            return None
-        return owner, result
+        try:
+            return owner, numpy_eval(expr, [value[1] for value in evaluated])
+        except NotImplementedError:
+            return None  # No function in the core: left to the print method.
 
     def _division_table(self, expr):
         evaluated = self._candidate_values(expr)

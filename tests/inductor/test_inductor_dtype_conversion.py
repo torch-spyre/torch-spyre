@@ -358,7 +358,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_working_implicit_add_fp16_to_fp32(self):
         """explicit fp16->fp32 cast still hits #2252 arrangement mismatch."""
         x = cached_randn((4, 64), differentiation="newim01_x")
@@ -370,7 +369,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_arrangement_error(self):
         """direct add of H2D fp32 + on-device fp16 hits arrangement mismatch."""
         x = cached_randn((4, 64), differentiation="newim02_fp16")
@@ -381,7 +379,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_4d_stick_aligned(self):
         """direct fp16+fp32 add on 4D (2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 4, 64), differentiation="dir4d_fp16")
@@ -394,7 +391,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_5d_stick_aligned(self):
         """direct fp16+fp32 add on 5D (2,2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 2, 4, 64), differentiation="dir5d_fp16")
@@ -407,7 +403,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_large_values(self):
         """direct fp16+fp32 add with large values (scale=100)."""
         x = cached_randn((4, 64), differentiation="dirlrg_fp16", scale=100.0)
@@ -420,7 +415,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_small_values(self):
         """direct fp16+fp32 add with small values (scale=1e-3)."""
         x = cached_randn((4, 64), differentiation="dirsml_fp16", scale=1e-3)
@@ -509,9 +503,8 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_sub_fp16_fp32_via_explicit_cast_roundtrip(self):
-        """sub with explicit fp16->fp32 cast hits #2252."""
+        """sub with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe09_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe09_y")
 
@@ -521,9 +514,8 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_mul_fp16_fp32_via_explicit_cast_roundtrip(self):
-        """mul with explicit fp16->fp32 cast hits #2252."""
+        """mul with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe10_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe10_y")
 
@@ -533,9 +525,8 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_div_fp16_by_fp32_via_explicit_cast_workaround(self):
-        """div with explicit fp16->fp32 cast hits #2252."""
+        """div with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe12_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe12_y")
 
@@ -556,7 +547,6 @@ class TestImplicitPromotion(unittest.TestCase):
         self.assertEqual(fn(x, y).dtype, torch.float16)
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_sub_fp32_tensor_fp16_tensor(self):
         """fp32_tensor - fp16_tensor (reversed operand order)."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="tp02_fp32")
@@ -679,9 +669,13 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
+    # The transposed (4, 64) fp32 result has a stick dim of 4, narrower than one
+    # 64-element stick pair, so the DL16_TO_FP32 layout is rejected ("requires
+    # whole stick pairs").
+    @_rejected("requires whole stick pairs", None)
     def test_implicit_tensor_add_non_contiguous_fp16_fp32(self):
-        """non-contiguous fp16 + fp32 hits arrangement mismatch."""
+        """non-contiguous fp16 + fp32: the transposed fp32 output has a stick dim
+        (4) narrower than a whole stick pair so this is rejected."""
         x = cached_randn((64, 4), differentiation="ncim02_fp16")
         y = cached_randn((64, 4), dtype=torch.float32, differentiation="ncim02_fp32")
 
@@ -847,15 +841,6 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"D2H fp32→fp16 value mismatch: got {result}, expected {expected}",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the copy compiles (#2852 is fixed), but the fp16 result is staggered and "
-            "its readback is permuted: converting it back on the device restores the "
-            "values (#4393)"
-        ),
-    )
     def test_compiled_copy_cross_dtype_fp32_to_fp16(self):
         """Compiled copy_() from fp32 into fp16 Spyre tensor."""
         src_fp32 = cached_randn(
@@ -880,15 +865,6 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"copy_ value mismatch: got {dst_spyre.cpu()}, expected {expected}",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            ".float() on a Spyre tensor gives a staggered (DL16_TO_FP32) result whose "
-            "readback is permuted (#4393), and the eager .half() of it is also wrong, "
-            "though the compiled .half() of the same tensor is right; see also #2205"
-        ),
-    )
     def test_float_half_methods_on_spyre_tensor(self):
         """.float() and .half() shortcut methods on Spyre tensors."""
         x_cpu = torch.randn(4, 64, dtype=torch.float16)

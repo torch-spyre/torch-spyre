@@ -52,6 +52,8 @@ from .constants import (
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
+    SHUFFLE_OP,
+    STAGGERED_EAS,
 )
 from . import config as _spyre_config
 from .core_mapping import (
@@ -87,13 +89,20 @@ from .pass_utils import (
     indirect_index_range,
     input_layout_for_operation,
     is_restickify_coords,
+    restickify_sweep_dim,
     alignment_coordinates,
     loop_var_ranges_from_dim_hints,
     per_trip_index,
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
-from .loop_facts import _loop_coefficient, advancing_levels, enclosing_loops
+from .loop_facts import (
+    _loop_coefficient,
+    advancing_levels,
+    enclosing_loops,
+    is_looped,
+    strict_loop_vars,
+)
 from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
@@ -111,6 +120,8 @@ from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
+
+_ALL_EAS = frozenset({ElementArrangement.STANDARD, *STAGGERED_EAS})
 
 
 class RValue(ABC):
@@ -275,6 +286,10 @@ class SpyreOpFuncs:
     @staticmethod
     def keep_by_index(x, indices):
         return ReductionOp("keepbyindex", [x, indices])
+
+    @staticmethod
+    def mask_by_index(x, indices):
+        return ReductionOp("maskbyindex", [x, indices])
 
     @staticmethod
     def layernormnorm(*args):
@@ -595,6 +610,47 @@ def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
     return placement.shard_device_bytes
 
 
+# TODO(#6175): share one symbol finder with sharded_hbm._shard_symbol
+# (and fold _reduced_input_dims in) when the matmul work shapes it.
+def _non_unified_shard_dim(
+    name: str,
+    layout: FixedTiledLayout,
+    it_space: dict[sympy.Symbol, sympy.Expr],
+    index: sympy.Expr,
+) -> sympy.Symbol | None:
+    """The shard-dim symbol of ``name``'s sharding in ``it_space``'s namespace.
+
+    The sharded planner pins the op's work split on the shard dim's iteration
+    symbol, but it traces read/writes before scheduling, and Inductor mints
+    fresh index symbols on every trace -- the planner's symbol and the
+    scheduler-node iteration space's symbol for the same dim can differ in
+    name (measured: planner ``d0`` vs iteration space ``c0``). So the symbol
+    is re-derived here, against the same iteration space the SDSC is emitted
+    from, by the shard dim's coefficient and extent in this tensor's access
+    index -- the same identification ``sharded_hbm._shard_symbol`` uses when
+    pinning the split. ``None`` when the tensor is not sharded storage.
+    """
+    placement = placement_of(name)
+    if placement is None:
+        return None
+    size = [int(s) for s in layout.size]
+    s = placement.shard_dim
+    if not 0 <= s < len(size):
+        raise Unsupported(f"{name}: shard dim {s} out of range for shape {size}")
+    stride = sympy.Integer(math.prod(size[s + 1 :]))
+    matches = [
+        sym
+        for sym, extent in it_space.items()
+        if index.coeff(sym) == stride and int(extent) == size[s]
+    ]
+    if len(matches) != 1:
+        raise Unsupported(
+            f"{name}: cannot identify the shard dim {s} in the iteration space "
+            f"by its stride {stride} and extent {size[s]} (candidates: {matches})"
+        )
+    return matches[0]
+
+
 def _matching_read_deps(
     read_deps: "list[MemoryDep]", name: str, mutation_real_name: "dict[str, str]"
 ) -> "list[tuple[int, MemoryDep]]":
@@ -617,6 +673,10 @@ def _matching_read_deps(
         for i, dep in enumerate(read_deps)
         if mutation_real_name.get(dep.name, dep.name) == name
     ]
+
+
+def _is_shuffle(in_ea, out_ea) -> bool:
+    return in_ea != out_ea and {in_ea, out_ea} <= _ALL_EAS
 
 
 class SpyreKernel(Kernel[CSEVariable]):
@@ -847,7 +907,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         consumes no new read (``x + x`` is one dependency) answers ``None``.
         """
         ir_node = self.current_node.node
-        if getattr(ir_node, "loop_info", None) is None:
+        if not is_looped(ir_node):
             return None
         if is_input:
             scheduler = getattr(V.graph, "scheduler", None)
@@ -866,7 +926,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             self._tile_advance_seen[name] = consumed + 1
         indexed = self._index_tile_advance(tensor, is_input, name)
         if indexed is None:
-            if getattr(ir_node.loop_info, "strict_loop_vars", False):
+            if strict_loop_vars(ir_node):
                 # The lowering lists the variable of every level on every member,
                 # so a shim op with no advance in its index is a bug, not a zero.
                 raise RuntimeError(
@@ -976,6 +1036,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
             non_unified_shard_bytes=_non_unified_shard_bytes(name, tensor.layout),
+            non_unified_shard_dim=_non_unified_shard_dim(
+                name, tensor.layout, it_space, tensor.index
+            ),
             stride_map=list(tensor.layout.device_layout.stride_map),
         )
         if (
@@ -1091,7 +1154,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 continue
             # Check if operation supports the argument's dtype
             if not (
-                op == IDENTITY_OP
+                op in (IDENTITY_OP, SHUFFLE_OP)
                 or (
                     op == RESTICKIFY_OP
                     and arg.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
@@ -1470,8 +1533,12 @@ class SpyreKernel(Kernel[CSEVariable]):
 
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
+            in_ea = args[-2].element_arrangement
+            out_ea = args[-1].element_arrangement
             if is_restickify_coords(in_coords, out_coords):
                 op = RESTICKIFY_OP
+            elif _is_shuffle(in_ea, out_ea) and not indirect_syms_used:
+                op = SHUFFLE_OP
             else:
                 op = IDENTITY_OP
             op_spec = self.create_op_spec(
@@ -1947,6 +2014,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         "count_symbol_sources="
                         f"{_serialize_value(op_spec.count_symbol_sources)},"
                     )
+                if op_spec.count_from_buffer is not None:
+                    buf.writeline(
+                        "count_from_buffer="
+                        f"{_serialize_value(op_spec.count_from_buffer)},"
+                    )
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)
@@ -2056,6 +2128,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                     "non_unified_shard_bytes="
                                     f"{arg.non_unified_shard_bytes},"
                                 )
+                            if arg.non_unified_shard_dim is not None:
+                                buf.writeline(
+                                    "non_unified_shard_dim="
+                                    f"{sympy_str(arg.non_unified_shard_dim)},"
+                                )
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="
@@ -2110,11 +2187,12 @@ def _restickify_restore_elided_dim(op_spec) -> None:
 
     - ELIDED operand: its stick is rebuilt as
       ``[floor(new_sym/64)] + real_dims + [Mod(new_sym, 64)]``.
-    - INTACT operand: ``new_sym`` binds to the outermost size-64 gap dim the
-      padding pass (``_pad_elided_dim``) prepended to cover the 64-plane sweep
-      (see the reuse site below).  ``new_sym`` has iteration RANGE 1, so it only
-      ever takes the value 0: SDSC codegen's back-gap mechanism absorbs the
-      size-64-vs-range-1 gap and it contributes no real stride to either operand.
+    - INTACT operand: ``new_sym`` binds to the outermost size-64 gap dim that
+      covers the 64-plane sweep (``restickify_sweep_dim``), the one the padding
+      pass (``_pad_elided_dim``) prepends.  ``new_sym`` has iteration RANGE 1, so
+      it only ever takes the value 0: SDSC codegen's back-gap mechanism absorbs
+      the size-64-vs-range-1 gap and it contributes no real stride to either
+      operand.
     """
     assert len(op_spec.args) == 2, f"restickify op_spec has {len(op_spec.args)} args"
     in_arg, out_arg = op_spec.args[0], op_spec.args[1]
@@ -2151,18 +2229,21 @@ def _restickify_restore_elided_dim(op_spec) -> None:
         )
         new_elided_size = [1] + real_sizes + [stick_size]
 
-        # Bind new_sym to the size-64 dim _pad_elided_dim prepended, so the
-        # descriptor's total size matches the grown allocation. The grow always
-        # targets the intact operand, so that dim is present here: outermost
-        # size-64 with coordinate 0 (asserted before we overwrite it).
+        # Bind new_sym to the size-64 gap dim, so the descriptor's total size
+        # matches the grown allocation. The grow always targets the intact
+        # operand, so that dim is present here (asserted before we overwrite it).
+        # Work division found it by the same rule to count its sweep in the span.
         intact_coords = list(intact_arg.device_coordinates)
         intact_size = list(intact_arg.device_size)
-        assert intact_size[0] == stick_size and intact_coords[0] == 0, (
-            f"restickify restore: expected padding-prepended size-{stick_size} "
-            f"gap dim on the intact operand, got size={intact_size[0]} "
-            f"coord={intact_coords[0]}"
+        gap = restickify_sweep_dim(
+            intact_size, intact_arg.stride_map, intact_coords, stick_size
         )
-        intact_coords[0] = new_sym
+        assert gap is not None, (
+            f"restickify restore: expected padding-prepended size-{stick_size} "
+            f"gap dim on the intact operand, got size={intact_size} "
+            f"coords={intact_coords}"
+        )
+        intact_coords[gap] = new_sym
 
         # Range 1, not 64: new_sym only ever takes value 0, so it contributes
         # no real stride and the size-64 device slot is just back-gap padding.

@@ -347,6 +347,20 @@ def test_without_placeholders_nothing_changes(monkeypatch):
     assert pool.submitted == 1 and not pool.reports
 
 
+def test_a_caller_can_switch_an_open_pool_to_abort_stand_ins(monkeypatch):
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", lambda *a, **k: None)
+    gm = _graph_with_outputs(((1,), torch.float32))
+    with pp.fork_inner_compiles(1, placeholders=True) as pool:
+        pool.placeholders = False
+        stand_in = spyre_inductor._spyre_inner_compile(gm, [])
+        with pytest.raises(pp.CompileOnlyAbort):
+            stand_in([])
+        assert not pool.reports  # nothing to wait for
+        pool.placeholders = True
+        out = spyre_inductor._spyre_inner_compile(gm, [])([])
+        assert len(out) == 1 and out[0].shape == (1,)
+
+
 def test_the_report_pass_sends_the_specs_once_and_only_in_a_child(monkeypatch):
     graph = types.SimpleNamespace(graph_input_names=[], graph_outputs=[3])
     # Not a child: nothing to send, and the graph is left alone.
@@ -379,7 +393,12 @@ def test_a_child_solver_gets_its_share_of_the_cpus(monkeypatch):
         monkeypatch.setattr(dist, "get_world_size", lambda: 8)
         assert pp._solver_cpu_share(7) == 8  # no local count: the process group's size
         monkeypatch.setattr(dist, "is_initialized", lambda: False)
-        assert pp._solver_cpu_share(7) == 64  # one rank keeps the host
+        assert pp._solver_cpu_share(7) == 16  # one rank: capped per child
+        monkeypatch.setattr(pp, "_host_cpus", lambda: 9)
+        assert pp._solver_cpu_share(7) == 9  # a small host stays whole
+        monkeypatch.setattr(pp, "_host_cpus", lambda: 384)
+        assert pp._solver_cpu_share(8) == 48  # a big host split across the workers
+        assert pp._solver_cpu_share(64) == 16
         monkeypatch.setattr(pp, "_host_cpus", lambda: 1)
         monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
         assert pp._solver_cpu_share(7) == 2  # never below two

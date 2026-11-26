@@ -18,6 +18,7 @@ from torch_spyre._C import DataFormats, ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
+SHUFFLE_OP = "shuffle"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
 # Relative restickify cost per device byte, by device dtype. The restickify cost
@@ -35,6 +36,9 @@ RESTICKIFY_SUPPORTED_DEVICE_DTYPES = frozenset(RESTICKIFY_DEVICE_DTYPE_COST_WEIG
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 KEEP_BY_INDEX_OP = "keepbyindex"
+MASK_BY_INDEX_OP = "maskbyindex"
+# keep_by_index / mask_by_index share layout, work-division and codegen rules.
+INDEX_MASKING_OPS = frozenset({KEEP_BY_INDEX_OP, MASK_BY_INDEX_OP})
 MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 
 # Reduction ops that cannot reduce along the stick dimension.
@@ -184,6 +188,8 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
+    "keepbyindex",
+    "maskbyindex",
     "log",
 ]
 
@@ -227,9 +233,11 @@ SPYRE_FP8_OPS = {
 }
 
 # Ops whose QFP8WT-arranged weight/output tensor requires a 2D stick [2, 64].
-# Used consistently in both compute_ops._layout_info_for_tensor and
-# superdsc._create_sdsc_tensors to gate device-size flattening and
-# 2D-stick metadata restoration.
+# Used in compute_ops._layout_info_for_tensor to restore 2D-stick metadata
+# that was erased by device-size flattening when an op is compiled individually.
+# Other ops (e.g. identity copies and index_copy_ scatters) are not gated here:
+# superdsc selects the 2D stick from the tensor's element arrangement alone, so
+# their metadata is never flattened away.
 FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 
 TOPK_OPS = {"topkvalue", "topkindex"}
@@ -273,7 +281,7 @@ CONV_OPS = {CONV2D_FWD_OP, DEPTHWISE_CONV2D_OP}
 # matmul (activation @ weight) and conv2d (activation * weight, reduced over
 # in/ki/kj) both build [input, weight, output] tensor args.
 TWO_INPUT_REDUCTION_OPS = frozenset(
-    {BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP, KEEP_BY_INDEX_OP}
+    {BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP} | INDEX_MASKING_OPS
 )
 
 # Depthwise conv is a two-input reduction like TWO_INPUT_REDUCTION_OPS but is

@@ -16,7 +16,7 @@
 
 The lowering itself is ``wsr/loop_tiling_lowering.py`` (entry point
 ``tile_groups(graph, groups)``): it divides each tiled op's ranges by the loop's
-trip count and gives every member a ``LoopInfo``. This module keeps what that
+trip count and gives every member a ``LoopMember``. This module keeps what that
 lowering shares with the ``for_each_tile`` lowering:
 
   - the range and layout division (``_divide_ranges``, ``_divide_reduction_ranges``),
@@ -29,11 +29,11 @@ Each op resolves its own tiled dimension from its ``loop_var`` in ``dim_hints``.
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 
 Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
-rewiring in this file, read "Appendix: How IR rewiring works, and why it's
-sound" in ``docs/source/compiler/coarse_tiling_loops.md``. It documents the
-wrap-never-reconstruct convention and why ``MutationLayoutSHOULDREMOVE``
-sites must satisfy the single-mutation-target invariant -- the same ground
-this file's rewrite sites depend on.
+rewiring in this file, read "Invariants and failure modes" in
+``docs/source/compiler/loop_nodes.md``. It documents the wrap-never-reconstruct
+convention and why ``MutationLayoutSHOULDREMOVE`` sites must satisfy the
+single-mutation-target invariant -- the same ground this file's rewrite sites
+depend on.
 """
 
 from __future__ import annotations
@@ -238,7 +238,7 @@ def _find_outside_consumers_planned(
     of objects (planning is zero-mutation, so there's no reason to carry
     object references past this stage), and looks up each candidate's outer loop-group key from
     name_to_group_outer_key (built once by the caller from the planned
-    LoopInfo dict) instead of a not-yet-stamped op.loop_info attribute.
+    LoopMember dict) instead of a not-yet-stamped op.loop_member attribute.
     """
     outer_key = group_loop_id[0]
     consumer_names: list[str] = []
@@ -453,7 +453,7 @@ def _check_matmul_broadcast_batch_tiling(
     # Ambiguous: more than one var is absent from x but present in y and the
     # output. Exactly one is the true generated (N) dim; the rest are excess
     # broadcast-batch vars x carries no symbol for at all. broadcast_batch_vars
-    # (issue #3888) resolves this via op.loop_info.loop_tiled_dims, but that
+    # (issue #3888) resolves this via op.loop_member.loop_tiled_dims, but that
     # isn't stamped yet at plan time -- so here we can only tell "ambiguous"
     # from "unambiguous", not which candidate is the real N dim. Treat every
     # candidate whose *tiled* extent exceeds 1 element/tile as excess: the
@@ -795,7 +795,7 @@ def _validate_planned_reduction_tiling(
 
     Called from build_loop_tiling_plan (planning time): tiled_dims /
     tiled_rdims are the op's own per-level lists computed there, before any
-    loop_info is stamped -- this check is a pure function of already-known
+    loop_member is stamped -- this check is a pure function of already-known
     shape data, so it doesn't need to wait for transformation to run.
     """
     # Pad both lists to the same length so zip covers all levels.

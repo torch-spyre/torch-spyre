@@ -1087,6 +1087,30 @@ def abs_add_mul_tiled_reference(
     return (A + B).abs() * C
 
 
+def gate_up_silu_tiled_fn(X: torch.Tensor, tile_size: int) -> torch.Tensor:
+    """Map mode: a fused gate/up activation, splitting each tile's last dim
+    with `chunk` inside the body -- the Granite-style ``silu(gate) * up``
+    pattern from issue #6329. The upper half's load index is a loop symbol
+    PLUS the chunk boundary offset within the SAME tile dimension (e.g.
+    ``d1 + cols // 2``), which used to fail to delinearize back into
+    per-dim coordinates for the marker inlining and raised instead of
+    compiling.
+    """
+
+    def body(_, ops):
+        (x_tile,) = ops
+        gate, up = x_tile.chunk(2, dim=-1)
+        return None, F.silu(gate) * up
+
+    _, out = for_each_tile(body, (X,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def gate_up_silu_tiled_reference(X: torch.Tensor) -> torch.Tensor:
+    gate, up = X.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
 def softmax_row_tiled_fn(X: torch.Tensor, tile_size: int) -> torch.Tensor:
     """Map mode: row-tile dim 0, softmax the (whole, untiled) last dim per tile.
 
@@ -1680,8 +1704,8 @@ def embedding_restickify_table_fn(
     operand (dims=(None, 0)): the indirect-access layout the embedding op
     needs forces insert_restickify.py to materialize a full, untiled
     relayout copy of `table` inside the loop body. Building that copy calls
-    _transfer_loop_info's `elif hasattr(op, "loop_info")` branch, which deep-
-    copies the embedding consumer's LoopInfo onto the copy buffer.
+    _transfer_loop_info's `elif hasattr(op, "loop_member")` branch, which deep-
+    copies the embedding consumer's LoopMember onto the copy buffer.
     Before the fix, the consumer's own `loop_tiled_dims` (its per-tile token
     axis) survived that copy onto the table buffer's unrelated row dim;
     work_division_constraints.py's coarse_tile_local_dim_split_domains then

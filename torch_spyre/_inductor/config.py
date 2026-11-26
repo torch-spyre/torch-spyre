@@ -583,7 +583,7 @@ enable_uniqueness_check: bool = (
 # direct read, no staging op between them). With it, every such edge is priced,
 # which can enumerate and cost a large number of candidate divisions on a graph
 # with many eligible same-group edges -- see #5609's compile-time report.
-# This is not for_each_tile-specific: loop_group_id/LoopInfo is stamped
+# This is not for_each_tile-specific: loop_group_id/LoopMember is stamped
 # by for_each_tile_lowering.py AND by the separate declarative coarse-tiling
 # path (scratchpad/coarse_tiling.py, wsr/coarse_tile.py), so the flag affects
 # any graph with coarse-tiled ops sharing a loop_group_id with their consumer,

@@ -741,7 +741,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
         return
     # A for_each_tile region's tiling is the user's and already stamped;
     # re-tiling one of its ops would overwrite that op's dim_hints and
-    # loop_info.  Candidate selection is expected to hold region ops
+    # its loop's tiling.  Candidate selection is expected to hold region ops
     # untiled, so reaching this is a bug upstream of the pass.
     region_ops = {
         name for region in prescribed_regions(graph.operations) for name in region.names

@@ -130,7 +130,7 @@ def _kernel(*, reads=(), writes=(), hints=(), levels=1, consumed=None):
             )
             for v in hints
         ],
-        loop_info=SimpleNamespace(
+        loop_member=SimpleNamespace(
             loop_group_id=tuple(range(levels)),
             loop_count=[4] * levels,
             loop_tiled_dims=[[] for _ in range(levels)],
