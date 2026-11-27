@@ -27,10 +27,11 @@ works out which entry of a table applies: ``value == values[index]``. Three laye
   last built in, so one held by several readers is built once. Only ``cp_expr``
   methods touch the model.
 
-A sum stays linear, so no table crosses two of its terms. A product of several
-operands is a switch on one of them where that has fewer entries than its one table,
-so no table crosses that factor and the rest. Any other node is one table over its
-inputs, refused when they do not fit the cap together. Its list
+A sum stays linear, so no table crosses two of its terms. A product that divides is
+one table, divided once. Any other product of several operands is a switch on one of
+them where that has fewer entries than its one table, so no table crosses that factor
+and the rest. Any other node is one table over its inputs, refused when they do not
+fit the cap together. Its list
 is the numpy core's function of its sympy class (``cost_expr_numpy.py``, which the
 CP-SAT printer evaluates its candidates with) applied to its operands' tables; a
 class the core has no function for is refused. Nothing imports the module yet.
@@ -569,14 +570,16 @@ class TableLowering(Printer):
         return _sum(operands, tuple(self._inputs(expr)))
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
-        """A product of several operands is a switch (_switch) on the one with the
-        fewest distinct values among those whose table fits the cap, the first in
-        expr's order on a tie, over the others' product, its constants applied to that
-        rest. Otherwise a product that divides (divides), 98/a, is declined: its table
-        divides once in the numpy core, as lambdify prints it, so 98/a is 2 at a = 49,
-        where 98 times the table of 1/a is under 2. A constant times one operand is
-        the operand scaled in float, as lambdify prints a/49: (1/49)*a, and any other
-        product is declined."""
+        """A product that divides (divides), 98*k/a, is declined: one table, divided
+        once in the numpy core as lambdify prints it, and no table of 1/a, so 98*k/a
+        is 2k at a = 49, where k times 98 * (1/49) is under 2k. Any other product of
+        several operands is a switch (_switch) on the one with the fewest distinct
+        values among those whose table fits the cap, the first in expr's order on a
+        tie, over the others' product, its constants applied to that rest. A constant
+        times one operand is the operand scaled in float, as lambdify prints a/49:
+        (1/49)*a, and any other product is declined."""
+        if any(divides(factor) for factor in expr.args):
+            return None
         constants = [factor for factor in factors(expr) if not factor.free_symbols]
         symbolic = [factor for factor in expr.args if factor.free_symbols]
         switch: AbstractRealization | None = None
@@ -593,8 +596,6 @@ class TableLowering(Printer):
                 rest = self._print(sympy.Mul(*(o for o in symbolic if o != factor)))
                 positions = tuple(self._inputs(expr))
                 switch = _switch(values, index, rest, positions, self.cap)
-        if switch is None and any(divides(factor) for factor in expr.args):
-            return None
         realization = self._print(symbolic[0]) if len(symbolic) == 1 else switch
         if realization is None or not constants:
             return realization
