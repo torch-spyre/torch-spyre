@@ -1307,6 +1307,35 @@ class TestSpyreTensorLayout(TestCase):
             _can_rescale_input_stl(in_layout, output, dep, output_dep, heads_stl)
         )
 
+    def test_convert_of_a_resized_reservation_reads_as_a_slice(self):
+        """A tensor reserved for 512 rows and resized to 128 keeps the 512-row
+        layout. Rescaling it would give the fp32 result a 512-row layout over 128
+        rows, which crashes the copy to the host (#6728), so it reads as a slice.
+        At 512 rows the same layout reads whole. Needs no device.
+        """
+        from torch_spyre._inductor.propagate_layouts import _can_rescale_input_stl
+
+        reserved = SpyreTensorLayout(
+            [1, 512, 64],
+            [64, 64, 1],
+            get_device_dtype(torch.float16),
+            {(0, 2): 64, (1,): 512},
+            ElementArrangement.STANDARD,
+        )
+        for rows, whole in ((128, False), (512, True)):
+            with self.subTest(rows=rows):
+                host_size = [rows, 64]
+                self.assertEqual(
+                    _can_rescale_input_stl(
+                        _host_layout(torch.float16, host_size),
+                        _host_layout(torch.float32, host_size),
+                        _dep("buf", host_size),
+                        _dep("out", host_size),
+                        reserved,
+                    ),
+                    whole,
+                )
+
     def test_qfp8ch_layout_rounds_a_partial_stick_up(self):
         """qfp8ch's fp16 -> fp8 output may end in a partially filled fp8 stick:
         one fp16 stick becomes one (half-filled) 128-element fp8 stick, never a
