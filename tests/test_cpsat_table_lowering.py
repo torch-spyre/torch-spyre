@@ -1098,8 +1098,9 @@ def test_a_literal_times_a_sum_is_a_gate():
 
 def test_a_product_takes_its_switch_or_its_table_by_entries():
     """A factor with a repeated value times a short list keeps its table, 6 entries
-    against 7; the step-by-step graph's product is a switch, 5 against 6. A factor of
-    one value scales the rest, with no lookup. Under a log or a power a product is
+    against 7; the step-by-step graph's product is a switch, 5 against 6, with
+    split_a**0.5 for its split_a**-2, which divides and makes it one table. A factor
+    of one value scales the rest, with no lookup. Under a log or a power a product is
     read as its table, and no switch is built."""
     case = Case()
     case.add_input("a", a=[1.0, 1.0, 2.0])
@@ -1112,15 +1113,18 @@ def test_a_product_takes_its_switch_or_its_table_by_entries():
     assert type(case.assert_exact(k * (a**0.5 + sympy.log(b)))) is SumRealization
     assert sorted(_tables(case.model)) == [3, 4]
 
-    def step_graph() -> tuple[Case, sympy.Basic]:
+    def step_graph(exp: float = 0.5) -> tuple[Case, sympy.Basic]:
         case = Case()
         case.add_input("a", split_a=[1.0, 2.0, 4.0])
         case.add_input("b", split_b=[1.0, 3.0])
-        return case, 9 * case.symbol("split_a") ** -2 * case.symbol("split_b") ** 0.5
+        return case, 9 * case.symbol("split_a") ** exp * case.symbol("split_b") ** 0.5
 
     case, product = step_graph()
     plan = case.assert_exact(product)
     assert type(plan) is SwitchRealization and plan.entries() == 5
+    case, product = step_graph(-2)
+    assert type(case.assert_exact(product)) is TableRealization
+    assert _tables(case.model) == [6] and not _named(case.model, "switch")
     for read in (sympy.log, lambda p: 2**p):
         case, product = step_graph()
         assert type(case.assert_exact(read(product))) is TableRealization
@@ -1212,17 +1216,51 @@ def test_a_quotient_is_divided_as_lambdify_prints_it():
     case.assert_exact(sympy.floor(x / y) + sympy.floor(x / y**2))
 
 
+def test_a_product_that_divides_is_divided_once_as_lambdify_prints_it():
+    """98*k/a is one table, divided once in the numpy core as lambdify prints it, so
+    it is exact at every assignment where 98 * (1/49) would floor one low. b/49 is
+    (1/49)*b, as lambdify prints it too, and its list is lambdify's."""
+    case = Case()
+    case.add_input("a", a=[49.0, 7.0])
+    case.integer("k", 1, 2)
+    a, k = case.symbol("a"), case.symbol("k")
+    assert math.floor(98 * (1 / 49)) == 1
+    at_least_2 = sympy.Piecewise((1, 98 * k / a >= 2), (0, True))
+    case.assert_exact(sympy.floor(98 * k / a) + at_least_2)
+    case = Case()
+    menu = [49.0, 98.0, 147.0]
+    case.add_input("b", b=menu)
+    b = case.symbol("b")
+    quotient = TableLowering(case.inputs, cap=CAP).print(b / 49)
+    lambdified = sympy.lambdify(b, b / 49, modules="numpy")
+    assert list(quotient.table(CAP).values) == list(lambdified(np.asarray(menu)))
+
+
+def test_a_product_that_divides_is_one_table_and_no_switch():
+    """No table of 1/a is made. A switch on k over 98 * (1/a) would hold 7 entries
+    against the table's 12, and floor one low at a = 49, where floor(98 * k / a) is
+    2k."""
+    case = Case()
+    case.integer("k", 1, 3)
+    case.add_input("a", a=[7.0, 14.0, 49.0, 98.0])
+    product = 98 * case.symbol("k") / case.symbol("a")
+    printer = Recording(case.inputs)
+    assert type(printer.print(product)) is TableRealization
+    assert 1 / case.symbol("a") not in printer.printed
+    case.assert_exact(sympy.floor(product))
+    assert _tables(case.model) == [12] and not _named(case.model, "switch")
+
+
 @pytest.mark.parametrize(
     "factor, menu, realization",
-    [((0, 2), [7.0, 49.0], GateRealization), ((1, 3), [7.0, 14.0, 49.0, 98.0], SwitchRealization)],
-    ids=["gate", "switch"],
+    [((0, 2), [7.0, 49.0], GateRealization), ((1, 3), [7.0, 14.0, 49.0, 98.0], TableRealization)],
+    ids=["gate", "table"],
 )  # fmt: skip
-def test_a_gated_or_switched_quotient_is_divided_as_lambdify_prints_it(
+def test_a_gated_or_tabled_quotient_is_divided_as_lambdify_prints_it(
     factor, menu, realization
 ):
-    """A gate's rest holds the product's constants, and a switch that divides is read
-    as its quotient's table: floor(98 * k / a) at a = 49 is 2k, not
-    floor(98 * (1/49) * k)."""
+    """A gate's rest holds the product's constants, and a product that divides is one
+    table: floor(98 * k / a) at a = 49 is 2k, not floor(98 * (1/49) * k)."""
     case = Case()
     case.integer("k", *factor)
     case.add_input("a", a=menu)
