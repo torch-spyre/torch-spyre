@@ -468,33 +468,20 @@ class TestStickRelocation(unittest.TestCase):
                 ratio = _compile_and_measure(fn, *shapes)
                 self.assertGreater(ratio, SPARSE_MIN_MEMORY_RATIO)
 
-    @expects_raise
-    def test_cat_of_sparse_reads_along_the_stick_dim_is_rejected(self):
-        # TODO(#6163): the reshape merges every dim, so no dim is left to take the
-        # stick and the read takes the sparse layout; a cat along the stick dim of
-        # sparse operands cannot be expressed. Make this a positive test when it
-        # can.
-        a = torch.randn(1, 2, 4, 8, 7, dtype=torch.float16).to("spyre")
-        torch.compiler.reset()
-        with (
-            inductor_config.patch(force_disable_caches=True),
-            pytest.raises(InductorError, match="Unexpected stick expression"),
-        ):
-            torch.compile(
-                lambda a, b: torch.cat([a.reshape(1, 8, 56), b.reshape(1, 8, 56)], -1)
-                * 2,
-                dynamic=False,
-            )(a, a.clone())
-
-    @expects_raise
-    def test_yolo26_detect_head_cat_is_rejected(self):
-        # TODO(#6163): each cat operand is restickified straight into its slice of
-        # the cat buffer, where its old-stick dim cannot be padded in place.
-        # Restickify into a fresh buffer and copy it into the slice, then make this
-        # a positive test. Case 1 of #6163 on two operands is
-        # test_cat_of_reshapes in test_inductor_ops.py; this is the yolo26 Detect
-        # head, where three views of different sizes meet a cat on the stick dim.
+    def test_cat_of_sparse_reads(self):
+        # #6163: every piece is a reshape that leaves no dim to take the stick, so
+        # each piece reads the sparse layout and the cat buffer takes the sparse
+        # layout of its own shape. Each piece is then copied into its slice
+        # without a restickify.
         cases = {
+            "1x2x4x8x7 off the stick dim": (
+                [(1, 2, 4, 8, 7)] * 2,
+                lambda a, b: torch.cat([a.reshape(1, 8, 56), b.reshape(1, 8, 56)], 1)
+                * 2,
+            ),
+            # The yolo26 Detect head: three views of different sizes meet a cat on
+            # the stick dim. Case 1 of #6163 on a non-stick dim is also
+            # test_cat_of_reshapes in test_inductor_ops.py.
             "yolo26 detect head": (
                 [(1, 80, 80, 80), (1, 80, 40, 40), (1, 80, 20, 20)],
                 lambda a, b, c: torch.cat([t.reshape(1, 80, -1) for t in (a, b, c)], -1)
@@ -503,19 +490,49 @@ class TestStickRelocation(unittest.TestCase):
         }
         for name, (shapes, fn) in cases.items():
             with self.subTest(name):
-                torch.compiler.reset()
-                with (
-                    inductor_config.patch(force_disable_caches=True),
-                    pytest.raises(
-                        InductorError, match="written into a slice of another buffer"
-                    ),
-                ):
-                    torch.compile(fn, dynamic=False)(
-                        *[
-                            torch.randn(*s, dtype=torch.float16).to("spyre")
-                            for s in shapes
-                        ]
-                    )
+                ratio = _compile_and_measure(fn, *shapes)
+                self.assertGreater(ratio, SPARSE_MIN_MEMORY_RATIO)
+
+    def test_cat_of_reshapes_along_the_stick_dim(self):
+        # Case 2 of #6163: a cat along the stick dim of reshapes that leave no dim
+        # to take the stick, and of such a reshape and a dense tensor. Values
+        # only: on the VM neither takes the sparse layout (the two-reshape case
+        # measured 64/7 of the inputs, a 7-element row per stick). With a dense
+        # piece the sparse piece is restickified into a fresh buffer of its own,
+        # which the padding pass pads, and copied into its slice.
+        cases = {
+            "two reshapes": (
+                [(1, 2, 4, 8, 7)] * 2,
+                lambda a, b: torch.cat([a.reshape(1, 8, 56), b.reshape(1, 8, 56)], -1)
+                * 2,
+            ),
+            "a reshape and a dense tensor": (
+                [(1, 2, 4, 8, 7), (1, 8, 56)],
+                lambda a, b: torch.cat([a.reshape(1, 8, 56), b], -1) * 2,
+            ),
+        }
+        for name, (shapes, fn) in cases.items():
+            with self.subTest(name):
+                _compile_and_measure(fn, *shapes)
+
+    @expects_raise
+    def test_cat_of_a_sparse_and_a_dense_read_off_the_stick_dim_is_rejected(self):
+        # TODO(#6558): one piece is dense, so the cat buffer stays dense, and the
+        # sparse piece needs a restickify whose new stick comes from two device
+        # dims that are not one dense run (Mod(d1, 7) on the outermost dim,
+        # floor(d1/7) on the fourth). That needs a re-base copy. Make this a
+        # positive test when it is supported.
+        a = torch.randn(1, 2, 4, 8, 7, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 8, 56, dtype=torch.float16).to("spyre")
+        torch.compiler.reset()
+        with (
+            inductor_config.patch(force_disable_caches=True),
+            pytest.raises(InductorError, match="not one dense run"),
+        ):
+            torch.compile(
+                lambda a, b: torch.cat([a.reshape(1, 8, 56), b], 1) * 2,
+                dynamic=False,
+            )(a, b)
 
 
 def _check_values_on_host(fn, shape, dtype):

@@ -4816,14 +4816,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # A cat piece that needs a restickify is written straight into a slice of
-        # the cat buffer; the padding pass cannot pad such a write in place.
-        # This is case 1 of #6163; the yolo26 Detect head, where three views of
-        # different sizes meet a cat on the stick dim, is covered in
-        # test_stick_relocation.py.
-        # TODO(#6163): restickify into a fresh buffer and copy it into the slice
-        # (the TODO in padding._pad_restickify_output); then this becomes a
-        # positive case.
+        # Case 1 of #6163: each piece is a reshape that leaves no dim to take the
+        # stick, so the cat buffer takes the sparse layout of its own shape and
+        # each piece is copied into its slice without a restickify. The yolo26
+        # Detect head and the cat on the stick dim are in
+        # test_stick_relocation.py (test_cat_of_sparse_reads).
         (
             "test_cat_of_reshapes",
             "test_cat_of_reshapes_cpu",
@@ -4833,9 +4830,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((1, 32, 25600), dtype=torch.float16),
                     cached_randn((1, 32, 25600), dtype=torch.float16),
                 ),
-            },
-            "expect_raise": {
-                "split_32x25600_to_32x160x160_dim1": "restickify written into a slice",
             },
         },
         (
