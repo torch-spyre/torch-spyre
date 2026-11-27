@@ -23,10 +23,15 @@ left at zero was not: the output itself says how many trips ran.
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
+from torch._dynamo.utils import counters
+from torch._inductor import config as inductor_config
+from torch._inductor.utils import fresh_cache
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
+from torch_spyre._inductor import _allow_scan_graph_caching
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor.wsr.for_each_tile import Slice, for_each_tile
 
@@ -105,6 +110,32 @@ class TestActiveCountOnDevice(unittest.TestCase):
 
     def test_nested_loop_reads_one_count_per_outer_trip(self):
         self._check(_nested(32), [1, 4, 32], trips=32)
+
+    def test_a_warm_cache_reads_its_own_count(self):
+        """A kernel loaded from the FX graph cache still reads the count on the
+        device: the count of the compile that filled the cache is not kept."""
+        x = torch.randn(16 * G, C)
+        with (
+            mock.patch.dict("os.environ", {"TORCH_SPYRE_CACHE_SCAN": "1"}),
+            inductor_config.patch(
+                unsafe_marked_cacheable_functions={},
+                fx_graph_cache=True,
+                fx_graph_remote_cache=False,
+            ),
+            fresh_cache(),
+        ):
+            _allow_scan_graph_caching()
+            counters.clear()
+            for count in (
+                3,
+                7,
+            ):  # the first compile fills the cache, the second loads it
+                torch._dynamo.reset()
+                compiled = torch.compile(_flat, fullgraph=True)
+                cnt = _count_rows([count])
+                out = compiled(x.to(DEVICE_NAME), cnt.to(DEVICE_NAME)).cpu()
+                self.assertEqual(_trips_run(out, x, 1, 16), [count], f"count {count}")
+            self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
 
     def test_a_declared_dynamic_dimension_is_refused(self):
         """The loop walks a dimension declared with dynamic=, so its trip count
