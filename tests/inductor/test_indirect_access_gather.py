@@ -48,6 +48,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._dynamo.utils import counters
+from torch._inductor.exc import InductorError
 from torch._inductor.utils import fresh_cache, run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1707,10 +1708,8 @@ def test_gather_stick_indexed_32bit(dtype):
 # Per-core span of a large gather
 #
 # Work division cannot split a gather's data dims, so past the 256 MB
-# per-core span the op runs as a loop over blocks of the table's rows. The
-# buffer collecting the tiles still has to be placed, so the larger shapes
-# below need a production core count. A gather is a pure copy, so every case
-# requires an exact match against CPU.
+# per-core span the op runs as a loop over blocks of the table's rows.
+# A gather is a pure copy, so every case below requires an exact match.
 # ---------------------------------------------------------------------------
 
 _MOE_DOWN_PROJ = (32, 2880, 2880)  # gpt-oss-20b, 15.8 MB per expert
@@ -1735,10 +1734,9 @@ def _assert_gather_matches_cpu(table_shape, idx_shape, dtype=torch.bfloat16):
 def test_moe_gather_down_proj_model_sizes(experts):
     """``down_proj[expert_ids]`` at a shipping model's size.
 
-    Decode selects 4 experts and an 11-token top-4 prefill selects 44, and each
-    is hard for a different reason: 4 because the entry dim is padded to a whole
-    index stick and every padded entry is copied (63 MB charged as 506 MB), 44
-    because 44 x 15.8 MB admits no legal core split at all.
+    Decode selects 4 experts, 63 MB, which fits outright. An 11-token top-4
+    prefill selects 44, and 44 x 15.8 MB admits no legal core split: one index
+    stick of entries is 32 rows, already 506 MB.
     """
     _assert_gather_matches_cpu(_MOE_DOWN_PROJ, (experts,))
 
@@ -1754,9 +1752,9 @@ def test_gather_span_entry_count_sweep(entries):
     """Entry counts either side of the span limit, on one table.
 
     At 8 MB per entry the limit falls at exactly 32 entries, so this covers
-    outputs that fit outright, the boundary itself, and outputs that only run
-    once the data dim is tiled -- including counts that are not a multiple
-    of an index stick (31, 33, 63), where the entry dim cannot be split.
+    outputs that fit outright (1 to 32), the boundary itself, and outputs that
+    only run once the data dim is tiled (33 to 64) -- including 33 and 63,
+    which are not a whole number of index sticks, so no core split is legal.
     """
     _assert_gather_matches_cpu(_SPAN_SWEEP_TABLE, (entries,))
 
@@ -1767,9 +1765,8 @@ def test_gather_span_entry_count_sweep(entries):
 def test_gather_span_two_dim_index(idx_shape):
     """A ``[tokens, top_k]`` index, the shape MoE routing actually produces.
 
-    A 2-D index puts the entry dims outermost in the output's device layout,
-    unlike the 1-D case, so it exercises a different coordinate geometry for
-    the same span question.
+    A 2-D index gives the output two entry dims instead of one, so the same
+    span question is asked on a different coordinate geometry.
     """
     _assert_gather_matches_cpu(_SPAN_SWEEP_TABLE, idx_shape)
 
@@ -1800,12 +1797,11 @@ def test_gather_span_unfactorable_data_dim_is_rejected():
     2879 is prime, so neither has one and the compile reports the span error
     instead of emitting a tile that still overflows. Tiling the other data
     dim does not rescue it either: the collector buffer keeps 2879 outermost.
-    The same shape at 2880 compiles exactly.
     """
     torch._dynamo.reset()
     table = torch.randn(8, 2879, 2880, dtype=torch.bfloat16)
     idx = torch.randint(0, 8, (44,), dtype=torch.int64)
-    with pytest.raises(Exception, match="per-core tensor span"):
+    with pytest.raises(InductorError, match="per-core tensor span"):
         torch.compile(lambda t, i: t[i], dynamic=False)(
             table.to("spyre"), idx.to("spyre")
         )

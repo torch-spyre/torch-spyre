@@ -657,8 +657,8 @@ def raise_if_per_core_overflow(
 def fits_span_without_tiling(op: ComputedBuffer, max_cores: int) -> bool:
     """Whether work division alone keeps every per-core span within the limit.
 
-    Runs the search ``span_reduction_pass`` runs and the check it then applies,
-    committing nothing.
+    Runs the search ``work_distribution_pass`` runs and the check it then
+    applies, committing nothing.
     """
     try:
         ctx = work_division_context_for_op(op, max_cores)

@@ -174,8 +174,9 @@ def _insert_relayout_copy(
         ],
         operations,
     )
-    # Nothing about the copy itself says it feeds an indirect access, so mark it.
-    # Only the inserted copy is new; the consumer is patched in place.
+    # Nothing about a restickify copy says it feeds an indirect access, so mark
+    # what this call inserted. The consumer keeps its name, so only the copy is
+    # new here.
     for o in operations:
         if isinstance(o, ComputedBuffer) and o.get_name() not in before:
             setattr(o, INDIRECT_RELAYOUT_ATTR, True)

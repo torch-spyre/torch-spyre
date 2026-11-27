@@ -908,11 +908,13 @@ pass for every op with:
 SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0
 ```
 
-Indirect access is the exception: a gather, a scatter, and the relayout copy
-`enforce_indirect_access_layout` inserts to feed one are planned whatever the
-setting, because work division cannot bring them under the span limit on its
-own.  The relayout copy carries `INDIRECT_RELAYOUT_ATTR`, set where it is
-inserted, since nothing about its own shape says what it feeds.
+Indirect access is the exception: an op taking part in one is considered
+whatever the setting, because work division cannot bring a large one under the
+span limit on its own.  A gather is then tiled over the table's data dims, and
+anything else still returns `None`.  The relayout copy
+`enforce_indirect_access_layout` inserts to feed a gather carries
+`INDIRECT_RELAYOUT_ATTR`, set where it is inserted, since nothing about its own
+shape says what it feeds.
 
 Ops that a `for_each_tile` loop already tiles take precedence.  Automatic hints
 are not added to ops that already carry dim hints.

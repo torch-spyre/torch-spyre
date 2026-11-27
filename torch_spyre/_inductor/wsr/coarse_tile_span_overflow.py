@@ -30,7 +30,6 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Pointwise, Reduction
 
-from ..constants import INDIRECT_RELAYOUT_ATTR
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
 from ..propagate_hints import DimHint
@@ -40,7 +39,7 @@ from .coarse_tile import _loop_var_to_reduction_ranges_pos
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
     _bmm_k_symbol,
-    _has_indirect_reads,
+    _is_indirect_access_related,
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
@@ -442,8 +441,8 @@ def span_overflow_groups(
     """
     from .. import config
 
-    # Indirect access is planned even with hints off: work division cannot bring
-    # a large one under the span limit. Every other op waits for the opt-in.
+    # Indirect access is considered even with hints off: work division cannot
+    # bring a large one under the span limit. Every other op waits for the opt-in.
     indirect_only = config.ignore_span_overflow_hints
 
     logger.debug(
@@ -547,9 +546,7 @@ def span_overflow_groups(
         if getattr(op, "dim_hints", []):
             flush_current_group()
             continue
-        if indirect_only and not (
-            getattr(op, INDIRECT_RELAYOUT_ATTR, False) or _has_indirect_reads(op)
-        ):
+        if indirect_only and not _is_indirect_access_related(op):
             flush_current_group()
             continue
 

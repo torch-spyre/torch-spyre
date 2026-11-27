@@ -1320,7 +1320,7 @@ def _output_span_candidates_from_op(
 
     device_size = [int(s) for s in layout.device_layout.device_size]
     itemsize = layout.dtype.itemsize
-    # Hoisted out of the loop below: this walks the op's inner_fn.
+    # Does not vary by dim, so ask once.
     count_each_tile_once = _is_indirect_access_related(op)
     candidates: list[SpanOverflowCandidate] = []
     for device_dim, coord in enumerate(device_coords[:-1]):
@@ -1344,10 +1344,9 @@ def _output_span_candidates_from_op(
             )
             continue
 
-        # ``coord`` already spans one tile, so dividing by the same split again
-        # under-counts and can accept a plan that still overflows. Count an
-        # indirect access exactly; other ops keep the existing accounting,
-        # which changing would alter the plans they pick.
+        # ``coord`` already spans one tile, so dividing by the split again
+        # under-counts and can let an overflowing plan through. Corrected for
+        # indirect access only, so other ops' plans are unchanged.
         if count_each_tile_once:
             split_by_symbol: dict[sympy.Symbol, int] = {}
         else:
@@ -2103,7 +2102,7 @@ def _search_output_only_tile_plan(
 
 
 def _gather_entry_host_dims(op: ComputedBuffer) -> set[int]:
-    """Output host dims of a gather that its index tensor is read over."""
+    """The gather output's host dims that its index tensor is read over."""
     index_names = {
         access.args[0].name
         for access in indirect_access_subs_from_op(op).values()
@@ -2123,12 +2122,12 @@ def _gather_data_dim_candidates(
     op: ComputedBuffer,
     candidates: list[SpanOverflowCandidate],
 ) -> list[SpanOverflowCandidate]:
-    """Move a gather's output span candidates onto the shared table's data dims.
+    """Offer a gather's span candidates on the shared table's data dims.
 
-    The span analysis offers only dims the index is read over. Tiling one of
-    those does not reduce the data coordinate that overflows, so supply the
-    table's own dims, which does. Each is offered with the worst overflowing
-    span; the stick dim only as a last resort, since tiling it leaves the
+    The analysis keys its candidates on the dims the index is read over. A
+    data-dim chunk instead advances the table's base identically on every
+    core, which is what a tile needs. Each dim is offered with the worst
+    overflowing span. The stick dim comes last: tiling it leaves the
     collector buffer needing the split that overflowed.
     """
     if not candidates:
@@ -2238,9 +2237,9 @@ def _plan_indirect_access_tile(
 ) -> SpanOverflowTilePlan | None:
     """Plan a tile for an op taking part in an indirect access, or decline.
 
-    Tiling is a fallback: an op work division can place keeps that plan rather
-    than trade cores for sequential trips. Declining when no tile fits lets
-    work division report the span overflow itself, instead of hiding the
+    Tiling is a fallback: if work division can place the op, keep that plan
+    rather than trade cores for sequential trips. Declining when no tile fits
+    lets work division report the overflow itself, rather than hiding the
     reason behind a planner-internal message.
     """
     if fits_span_without_tiling(op, max_cores):
@@ -2334,6 +2333,7 @@ def plan_span_overflow_tile(
     if isinstance(op.data, Pointwise):
         # Pointwise ops only need output-span analysis here.
         candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
+        # Also the relayout copy, which has no indirect read of its own.
         if candidates and _is_indirect_access_related(op):
             return _plan_indirect_access_tile(op, max_cores, candidates)
         logger.debug(
