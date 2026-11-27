@@ -725,16 +725,24 @@ def fn(x, routing):
 
 The count must be:
 
-- a float32 tensor holding a whole number, on the same device as the
-  operands, and not one of the operands the loop tiles;
+- a float32 tensor on the same device as the operands, and not one of the
+  operands the loop tiles;
 - one 128-byte stick per row (32 float32 values, the count in the first), in
   standard element order;
 - written by a Spyre op in the same compiled kernel as the loop. A count passed
   in straight from the host is not supported yet; compute it with one device op,
   for example `active_count=cnt.abs()`.
 
-The loop must have a static trip count and `reverse=False`. Each of these is
-refused at compile time with an error naming the count.
+The loop must have a static trip count (it may not walk a dimension declared
+with `dynamic=`) and `reverse=False`, and it may not hold a collective such as
+`all_reduce`: under tensor parallelism each rank reads its own count, so the
+ranks could run different numbers of trips around it. Reduce once before or
+after the loop instead. Each of these is refused at compile time with an error
+naming the count.
+
+The count's value is only read at run time, so it is not checked: keeping it a
+whole number is the producer's job. A fractional value rounds up, so 2.5 runs
+three trips.
 
 #### Data Semantics
 
