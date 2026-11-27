@@ -454,37 +454,21 @@ def _make_name_stable_loader(name: str):
     ``ir.Buffer.make_loader()`` (upstream) returns a closure over ``self`` --
     reading ``self.name``/``self.get_layout()`` straight off the captured
     object every time the loader runs, with no indirection through
-    ``V.graph.get_buffer(name)`` in between. That is safe as long as nothing
-    ever needs to replace the buffer object afterwards; the object a later
-    reader's closure captured stays the live one, and mutating its layout
-    in place (as ``finalize_layouts`` does: ``op.layout = ...``) stays
-    visible through that closure.
+    ``V.graph.get_buffer(name)`` in between. That is fine as long as the
+    object is only ever mutated in place afterwards (as ``finalize_layouts``
+    does: ``op.layout = ...``). ``ComputedBuffer`` is a frozen dataclass,
+    though, so some passes (e.g. a read redirect, or inlining a tile marker)
+    replace the object outright instead -- correctly repointing every
+    NAME-based reference (``V.graph.name_to_buffer``, ``name_to_op``), but
+    never a closure another buffer's loader already captured over the old
+    object.
 
-    It stops being safe once a buffer built here is consumed, VIA THAT
-    CLOSURE, by another buffer built here in the SAME split_multi_ops call --
-    e.g. a multi-level intermediate chain like lower_trunc's ``floor``
-    reading ``abs``. Inside a for_each_tile loop body (see
-    split_multi_ops_in_while_loop_bodies, for_each_tile_lowering.py),
-    everything in the body -- these intermediates included -- is still due
-    for splice_while_loop's unconditional read-redirect (placeholder reads
-    pointed at the real carry/tile buffer) and, for a marker consumer,
-    _consume_tile_dim_markers's inlining. Both replace the ComputedBuffer
-    object outright (it is a frozen dataclass; replace_computed_buffer_body's
-    own docstring explains why), correctly repointing every NAME-based
-    reference (V.graph.name_to_buffer, name_to_op) but never the closure
-    `floor`'s loader captured over the OLD `abs` object. That old object is
-    then orphaned forever at whatever layout it had when captured --
-    FlexibleLayout, since this runs before layout propagation -- and
-    `floor`'s own scheduling later crashes computing its load index:
-    AssertionError: convert FlexibleLayout to FixedLayout first (issue
-    #6410).
-
-    Re-resolving by name on every call sidesteps this regardless of how many
-    times the object gets replaced afterwards: by the time anything actually
-    loads from it, ``V.graph.get_buffer(name)`` returns whichever object is
-    CURRENTLY live, with whatever layout propagation has given it by then.
-    Outside a loop body, where nothing ever replaces these objects, this is
-    a no-op change -- the name always resolves to the same object regardless.
+    Re-resolving ``name`` via ``V.graph.get_buffer`` on every call sidesteps
+    this regardless of how many times the object is replaced afterwards:
+    whichever object is current when the loader actually runs is the one
+    used. Outside a loop body, where split_multi_ops's own intermediates are
+    never replaced after creation, this is a no-op -- the name always
+    resolves to the same object either way.
     """
 
     def make_loader():
@@ -531,10 +515,8 @@ def _lower_fx_node(node, gl, ops, before):
     for new_op in new_ops:
         move_before(ops, before, new_op)
     gl.name_to_buffer[buf.get_name()] = buf
-    # A later intermediate built in this same split_multi_ops call (e.g. a
-    # chained op reading this one) may capture buf via make_loader() before
-    # this buffer is ever itself replaced -- see _make_name_stable_loader's
-    # own docstring for why that closure must not be left to go stale.
+    # A later intermediate built in this same call may read buf via
+    # make_loader() -- see _make_name_stable_loader's own docstring.
     buf.make_loader = _make_name_stable_loader(buf.get_name())
     return buf
 

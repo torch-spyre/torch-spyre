@@ -459,42 +459,27 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                 torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
 
     def test_cast_to_int32_in_tile_body_matches_eager(self):
-        """Regression test for issue #6410.
+        """`cast_to_int32_tiled_fn` matches a CPU `.to(torch.int32)` reference
+        for every floating source dtype, inside a `for_each_tile` body.
+        `float16`/`bfloat16` additionally round-trip through an extra
+        `float32` conversion fused around the same `lower_trunc` body
+        (`to_dtype`'s `float16_format` branch), so this exercises more than
+        just the plain `float32` case. `self.subTest` reports each dtype's
+        failure independently rather than stopping at the first.
 
-        `cast_to_int32_tiled_fn`'s per-tile cast to ``int32`` is lowered
-        inside a `for_each_tile` body, where `lower_trunc`'s fused
-        ``floor(|x|) * clip(x, -1, 1)`` synthesis of the cast used to reach
-        `SpyreKernel.store` undecomposed (see that fixture's docstring) and
-        raise `InductorError: ... unexpected argument
-        PointwiseOp(op='floor', ...) to mul`. Disabling
-        `split_multi_ops_in_while_loop_bodies` (the fix: running
-        `split_multi_ops` against each loop body's own FX subgraph before
-        `splice_while_loops` disconnects it) reproduces the crash here.
-
-        Looped over `bfloat16` in addition to `float32`: it round-trips
-        through an extra `float32` conversion fused around the same
-        `lower_trunc` body (`to_dtype`'s `float16_format` branch), so a
-        dtype-specific fix in `lower_trunc` alone -- as opposed to a general
-        one covering every fused body inside a loop -- would not reach it.
-        `self.subTest` reports each dtype's failure independently rather
-        than stopping at the first.
-
-        `float16` is deliberately excluded here: the device's `float16` <->
-        `float32` round-trip is itself lossy for some values (confirmed
-        independent of `for_each_tile`/this fix -- the same mismatch
-        reproduces on a plain, unlooped `x.to(torch.int32)`), a separate,
-        pre-existing issue this PR does not address.
-
-        Values include both positive and negative fractions so the fix is
-        checked against `trunc`-toward-zero value semantics, not just that
-        compilation succeeds.
+        Input values are quarter-integers (`k / 4` for integer `k`), which
+        `float16` holds exactly, so the comparison is exact (`atol=rtol=0`)
+        without `float16`'s own device round-trip precision loss
+        confounding the result. Includes both positive and negative values
+        so the check exercises `trunc`-toward-zero semantics, not just
+        rounding.
         """
         torch.manual_seed(6410)
         rows, cols, tile_size = 128, 64, 64
 
-        for src_dtype in (torch.float32, torch.bfloat16):
+        for src_dtype in (torch.float32, torch.float16, torch.bfloat16):
             with self.subTest(src_dtype=src_dtype):
-                x = (torch.rand(rows, cols) * 200 - 100).to(src_dtype)
+                x = (torch.randint(-1000, 1000, (rows, cols)) / 4).to(src_dtype)
                 expected = x.to(torch.int32)
 
                 torch._dynamo.reset()

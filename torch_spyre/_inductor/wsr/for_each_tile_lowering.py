@@ -23,14 +23,11 @@ every step of turning one into tiled, schedulable ops:
    count. Every for_each_tile-specific assumption lives in this module;
    while_loop_bridge.py (the generic splice mechanism) knows none of them.
 
-2. Split: split_multi_ops_in_while_loop_bodies runs just before splice_while_loops
-   and splits any fused multi-op body (e.g. lower_trunc's floor(abs(x))) inside
-   each still-unspliced WhileLoop's own body_subgraph.graph. It has to run
-   before the splice below, not after: split_multi_ops's origin lookup needs
-   the body's own (still intact) FX graph to find where a fused op's new
-   intermediates go, and that graph is no longer reachable once splicing has
-   flattened the body into the top-level graph. See that function's own
-   docstring for why (issue #6410).
+2. Split: split_multi_ops_in_while_loop_bodies runs just before splice_while_loops,
+   splitting any fused multi-op body (e.g. lower_trunc's floor(abs(x))) inside
+   each still-unspliced WhileLoop's own body_subgraph.graph. It must run before
+   the splice below: split_multi_ops needs the body's own FX graph, still
+   intact, to find where a fused op's new intermediates go.
 
 3. Splice: once accepted, splice_while_loops hands the WhileLoop to
    while_loop_bridge.splice_while_loop, which flattens the loop body into
@@ -3322,38 +3319,23 @@ def split_multi_ops_in_while_loop_bodies(graph) -> None:
     """CustomPreSchedulingPasses entry point: split fused ops inside WhileLoop bodies.
 
     Runs split_multi_ops (split_multi_ops.py) against each still-unspliced
-    for_each_tile WhileLoop's own body_subgraph.graph, immediately before
-    splice_while_loops (the next pass in the pipeline) flattens that body into
-    graph.operations. Must run before splice_while_loops, not after -- see why
-    below.
+    for_each_tile WhileLoop's own body_subgraph.graph, before splice_while_loops
+    (the next pass) flattens that body into graph.operations.
 
-    split_multi_ops's own origin_in_graph lookup finds the FX node that
-    anchors where a new intermediate buffer's node gets inserted, by searching
-    V.graph.graph: the FX graph belonging to whichever GraphLowering is
-    currently active. While a for_each_tile loop is still a WhileLoop HOP, the
-    ops inside its body carry origins in body_subgraph.graph's OWN FX graph --
-    a different object from the top-level graph's. splice_while_loops's splice
-    flattens the body's ComputedBuffer IR ops into graph.operations, but has
-    no reason to (and does not) re-parent their FX origins into the top-level
-    FX graph; nothing else needs that, since the IR ops are already runnable
-    in place without it. So by the time split_multi_ops runs in the main
-    CustomPreSchedulingPasses list (well after splice_while_loops, close to
-    stickification), a fused op that lived inside a loop body carries an
-    origin naming a node in a graph that no longer contains it:
-    origin_in_graph finds nothing there, split_multi_ops silently skips the
-    op (its own docstring on that lookup documents this as a known gap), and
-    a fused, unsupported multi-op buffer (e.g. lower_trunc's
-    ``floor(abs(x))``) reaches SpyreKernel.store intact instead of split into
-    separate buffers (issue #6410).
+    Must run before splice_while_loops: split_multi_ops's origin_in_graph
+    lookup finds the FX node that anchors where a new intermediate's node is
+    inserted, by searching V.graph.graph -- the FX graph of whichever
+    GraphLowering is currently active. A for_each_tile body's ops carry
+    origins in body_subgraph.graph's own FX graph, a different object from
+    the top-level graph's; splicing flattens the body's IR ops into
+    graph.operations but does not re-parent their FX origins into the
+    top-level graph. Running split_multi_ops here, while body and FX graph
+    still match, lets it find that anchor and split every fused op before
+    splicing happens.
 
-    Running split_multi_ops here instead, against each body's own
-    body_subgraph.graph while body and FX graph still match, splits every
-    fused op before any splicing happens -- the op never gets a chance to go
-    stale. The resulting intermediate ComputedBuffers become ordinary members
-    of body_subgraph.graph.operations, so splice_while_loop picks them up
-    exactly like any other body op once it runs. This covers every lowering
-    that can produce a fused multi-op body inside a loop, not only
-    lower_trunc.
+    The resulting intermediate ComputedBuffers become ordinary members of
+    body_subgraph.graph.operations, so splice_while_loop picks them up like
+    any other body op.
 
     A nested for_each_tile's inner WhileLoop is only reachable through the
     outer body's own body_subgraph.graph.operations (it has not been spliced

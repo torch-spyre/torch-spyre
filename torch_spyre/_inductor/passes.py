@@ -566,12 +566,7 @@ class CustomPreSchedulingPasses:
             # Split any fused multi-op body (e.g. lower_trunc's floor(abs(x)))
             # inside each for_each_tile WhileLoop's own body_subgraph.graph
             # while that body's FX graph is still intact. Must run before
-            # splice_while_loops, below: once that pass flattens a loop body
-            # into graph.operations, a fused op's origin no longer names a
-            # node reachable from the top-level graph, and split_multi_ops
-            # (which runs much later, near stickification) silently skips it.
-            # See split_multi_ops_in_while_loop_bodies's own docstring
-            # (issue #6410).
+            # splice_while_loops, below -- see that function's own docstring.
             split_multi_ops_in_while_loop_bodies,
             #
             # Convert for_each_tile WhileLoops bodies into inlined IR with loop_infos

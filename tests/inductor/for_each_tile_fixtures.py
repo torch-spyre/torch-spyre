@@ -1609,26 +1609,13 @@ def scatter_carry_old_value_fn(values, indices, output):
 
 
 def cast_to_int32_tiled_fn(x, *, tile_size):
-    """A plain cast to ``int32`` on each tile -- issue #6410.
+    """A plain cast to ``int32`` on each tile.
 
     The device has no truncation op, so a float -> int cast routes through
-    ``lower_trunc``, which synthesizes it as ``floor(|x|) * clip(x, -1, 1)``.
-    A ``float16``/``bfloat16`` source additionally round-trips through
+    ``lower_trunc``, synthesized as ``floor(|x|) * clip(x, -1, 1)``. A
+    ``float16``/``bfloat16`` source additionally round-trips through
     ``float32`` first (``to_dtype``'s ``float16_format`` branch), fusing a
-    second conversion around the same ``lower_trunc`` body. Outside a loop,
-    ``split_multi_ops`` decomposes a fused body like this into separate
-    buffers after the fact. Inside a ``for_each_tile`` body, the body is
-    lowered against the ``while_loop`` HOP's own FX subgraph (see upstream
-    ``ir.WhileLoop.create``); once ``splice_while_loops`` flattens that body
-    into the top-level graph, an op's origin still names a node in the
-    now-disconnected subgraph, so ``split_multi_ops``'s ``origin_in_graph``
-    lookup -- run against the top-level graph, as it is by default -- finds
-    nothing and silently skips it. A fused ``floor(abs(x))`` then reaches
-    ``SpyreKernel.store`` undecomposed, which rejects it as an unsupported
-    argument to ``mul``. ``split_multi_ops_in_while_loop_bodies``
-    (``for_each_tile_lowering.py``) fixes this generally, for any dtype, by
-    running ``split_multi_ops`` against the body's own FX subgraph before
-    the splice disconnects it.
+    second conversion around the same ``lower_trunc`` body.
     """
     from torch_spyre._inductor.wsr import for_each_tile
 
