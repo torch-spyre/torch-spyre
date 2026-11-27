@@ -14,6 +14,7 @@
 
 import dataclasses
 import types
+import unittest.mock as mock
 
 import pytest
 import sympy
@@ -28,11 +29,13 @@ from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Scatter
 from torch._inductor.sizevars import SizeVarAllocator
+from torch._inductor.utils import sympy_index_symbol
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_device_dtype
 
 import torch_spyre._inductor.pass_utils as pass_utils
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_layouts import PropArg
 from torch_spyre._inductor.patches import _unique_operation_names
 from torch_spyre._inductor.pass_utils import (
@@ -42,7 +45,10 @@ from torch_spyre._inductor.pass_utils import (
     reorder_valid_elements,
     restickify_valid_elements,
 )
-from torch_spyre._inductor.propagate_layouts import _compact_broadcast_device_dims
+from torch_spyre._inductor.propagate_layouts import (
+    _compact_broadcast_device_dims,
+    _prune_unaligned_staggered_inputs,
+)
 from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 from utils_inductor import DEVICE
 
@@ -852,3 +858,139 @@ def test_compute_size1_restickify_layout_indirect_access():
     # maps to no host stride.
     assert list(result.device_size) == [512, 64]
     assert list(result.stride_map) == [1, 0]
+
+
+@pytest.mark.parametrize(
+    "ea, device_size, stride_map, dtype",
+    [
+        (ElementArrangement.DL16_TO_FP32, [4, 4, 32], [32, 100, 1], torch.float32),
+        (ElementArrangement.FP32_TO_DL16, [2, 4, 64], [64, 100, 1], torch.float16),
+    ],
+)
+@pytest.mark.parametrize("outer_name, stick_name", [("c0", "c1"), ("c1", "c0")])
+def test_unaligned_staggered_guard_considers_every_reduction_var(
+    ea, device_size, stride_map, dtype, outer_name, stick_name
+):
+    """A full sum() of an unaligned (4, 100) staggered input reduces two variables.
+
+    The guard must raise whichever of them carries the stick. Swapping which
+    symbol name is the stick variable exercises both set iteration orders, so a
+    guard that picks one reduction variable arbitrarily fails for one of them.
+    """
+    outer = sympy_index_symbol(outer_name)
+    stick = sympy_index_symbol(stick_name)
+    valid = dict(SpyreTensorLayout([4, 100], dtype).valid_elements)
+    stl = SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype), valid, ea)
+    host = FixedLayout(torch.device("cpu"), dtype, [4, 100], [100, 1])
+    dep = MemoryDep("x", 100 * outer + stick, (outer, stick), (4, 100))
+    scalar_out = MemoryDep("y", sympy.S.Zero, (), ())
+    op = mock.MagicMock()
+    op.get_name.return_value = "buf1"
+    op.data.reduction_type = "sum"
+
+    with pytest.raises(Unsupported, match="issue #4014"):
+        _prune_unaligned_staggered_inputs(op, PropArg(dep, host, [stl]), scalar_out)
+
+
+@pytest.mark.parametrize(
+    "ea, dtype",
+    [
+        (ElementArrangement.DL16_TO_FP32, torch.float32),
+        (ElementArrangement.FP32_TO_DL16, torch.float16),
+    ],
+)
+@pytest.mark.parametrize(
+    "n, rejected",
+    [(59, True), (60, False), (63, False), (64, False), (65, False)]
+    + [(68, False), (69, True), (100, True), (125, False), (133, True)],
+)
+def test_unaligned_staggered_guard_allows_tail_run_sizes(ea, dtype, n, rejected):
+    """The guard keeps sizes within 4 of a multiple of 64 (#4014).
+
+    There the padding lanes are one run at the end of the dimension, so the
+    backend's single tail interval masks the right lanes (checked on device:
+    N=60, 63, 68 are correct, N=59, 69, 100 are not).
+    """
+    i = sympy_index_symbol("c0")
+    stl = SpyreTensorLayout([n], dtype).with_element_arrangement(ea)
+    host = FixedLayout(torch.device("cpu"), dtype, [n], [1])
+    dep = MemoryDep("x", i, (i,), (n,))
+    scalar_out = MemoryDep("y", sympy.S.Zero, (), ())
+    op = mock.MagicMock()
+    op.get_name.return_value = "buf1"
+    op.data.reduction_type = "sum"
+    arg = PropArg(dep, host, [stl])
+
+    if rejected:
+        with pytest.raises(Unsupported, match="issue #4014"):
+            _prune_unaligned_staggered_inputs(op, arg, scalar_out)
+    else:
+        _prune_unaligned_staggered_inputs(op, arg, scalar_out)
+        assert arg.layouts == [stl]
+
+
+def test_unaligned_staggered_guard_returns_removed_candidates():
+    """The guard reports what it removed, so the layout search can forbid it.
+
+    A (64, 100) bool sum has two candidates. The stick on the 100 dim is unsafe
+    and is returned; the stick on the 64 dim is kept (#4014).
+    """
+    dtype = torch.float32
+    ea = ElementArrangement.DL16_TO_FP32
+    dev = get_device_dtype(dtype)
+    on_100 = SpyreTensorLayout(
+        [4, 64, 32], [32, 100, 1], dev, {(0, 2): 100, (1,): 64}, ea
+    )
+    on_64 = SpyreTensorLayout(
+        [2, 100, 32], [3200, 1, 100], dev, {(0, 2): 64, (1,): 100}, ea
+    )
+    i = sympy_index_symbol("c0")
+    j = sympy_index_symbol("c1")
+    host = FixedLayout(torch.device("cpu"), dtype, [64, 100], [100, 1])
+    dep = MemoryDep("x", 100 * i + j, (i, j), (64, 100))
+    scalar_out = MemoryDep("y", sympy.S.Zero, (), ())
+    op = mock.MagicMock()
+    op.get_name.return_value = "buf1"
+    op.data.reduction_type = "sum"
+    arg = PropArg(dep, host, [on_100, on_64])
+
+    removed = _prune_unaligned_staggered_inputs(op, arg, scalar_out)
+
+    assert removed == [on_100]
+    assert arg.layouts == [on_64]
+
+
+def test_edge_cost_map_forbidden_in_stls_cost_inf():
+    """An input layout listed as forbidden costs INF against any target, so the
+    layout search never commits the producer to it."""
+    from torch_spyre._inductor.optimize_restickify import INF, EdgeCostMap
+
+    dtype = torch.float32
+    stl = SpyreTensorLayout(
+        [4, 64, 32],
+        [32, 100, 1],
+        get_device_dtype(dtype),
+        {(0, 2): 100, (1,): 64},
+        ElementArrangement.DL16_TO_FP32,
+    )
+    other = SpyreTensorLayout(
+        [2, 100, 32],
+        [3200, 1, 100],
+        get_device_dtype(dtype),
+        {(0, 2): 64, (1,): 100},
+        ElementArrangement.DL16_TO_FP32,
+    )
+    i = sympy_index_symbol("c0")
+    j = sympy_index_symbol("c1")
+    dep = MemoryDep("x", 100 * i + j, (i, j), (64, 100))
+    buf = mock.MagicMock()
+    buf.get_layout.return_value = FixedLayout(
+        torch.device("cpu"), dtype, [64, 100], [100, 1]
+    )
+    with mock.patch("torch_spyre._inductor.optimize_restickify.V") as v:
+        v.graph.get_buffer.return_value = buf
+        ec = EdgeCostMap(
+            dep, [stl, other], dep, mock.MagicMock(), None, frozenset([stl])
+        )
+        assert ec.cost(stl, other) == INF
+        assert ec.layout(stl, other) is EdgeCostMap.INFEASIBLE

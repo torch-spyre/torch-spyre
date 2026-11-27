@@ -2572,6 +2572,92 @@ def _multi_arg_pointwise_layouts(
     return results
 
 
+# Elements per group in a staggered stick; see _prune_unaligned_staggered_inputs.
+_STAGGER_GROUP = 4
+
+
+def _prune_unaligned_staggered_inputs(
+    op: Operation, arg: "PropArg", output_dep: MemoryDep
+) -> list[SpyreTensorLayout]:
+    """Remove staggered STL candidates where the reduction is over the stick
+    and the stick dimension's padding is not one tail run (see below).
+
+    Returns the removed candidates. ``arg.layouts`` is this reduction's own copy
+    of its producer's candidates, so removing from it does not constrain the
+    producer; the caller forbids the returned layouts in the layout search.
+
+    Issue #4014: for a staggered (``DL16_TO_FP32`` or ``FP32_TO_DL16``) input,
+    when a reduction variable lives on the stick dimension and that dimension's
+    size is not a multiple of 64 (the stagger unit), the backend's coordinate
+    masking emits a single tail-interval which covers the wrong lanes and
+    silently returns an incorrect result.
+
+    The tail interval is correct when the last stagger unit holds at most
+    one group of four live elements (``n % 64 <= 4``) or lacks at most one group
+    of four (``n % 64 >= 60``): the padding lanes are then one run at the end of
+    the dimension, as in a standard arrangement. Both arrangements have this
+    property (checked against the permutations in #4014 and on device, e.g.
+    N=60, 63, 68 are correct and N=59, 69, 100 are not), so those sizes are kept.
+
+    Every reduced variable is considered: a reduction can have several (a full
+    ``sum()`` of a 2-D tensor reduces both dims), and the guard fires when any
+    of them is carried by the stick.  When the reduction is over non-stick
+    dimensions only, the stagger does not affect coordinate masking and the
+    candidate is safe.
+
+    If every candidate is unsafe, ``Unsupported`` is raised immediately (no
+    restickify attempt — staggered STLs cannot be restickified).
+    """
+    # Identify the reduction variables: present in input dep, absent in output.
+    reduction_vars = arg.dep.index.free_symbols - output_dep.index.free_symbols
+    if not reduction_vars:
+        return []
+
+    in_coords = host_coordinates(arg.layout, arg.dep, None)
+    # The stagger unit is 64 elements for both staggered arrangements, whatever
+    # the host dtype, so it is the fp16 stick width and not elems_per_stick():
+    #  - FP32_TO_DL16 is fp16 on device (64 elements per stick).
+    #  - DL16_TO_FP32 is fp32 on device (32 elements per stick) but is staggered
+    #    in pairs of fp32 sticks, so its unit is also 64.  Using 32 would accept
+    #    sizes such as 96 that have no room for the last stick pair.
+    stagger_unit = get_elem_in_stick(torch.float16)
+
+    bad: dict[int, int] = {}  # id(stl) -> stick-dim size for unsafe candidates
+    for stl in arg.layouts:
+        if stl.element_arrangement not in STAGGERED_EAS:
+            continue
+        dev_coords = try_device_coordinates(stl, arg.dep, None)
+        if dev_coords is None:
+            continue
+        # Only unsafe when a reduction variable lives on the stick.
+        if not reduction_vars & dev_coords[-1].free_symbols:
+            continue
+        stick_dim = matching_dim(in_coords, dev_coords[-1])
+        if stick_dim is None:
+            continue
+        n = concretize_expr(arg.layout.size[stick_dim])
+        r = n % stagger_unit
+        if min(r, stagger_unit - r) > _STAGGER_GROUP:
+            # Padding lanes are not one tail run; the mask names the wrong lanes.
+            bad[id(stl)] = n
+
+    if not bad:
+        return []
+
+    kept = [stl for stl in arg.layouts if id(stl) not in bad]
+    removed = [stl for stl in arg.layouts if id(stl) in bad]
+    if not kept:
+        stl = arg.layouts[0]
+        n = bad[id(stl)]
+        raise Unsupported(
+            f"{op.get_name()} ({op.data.reduction_type}): reduction of a staggered "
+            f"({stl.element_arrangement}) input whose stick-dim size {n} is not "
+            f"within {_STAGGER_GROUP} of a multiple of {stagger_unit} (issue #4014)"
+        )
+    arg.layouts[:] = kept
+    return removed
+
+
 def _reduction_layouts(
     op: Operation,
     output: FixedLayout,
@@ -2596,6 +2682,7 @@ def _reduction_layouts(
     (one element per stick), as in ``_topk_layouts``.
     """
     arg = args[0]
+    unsafe_in_stls = _prune_unaligned_staggered_inputs(op, arg, output_dep)
     layouts = []
     for stl in arg.layouts:
         layouts.extend(
@@ -2627,6 +2714,7 @@ def _reduction_layouts(
         forbidden_stick_sym=(
             find_reduction_var((arg.dep,), output_dep) if non_stick_only else None
         ),
+        forbidden_in_stls=unsafe_in_stls,
     )
     return layouts
 

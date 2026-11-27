@@ -1457,6 +1457,78 @@ def lower_mean_default(x, *, dtype=None):
     return lower_mean(x, axis=axis, keepdim=False, dtype=dtype)
 
 
+def _lower_sum_impl(x, axis, keepdim, dtype=None):
+    """Lower sum over ``axis``, accumulating in ``comp_dtype``.
+
+    bool/int32/int64 inputs accumulate in fp32 (INT_TO_FLOAT). fp32 holds integers
+    exactly only up to 2**24, so an int32/int64 input with an element or a running
+    sum above 2**24 that fp32 cannot represent gives an inexact result (#6683).
+    A bool sum is a count, so it is exact while the element count stays below 2**24.
+    """
+    comp_dtype = _promoted_dtype(x, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT)
+    # When the caller requests a wider float output dtype (e.g. fp16.sum(dtype=fp32)),
+    # widen comp_dtype so the accumulation runs in that wider type rather than reducing
+    # in fp16 and upcasting only after.  This avoids large precision loss on fp16 inputs
+    # (max abs err ~50 on (8, 4096) inputs when reduced in fp16).
+    if dtype is not None and dtype.is_floating_point:
+        comp_dtype = torch.promote_types(comp_dtype, dtype)
+
+    if dtype is not None:
+        result_dtype = dtype
+    elif not x.get_dtype().is_floating_point:
+        result_dtype = torch.int64
+    else:
+        result_dtype = x.get_dtype()
+
+    if x.get_dtype() != comp_dtype:
+        x_comp = to_dtype(x, comp_dtype)
+        origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+        _ensure_synthetic_origin(
+            x_comp,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
+        x_comp.realize()
+    else:
+        x_comp = x
+
+    kwargs = lowering._make_reduction_inner(
+        x_comp,
+        axis=axis,
+        keepdims=keepdim,
+        dtype=comp_dtype,
+        override_return_dtype=None,
+    )
+    result = Reduction.create(
+        reduction_type="sum",
+        input_node=x_comp,
+        **kwargs,
+    )
+    result.realize()
+
+    if comp_dtype != result_dtype:
+        skip_trunc = not x.get_dtype().is_floating_point
+        return to_dtype(result, result_dtype, skip_trunc=skip_trunc)
+    return result
+
+
+@register_spyre_lowering(torch.ops.aten.sum.dim_IntList, type_promotion_kind=None)
+def lower_sum_dim(x, dim=None, keepdim=False, *, dtype=None):
+    if dim is None:
+        axis = list(range(len(x.get_size())))
+    elif isinstance(dim, int):
+        axis = [dim]
+    else:
+        axis = list(dim)
+    return _lower_sum_impl(x, axis=axis, keepdim=keepdim, dtype=dtype)
+
+
+@register_spyre_lowering(torch.ops.aten.sum.default, type_promotion_kind=None)
+def lower_sum_default(x, *, dtype=None):
+    axis = list(range(len(x.get_size())))
+    return _lower_sum_impl(x, axis=axis, keepdim=False, dtype=dtype)
+
+
 @register_spyre_lowering(torch.ops.spyre.gelu)
 def lower_gelu(x, approximate="none"):
     pw = Pointwise.create(

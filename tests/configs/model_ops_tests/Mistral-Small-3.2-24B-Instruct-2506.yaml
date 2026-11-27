@@ -1791,6 +1791,9 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bool
                           device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mistral3/modeling_mistral3.py#L263 in get_placeholder_mask,
                     code: n_image_tokens = special_image_mask.sum()'
                   tags:
