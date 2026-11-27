@@ -24,6 +24,7 @@ import pytest
 import torch
 from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import InductorError
+from torch_spyre._inductor.errors import Unsupported
 
 from utils_inductor import DEVICE, cached_randn, compare_with_cpu
 from conftest import (
@@ -118,13 +119,6 @@ def _mode_params(*, eager=None, compile=None):
     return tuple(params)
 
 
-_MODE_PARAMS_SCATTER_EAGER_ONLY_UNSUPPORTED = _mode_params(
-    eager=(
-        4473,
-        NotImplementedError,
-        "Spyre eager scatter dispatch is unsupported for this case",
-    )
-)
 _MODE_PARAMS_SCATTER_HIGH_RANK_XFAIL = _mode_params(
     eager=(
         4473,
@@ -137,16 +131,40 @@ _MODE_PARAMS_SCATTER_HIGH_RANK_XFAIL = _mode_params(
         "dbo-opt GatherIndexConversion fails its divisibility assertion",
     ),
 )
-_MODE_PARAMS_SCATTER_ADD_UNSUPPORTED = _mode_params(
+_MODE_PARAMS_SCATTER_TRANSPOSED_SOURCE_STRIDED_INDEX_XFAIL = _mode_params(
     eager=(
-        4396,
+        4473,
         NotImplementedError,
-        "aten::scatter_add.out has no registered Spyre eager kernel",
+        "Spyre eager scatter dispatch is unsupported for this case",
     ),
     compile=(
-        6575,
+        4927,
         InductorError,
-        "dbo-opt scheduler rejects the scatter page-size constraint",
+        "Inductor does not support slice_scatter with step=2 for a strided destination view",
+    ),
+)
+_MODE_PARAMS_SCATTER_1D_SINGLE_ELEMENT_XFAIL = _mode_params(
+    eager=(
+        4473,
+        NotImplementedError,
+        "Spyre eager scatter dispatch is unsupported for this case",
+    ),
+    compile=(
+        4637,
+        InductorError,
+        "Inductor indirect-scatter alignment fails with KeyError: tmp0",
+    ),
+)
+_MODE_PARAMS_SCATTER_1D_INPLACE_SCALAR_FILL_XFAIL = _mode_params(
+    eager=(
+        4473,
+        NotImplementedError,
+        "Spyre eager scatter dispatch is unsupported for this case",
+    ),
+    compile=(
+        4474,
+        InductorError,
+        "Inductor cannot pad the sliced scatter output in place during restickification",
     ),
 )
 _MODE_PARAMS_SCATTER_ADD_EAGER_ONLY_XFAIL = _mode_params(
@@ -156,7 +174,91 @@ _MODE_PARAMS_SCATTER_ADD_EAGER_ONLY_XFAIL = _mode_params(
         "aten::scatter_add.out has no registered Spyre eager kernel",
     )
 )
+_MODE_PARAMS_INDEX_ADD_STORAGE_OFFSET_XFAIL = _mode_params(
+    eager=(3507, NotImplementedError, "Enable Tensor.index_add_ / aten::index_add"),
+    compile=(
+        6707,
+        InductorError,
+        "Inductor layout propagation cannot resolve sharding because graph and real input counts differ",
+    ),
+)
+_MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL = _mode_params(
+    eager=(
+        4396,
+        NotImplementedError,
+        "aten::scatter_add.out has no registered Spyre eager kernel",
+    ),
+    compile=(
+        6707,
+        InductorError,
+        "Inductor layout propagation cannot resolve sharding because graph and real input counts differ",
+    ),
+)
+_MODE_PARAMS_SCATTER_REDUCE_DYNAMIC_SYMINT_XFAIL = _mode_params(
+    eager=(
+        4361,
+        NotImplementedError,
+        "indexed-reduction eager dispatch is reported unsupported",
+    ),
+    compile=(
+        6575,
+        InductorError,
+        "dbo-opt scheduler rejects the scatter page-size constraint",
+    ),
+)
+_MODE_PARAMS_SCATTER_ADD_BF16_SUBNORMAL_XFAIL = _mode_params(
+    eager=(
+        4396,
+        NotImplementedError,
+        "aten::scatter_add.out has no registered Spyre eager kernel",
+    ),
+    compile=(
+        6574,
+        InductorError,
+        "dbo-opt GatherIndexConversion fails its divisibility assertion",
+    ),
+)
+
+
+def _scatter_reduce_nan_inf_params():
+    """Build mode/reduction pairs with the existing per-mode XFAIL policies."""
+    params = []
+    for reduce_mode in ("sum", "prod", "mean", "amax", "amin"):
+        for mode in ("eager", "compile"):
+            if mode == "eager":
+                xfail = (
+                    4361,
+                    NotImplementedError,
+                    "indexed-reduction eager dispatch is reported unsupported",
+                )
+            elif reduce_mode == "sum":
+                xfail = (
+                    6575,
+                    InductorError,
+                    "dbo-opt scheduler rejects the scatter page-size constraint",
+                )
+            else:
+                xfail = (
+                    4361,
+                    InductorError,
+                    "indexed-reduction compile path is reported unsupported",
+                )
+            params.append(
+                pytest.param(
+                    mode,
+                    reduce_mode,
+                    marks=_xfail(*xfail),
+                    id=f"{reduce_mode}-{mode}",
+                )
+            )
+    return tuple(params)
+
+
+_SCATTER_REDUCE_NAN_INF_PARAMS = _scatter_reduce_nan_inf_params()
 _MODE_PARAMS_EAGER_COMPILE = ("eager", "compile")
+# Compile-only: the eager row is dropped where upstream (TestTorch / TestIndexing /
+# TestScatterGather, run through the OOT upstream configs) already covers the same case.
+_MODE_PARAMS_COMPILE_ONLY = ("compile",)
 _REDUCE_MODES = ("prod", "mean", "amax", "amin")
 _PUT_ACCUMULATE_OPTIONS = (False, True)
 
@@ -193,6 +295,54 @@ _MODE_PARAMS_INDEX_FILL_UNSUPPORTED = _mode_params(
         "Inductor scatter/index_fill lowering rejects a Constant store value",
     ),
 )
+_MODE_PARAMS_INDEX_FILL_NONUNIT_STRIDED_XFAIL = _mode_params(
+    eager=(
+        6587,
+        NotImplementedError,
+        "aten::index_fill_.int_Scalar has no registered Spyre eager kernel",
+    ),
+    compile=(
+        4927,
+        InductorError,
+        "Inductor does not support slice_scatter with step=2 for a strided destination view",
+    ),
+)
+_MODE_PARAMS_INDEX_REDUCE_SLICED_VIEW_DEST_XFAIL = _mode_params(
+    eager=(
+        6210,
+        InductorError,
+        "Indirect indexing on a sliced view with a non-zero storage offset fails OpSpec validation",
+    ),
+    compile=(
+        6210,
+        InductorError,
+        "Indirect indexing on a sliced view with a non-zero storage offset fails OpSpec validation",
+    ),
+)
+_MODE_PARAMS_INDEX_PUT_HALF_FORMAT_COLLISION_XFAIL = _mode_params(
+    eager=(
+        692,
+        NotImplementedError,
+        "aten::_index_put_impl_ has no registered Spyre eager kernel",
+    ),
+    compile=(
+        4411,
+        AssertionError,
+        "index_put_ accumulate with colliding indices keeps one update instead of accumulating them",
+    ),
+)
+_MODE_PARAMS_INDEX_COPY_ZERO_VOLUME_XFAIL = _mode_params(
+    eager=(
+        4474,
+        InductorError,
+        "Inductor cannot pad the sliced output in place during restickification",
+    ),
+    compile=(
+        3455,
+        InductorError,
+        "Inductor raises Unexpected stick expression for the zero-volume layout",
+    ),
+)
 _MODE_PARAMS_MASKED_SCATTER_UNSUPPORTED = _mode_params(
     eager=(
         4437,
@@ -217,6 +367,70 @@ _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE = _mode_params(
         "Spyre masked_scatter lowering rejects unsupported mask/source indexing",
     ),
 )
+# Dynamic-shape masked_scatter now runs without an XFAIL in compile mode.
+# Keep the existing eager XFAIL because the eager elementwise indexing path is unsupported.
+_MODE_PARAMS_MASKED_SCATTER_DYNAMIC = _mode_params(
+    eager=(
+        4437,
+        RuntimeError,
+        "Spyre masked_scatter rejects element-level mask/source indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_COMPILE_ONLY = _mode_params(
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter lowering rejects unsupported mask/source indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_ZERO_VOLUME = _mode_params(
+    eager=(
+        4437,
+        NotImplementedError,
+        "Spyre eager masked_scatter_ overload has no registered kernel",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter lowering rejects unsupported mask/source indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_ALL_TRUE = _mode_params(
+    eager=(
+        4437,
+        Unsupported,
+        "Spyre eager masked_scatter_ overload has no registered kernel",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter requires a mask broadcast along the last dim and rejects element-level indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_SCALAR_FALSE = _mode_params(
+    eager=(
+        4437,
+        Unsupported,
+        "Spyre masked_scatter requires a mask broadcast along the last dim and rejects element-level indexing",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter requires a mask broadcast along the last dim and rejects element-level indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_NO_SIDE_EFFECTS = _mode_params(
+    eager=(
+        4437,
+        Unsupported,
+        "Spyre masked_scatter does not support element-level mask/source indexing",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter does not support element-level mask/source indexing",
+    ),
+)
 _MODE_PARAMS_INDEX_PUT_UNSUPPORTED = _mode_params(
     eager=(
         692,
@@ -224,9 +438,16 @@ _MODE_PARAMS_INDEX_PUT_UNSUPPORTED = _mode_params(
         "aten::_index_put_impl_ has no registered Spyre eager kernel",
     ),
     compile=(
-        4451,
+        6748,
         InductorError,
-        "index_put_ on a 3-D view of a 4-D tensor fails with a stride assertion in Inductor scheduling",
+        "torch.index_put compilation fails due to output indexer stride assertion",
+    ),
+)
+_MODE_PARAMS_INDEX_COPY_NONCONTIG_5D = _mode_params(
+    eager=(
+        6587,
+        RuntimeError,
+        "Eager index_copy.out on a non-contiguous 5D destination re-enters the compiled Spyre kernel",
     ),
 )
 _MODE_PARAMS_PUT_UNSUPPORTED = _mode_params(
@@ -235,6 +456,54 @@ _MODE_PARAMS_PUT_UNSUPPORTED = _mode_params(
         6578,
         InductorError,
         "Compiled put_ fails the restickify op_spec three-argument assertion",
+    ),
+)
+_MODE_PARAMS_PUT_ALL_NONCONTIG_XFAIL = _mode_params(
+    eager=(
+        692,
+        NotImplementedError,
+        "aten::put_ has no registered Spyre eager kernel for all-noncontiguous inputs",
+    ),
+    compile=(
+        6578,
+        InductorError,
+        "Compiled put_ fails the restickify op_spec three-argument assertion",
+    ),
+)
+_MODE_PARAMS_INDEX_REDUCE_DUPLICATES_XFAIL = _mode_params(
+    eager=(
+        4411,
+        AssertionError,
+        "eager index_reduce with duplicate indices keeps one update instead of reducing them",
+    ),
+    compile=(
+        4411,
+        AssertionError,
+        "compiled index_reduce with duplicate indices keeps one update instead of reducing them",
+    ),
+)
+_MODE_PARAMS_INDEX_REDUCE_NONCONTIG_SOURCE_XFAIL = _mode_params(
+    eager=(
+        4932,
+        AssertionError,
+        "Eager index_reduce_ with a non-contiguous source returns values that differ from CPU",
+    ),
+    compile=(
+        4932,
+        AssertionError,
+        "Compiled index_reduce_ with a non-contiguous source returns values that differ from CPU",
+    ),
+)
+_MODE_PARAMS_INDEX_REDUCE_NONCONTIG_ALL_XFAIL = _mode_params(
+    eager=(
+        4932,
+        AssertionError,
+        "Eager index_reduce_ with non-contiguous dest, source, and index returns values that differ from CPU",
+    ),
+    compile=(
+        4927,
+        InductorError,
+        "Inductor does not support slice_scatter with step=2 for a strided destination view",
     ),
 )
 
@@ -1211,7 +1480,7 @@ class TestScatterReduceCompileDynamic:
 class TestScatterEdgeCasesEagerCompile:
     """Tensor-src scatter / scatter_ edge cases: zero-volume, strided, empty and single-element operands."""
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_EAGER_ONLY_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_COMPILE_ONLY)
     def test_scatter_zero_volume_inner_dim(self, mode: str):
         """Zero-volume inner dimension scatter — shape (8, 0, 128) must be a safe no-op.
 
@@ -1237,25 +1506,7 @@ class TestScatterEdgeCasesEagerCompile:
         )
 
     @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="Spyre eager scatter dispatch is unsupported for this case, #4473",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-        ],
+        "mode", _MODE_PARAMS_SCATTER_TRANSPOSED_SOURCE_STRIDED_INDEX_XFAIL
     )
     def test_scatter_transposed_source_strided_index(self, mode: str):
         """Transposed (non-contiguous) source + strided index into strided destination.
@@ -1292,7 +1543,7 @@ class TestScatterEdgeCasesEagerCompile:
             rtol=0.016,
         )
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_EAGER_ONLY_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_COMPILE_ONLY)
     @pytest.mark.parametrize("dim", [0, 1])
     def test_scatter_empty_row_index(self, mode: str, dim: int):
         """Zero-element index and source — safe no-op, dest returned unchanged.
@@ -1326,27 +1577,7 @@ class TestScatterEdgeCasesEagerCompile:
             rtol=0.016,
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="Spyre eager scatter dispatch is unsupported for this case, #4473",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor indirect-scatter alignment fails with KeyError: tmp0, #4637",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_1D_SINGLE_ELEMENT_XFAIL)
     def test_scatter_1d_single_element_source(self, mode: str):
         """Single-element source scatter — src shape (1,) writes one value into a 1D dest.
 
@@ -1367,27 +1598,7 @@ class TestScatterEdgeCasesEagerCompile:
             fn, self_t, idx_t, src_t, run_eager=run_eager, run_compile=run_compile
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="Spyre eager scatter dispatch is unsupported for this case, #4473",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor cannot pad the sliced scatter output in place during restickification, #4474",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_1D_INPLACE_SCALAR_FILL_XFAIL)
     def test_scatter_1d_inplace_scalar_fill(self, mode: str):
         """1D in-place scatter_ scalar fill into a head_dim vector.
 
@@ -1550,27 +1761,7 @@ class TestScatterHighRankEagerCompile:
 class TestScatterAddShapesEagerCompile:
     """scatter_add: storage offsets, bf16 subnormals, and 4D / 5D / 6D KV-cache geometries."""
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="aten::scatter_add.out has no registered Spyre eager kernel, #4396",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor layout propagation cannot resolve sharding because graph and real input counts differ, #6707",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL)
     def test_scatter_add_nonzero_storage_offset(self, mode: str):
         """Non-zero storage_offset on self, index, and src simultaneously.
 
@@ -1604,27 +1795,7 @@ class TestScatterAddShapesEagerCompile:
             rtol=0.016,
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="aten::scatter_add.out has no registered Spyre eager kernel, #4396",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="dbo-opt GatherIndexConversion fails its divisibility assertion, #6574",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_BF16_SUBNORMAL_XFAIL)
     def test_scatter_add_bf16_subnormal_accumulation(self, mode: str):
         """BF16 subnormal/denormal accumulation using smallest_subnormal.
 
@@ -1655,7 +1826,7 @@ class TestScatterAddShapesEagerCompile:
             rtol=0.0001,
         )
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL)
     def test_scatter_add_4d_both(self, mode: str):
         """4D scatter_add on (batch, kv_heads, seq, head_dim) — both OOP and IP.
 
@@ -1696,7 +1867,7 @@ class TestScatterAddShapesEagerCompile:
             rtol=0.005,
         )
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL)
     def test_scatter_add_5d_both(self, mode: str):
         """5D scatter_add on (batch, layers, kv_heads, seq, head_dim) — both OOP and IP.
 
@@ -1737,7 +1908,7 @@ class TestScatterAddShapesEagerCompile:
             rtol=0.005,
         )
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL)
     def test_scatter_add_6d_both(self, mode: str):
         """6D scatter_add on (experts, batch, layers, kv_heads, seq, head_dim) — both OOP and IP.
 
@@ -1783,111 +1954,7 @@ class TestScatterAddShapesEagerCompile:
 class TestScatterReduceModesEagerCompile:
     """scatter_reduce across all reduction modes and with dynamic shapes."""
 
-    @pytest.mark.parametrize(
-        ("mode", "reduce_mode"),
-        [
-            pytest.param(
-                "eager",
-                "sum",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="indexed-reduction eager dispatch is reported unsupported, #4361",
-                ),
-                id="sum-eager",
-            ),
-            pytest.param(
-                "compile",
-                "sum",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="dbo-opt scheduler rejects the scatter page-size constraint, #6575",
-                ),
-                id="sum-compile",
-            ),
-            pytest.param(
-                "eager",
-                "prod",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="indexed-reduction eager dispatch is reported unsupported, #4361",
-                ),
-                id="prod-eager",
-            ),
-            pytest.param(
-                "compile",
-                "prod",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="indexed-reduction compile path is reported unsupported, #4361",
-                ),
-                id="prod-compile",
-            ),
-            pytest.param(
-                "eager",
-                "mean",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="indexed-reduction eager dispatch is reported unsupported, #4361",
-                ),
-                id="mean-eager",
-            ),
-            pytest.param(
-                "compile",
-                "mean",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="indexed-reduction compile path is reported unsupported, #4361",
-                ),
-                id="mean-compile",
-            ),
-            pytest.param(
-                "eager",
-                "amax",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="indexed-reduction eager dispatch is reported unsupported, #4361",
-                ),
-                id="amax-eager",
-            ),
-            pytest.param(
-                "compile",
-                "amax",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="indexed-reduction compile path is reported unsupported, #4361",
-                ),
-                id="amax-compile",
-            ),
-            pytest.param(
-                "eager",
-                "amin",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="indexed-reduction eager dispatch is reported unsupported, #4361",
-                ),
-                id="amin-eager",
-            ),
-            pytest.param(
-                "compile",
-                "amin",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="indexed-reduction compile path is reported unsupported, #4361",
-                ),
-                id="amin-compile",
-            ),
-        ],
-    )
+    @pytest.mark.parametrize(("mode", "reduce_mode"), _SCATTER_REDUCE_NAN_INF_PARAMS)
     def test_scatter_reduce_nan_inf_all_modes(self, mode: str, reduce_mode: str):
         """NaN and Inf propagation across all 5 reduction modes (not just sum).
 
@@ -1911,27 +1978,7 @@ class TestScatterReduceModesEagerCompile:
             fn, self_t, idx_t, src_t, run_eager=run_eager, run_compile=run_compile
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="indexed-reduction eager dispatch is reported unsupported, #4361",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="dbo-opt scheduler rejects the scatter page-size constraint, #6575",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_REDUCE_DYNAMIC_SYMINT_XFAIL)
     def test_scatter_reduce_dynamic_symint_shapes(self, mode: str):
         """Dynamic SymInt shape tracing through scatter_reduce in TorchInductor.
 
@@ -1961,27 +2008,7 @@ class TestScatterReduceModesEagerCompile:
 class TestIndexAddEagerCompile:
     """index_add / index_add_: storage offsets, high-rank KV-cache geometries and channels-last layout."""
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="indexed-reduction eager dispatch is reported unsupported, #4634",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor layout propagation cannot resolve sharding because graph and real input counts differ, #6707",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_ADD_STORAGE_OFFSET_XFAIL)
     def test_index_add_nonzero_storage_offset(self, mode: str):
         """Non-zero storage_offset on sliced window inputs — pointer arithmetic correctness.
 
@@ -2244,27 +2271,7 @@ class TestIndexFillShapesEagerCompile:
             fn_ip, self_t, idx_t, run_eager=run_eager, run_compile=run_compile
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="aten::index_fill_.int_Scalar has no registered Spyre eager kernel, #6587",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_FILL_NONUNIT_STRIDED_XFAIL)
     def test_index_fill_nonunit_strided_slice(self, mode: str):
         """Non-unit strided slice fill — interleaved rows must remain unmodified.
 
@@ -2342,20 +2349,7 @@ class TestIndexSelectDynamicEagerCompile:
 class TestMaskedScatterEagerCompile:
     """masked_scatter / masked_scatter_: dynamic shapes, high-rank, contiguity and zero-volume cases."""
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=RuntimeError,
-                    reason="Spyre masked_scatter rejects element-level mask/source indexing, #4437",
-                ),
-            ),
-            "compile",
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_DYNAMIC)
     def test_masked_scatter_dynamic_shapes_inductor(self, mode: str):
         """Dynamic batch dimension and dynamic source length under TorchInductor.
 
@@ -2516,7 +2510,7 @@ class TestMaskedScatterEagerCompile:
             rtol=0.005,
         )
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ALL_TRUE)
     def test_masked_scatter_all_true_full_replacement(self, mode: str):
         """Dense all-True mask replaces every element from the flat source."""
         run_eager, run_compile = _mode_flags(mode)
@@ -2538,7 +2532,7 @@ class TestMaskedScatterEagerCompile:
             rtol=0.016,
         )
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_NO_SIDE_EFFECTS)
     def test_masked_scatter_no_side_effects(self, mode: str):
         """Out-of-place masked_scatter must not mutate self, mask, or source."""
         run_eager, run_compile = _mode_flags(mode)
@@ -2570,7 +2564,7 @@ class TestMaskedScatterEagerCompile:
 
         compare_with_cpu(fn, x, mask, src, run_eager=run_eager, run_compile=run_compile)
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_SCALAR_FALSE)
     def test_masked_scatter_scalar_false_mask_noop(self, mode: str):
         """0-dimensional scalar False mask — dest returned unchanged (no True positions)."""
         run_eager, run_compile = _mode_flags(mode)
@@ -2583,7 +2577,7 @@ class TestMaskedScatterEagerCompile:
 
         compare_with_cpu(fn, x, mask, src, run_eager=run_eager, run_compile=run_compile)
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ZERO_VOLUME)
     @pytest.mark.parametrize(
         "dest_shape,mask_shape",
         [
@@ -2633,7 +2627,7 @@ class TestMaskedScatterEagerCompile:
             fn_outplace, dest, mask, src, run_eager=run_eager, run_compile=run_compile
         )
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ZERO_VOLUME)
     @pytest.mark.parametrize("dest_shape", [(5, 0, 5), (3, 0, 4), (0, 8)])
     def test_masked_scatter_zero_volume_ones_mask(self, mode: str, dest_shape: tuple):
         """MSK-GAP-C (ones mask): Zero-volume dest with all-True mask and empty source.
@@ -2667,7 +2661,7 @@ class TestMaskedScatterEagerCompile:
             fn_outplace, dest, mask, src, run_eager=run_eager, run_compile=run_compile
         )
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE)
     def test_masked_scatter_noncontig_dest_mask_combos(self, mode: str):
         """All four contiguous/non-contiguous destination × mask combinations.
 
@@ -2744,27 +2738,7 @@ class TestMaskedScatterEagerCompile:
 class TestIndexReduceShapesEagerCompile:
     """index_reduce / index_reduce_: views, dtypes, index dtypes, high-rank geometries and non-contiguous operands."""
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Indirect indexing on a sliced view with a non-zero storage offset fails OpSpec validation, #6210",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Indirect indexing on a sliced view with a non-zero storage offset fails OpSpec validation, #6210",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_REDUCE_SLICED_VIEW_DEST_XFAIL)
     @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
     def test_index_reduce_sliced_view_dest(self, mode: str, reduce_mode: str):
         """IDR-GAP-F: index_reduce_ on a non-contiguous view slice of a larger tensor.
@@ -2832,27 +2806,7 @@ class TestIndexReduceShapesEagerCompile:
             rtol=0.005,
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce with duplicate indices keeps one update instead of reducing them, #4411",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce with duplicate indices keeps one update instead of reducing them, #4411",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_REDUCE_DUPLICATES_XFAIL)
     @pytest.mark.parametrize(
         "dtype, reduce_mode, index_dtype, atol, rtol", _INDEX_REDUCE_OUTPLACE_CASES
     )
@@ -3014,138 +2968,7 @@ class TestIndexReduceShapesEagerCompile:
             rtol=0.005,
         )
 
-    @pytest.mark.parametrize(
-        ("reduce_mode", "mode"),
-        [
-            pytest.param(
-                "prod",
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with duplicate indices keeps one update instead of reducing them, #4411",
-                ),
-            ),
-            pytest.param(
-                "prod",
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-            pytest.param(
-                "mean",
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ on a non-contiguous destination returns values that differ from CPU, #4932",
-                ),
-            ),
-            pytest.param(
-                "mean",
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-            pytest.param(
-                "amax",
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ on a non-contiguous destination returns values that differ from CPU, #4932",
-                ),
-            ),
-            pytest.param(
-                "amax",
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-            pytest.param(
-                "amin",
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ on a non-contiguous destination returns values that differ from CPU, #4932",
-                ),
-            ),
-            pytest.param(
-                "amin",
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-        ],
-    )
-    def test_index_reduce_noncontig_dest(self, mode: str, reduce_mode: str):
-        """IDR-GAP-B (i): Non-contiguous destination — step-2 row stride.
-
-        Model shape: Ministral-3-14B (kv_heads=8, head_dim=128) — step-2 row view.
-        dest is a [::2, :] view of a larger backing buffer (stride[0] = 2×cols),
-        so it is non-contiguous.  src and idx are contiguous.
-        index_reduce_ must correctly address the strided destination layout.
-        """
-        torch.manual_seed(0)
-        run_eager, run_compile = _mode_flags(mode)
-        base = torch.rand(16, 128, dtype=torch.bfloat16) + 0.5
-        dest = base[::2, :]
-        assert not dest.is_contiguous()
-        src = torch.rand(4, 128, dtype=torch.bfloat16) + 0.5
-        idx = torch.randint(0, dest.shape[0], (4,), dtype=torch.int64)
-
-        def fn(backing, i, s):
-            out = backing.clone()
-            dest_view = out[::2, :]
-            assert not dest_view.is_contiguous()
-            dest_view.index_reduce_(0, i, s, reduce=reduce_mode, include_self=True)
-            return out
-
-        compare_with_cpu(
-            fn,
-            base,
-            idx,
-            src,
-            run_eager=run_eager,
-            run_compile=run_compile,
-            atol=0.005,
-            rtol=0.005,
-        )
-
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with a non-contiguous source returns values that differ from CPU, #4932",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with a non-contiguous source returns values that differ from CPU, #4932",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_REDUCE_NONCONTIG_SOURCE_XFAIL)
     @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
     def test_index_reduce_noncontig_source(self, mode: str, reduce_mode: str):
         """IDR-GAP-B (ii): Non-contiguous source — transposed 2D tensor.
@@ -3189,149 +3012,8 @@ class TestIndexReduceShapesEagerCompile:
             rtol=0.005,
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with a non-contiguous index returns values that differ from CPU, #4932",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with a non-contiguous index returns values that differ from CPU, #4932",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_REDUCE_NONCONTIG_ALL_XFAIL)
     @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
-    def test_index_reduce_noncontig_index(self, mode: str, reduce_mode: str):
-        """IDR-GAP-B (iii): Non-contiguous index — step-2 stride slice.
-
-        Model shape: Gemma-4-26B (kv_heads=16, head_dim=256) — step-2 index over kv-heads.
-        idx is derived from a wider buffer via [::2], giving non-unit stride.
-        dest and src are contiguous.
-        """
-        torch.manual_seed(0)
-        run_eager, run_compile = _mode_flags(mode)
-        dest = torch.rand(16, 256, dtype=torch.bfloat16) + 0.5
-        src = torch.rand(4, 256, dtype=torch.bfloat16) + 0.5
-
-        def fn(d, i, s):
-            out = d.clone()
-            out.index_reduce_(0, i, s, reduce=reduce_mode, include_self=True)
-            return out
-
-        idx_base_unique = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int64)
-        idx_unique = idx_base_unique[::2]
-        assert not idx_unique.is_contiguous()
-        compare_with_cpu(
-            fn,
-            dest,
-            idx_unique,
-            src,
-            run_eager=run_eager,
-            run_compile=run_compile,
-            atol=0.005,
-            rtol=0.005,
-        )
-        idx_base_dup = torch.tensor([0, 1, 0, 1, 2, 3, 2, 3], dtype=torch.int64)
-        idx_dup = idx_base_dup[::2]
-        assert not idx_dup.is_contiguous()
-        compare_with_cpu(
-            fn,
-            dest,
-            idx_dup,
-            src,
-            run_eager=run_eager,
-            run_compile=run_compile,
-            atol=0.005,
-            rtol=0.005,
-        )
-
-    @pytest.mark.parametrize(
-        ("reduce_mode", "mode"),
-        [
-            pytest.param(
-                "prod",
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with a non-contiguous dest, source and index returns values that differ from CPU, #4932",
-                ),
-            ),
-            pytest.param(
-                "prod",
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-            pytest.param(
-                "mean",
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with a non-contiguous dest, source and index returns values that differ from CPU, #4911",
-                ),
-            ),
-            pytest.param(
-                "mean",
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-            pytest.param(
-                "amax",
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with a non-contiguous dest, source and index returns values that differ from CPU, #4911",
-                ),
-            ),
-            pytest.param(
-                "amax",
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-            pytest.param(
-                "amin",
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_reduce_ with a non-contiguous dest, source and index returns values that differ from CPU, #4911",
-                ),
-            ),
-            pytest.param(
-                "amin",
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor does not support slice_scatter with step=2 for a strided destination view, #4927",
-                ),
-            ),
-        ],
-    )
     def test_index_reduce_all_three_noncontig(self, mode: str, reduce_mode: str):
         """IDR-GAP-B (iv): dest, src, and index all non-contiguous simultaneously.
 
@@ -3388,27 +3070,7 @@ class TestIndexReduceShapesEagerCompile:
 class TestIndexPutShapesEagerCompile:
     """index_put / index_put_ and slice assignment: collisions, high-rank geometries, boolean masks."""
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="aten::_index_put_impl_ has no registered Spyre eager kernel, #692",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="index_put_ accumulate with colliding indices keeps one update instead of accumulating them, #4411",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_PUT_HALF_FORMAT_COLLISION_XFAIL)
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_index_put_half_format_heavy_collision(self, mode: str, dtype: torch.dtype):
         """5000 low-precision updates collide on 8 rows (625 updates per row)."""
@@ -3568,27 +3230,7 @@ class TestIndexPutShapesEagerCompile:
             rtol=0.016,
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=NotImplementedError,
-                    reason="aten::_index_put_impl_ has no registered Spyre eager kernel, #692",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="index_put_ with a sparse 3D boolean mask is not supported on Spyre, #6588",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_PUT_UNSUPPORTED)
     def test_index_put_sparse_3d_bool_mask_transposed(self, mode: str):
         """Sparse 3D boolean mask on a transposed (non-contiguous) tensor.
 
@@ -3623,20 +3265,7 @@ class TestIndexPutShapesEagerCompile:
 class TestIndexCopyEagerCompile:
     """index_copy / index_copy_: non-contiguous 5D destination, zero-volume trailing dim and 6D geometry."""
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=RuntimeError,
-                    reason="Eager index_copy.out on a non-contiguous 5D destination re-enters the compiled Spyre kernel, #6587",
-                ),
-            ),
-            "compile",
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_COPY_NONCONTIG_5D)
     def test_index_copy_5d_noncontiguous_strided(self, mode: str):
         """Non-contiguous 5D transposed destination — strided DMA coordinate correctness.
 
@@ -3668,27 +3297,7 @@ class TestIndexCopyEagerCompile:
             rtol=0.05,
         )
 
-    @pytest.mark.parametrize(
-        "mode",
-        [
-            pytest.param(
-                "eager",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor cannot pad the sliced output in place during restickification, #4474",
-                ),
-            ),
-            pytest.param(
-                "compile",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=InductorError,
-                    reason="Inductor raises Unexpected stick expression for the zero-volume layout, #3455",
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_COPY_ZERO_VOLUME_XFAIL)
     def test_index_copy_zero_volume_trailing_dim(self, mode: str):
         """Zero-volume trailing dimension — index_copy must be a safe no-op.
 
@@ -3761,112 +3370,7 @@ class TestIndexCopyEagerCompile:
 class TestPutNonContigEagerCompile:
     """torch.put / put_: non-contiguous destination, source and index, and 5D / 6D geometries."""
 
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_PUT_UNSUPPORTED)
-    @pytest.mark.parametrize("accumulate", _PUT_ACCUMULATE_OPTIONS)
-    def test_put_2d_dst_noncontig(self, mode: str, accumulate: bool):
-        """PUT-01b: 2D non-contiguous dst — flat index must respect multi-stride address layout.
-
-        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128) — stride-2 view over kv-heads.
-        """
-        torch.manual_seed(0)
-        run_eager, run_compile = _mode_flags(mode)
-        base = torch.zeros(16, 128, dtype=torch.bfloat16)
-        dst = base[::2, :]
-        src = torch.randn(4, dtype=torch.bfloat16)
-        if accumulate:
-            idx = torch.randint(0, dst.numel(), (4,), dtype=torch.int64)
-        else:
-            idx = torch.randperm(dst.numel(), dtype=torch.int64)[:4]
-
-        def fn(d, i, s):
-            return torch.put(d, i, s, accumulate=accumulate)
-
-        compare_with_cpu(
-            fn,
-            dst,
-            idx,
-            src,
-            run_eager=run_eager,
-            run_compile=run_compile,
-            atol=0.01,
-            rtol=0.016,
-        )
-
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_PUT_UNSUPPORTED)
-    @pytest.mark.parametrize("accumulate", _PUT_ACCUMULATE_OPTIONS)
-    def test_put_noncontig_source(self, mode: str, accumulate: bool):
-        """PUT-GAP-B (i): Non-contiguous source tensor.
-
-        Model shape: Granite-4.1-20B (head_dim=128) — 1D flat KV slot buffer.
-        Source is a step-2 slice of a larger 1-D buffer (non-unit stride).
-        The destination and index are fully contiguous.  torch.put must
-        flatten and read the source through its stride rather than assuming
-        a packed memory layout.
-        """
-        torch.manual_seed(0)
-        run_eager, run_compile = _mode_flags(mode)
-        dst = torch.zeros(128, dtype=torch.bfloat16)
-        src_base = torch.randn(16, dtype=torch.bfloat16)
-        src = src_base[::2]
-        assert not src.is_contiguous()
-        if accumulate:
-            idx = torch.randint(0, 128, (8,), dtype=torch.int64)
-        else:
-            idx = torch.randperm(128, dtype=torch.int64)[:8]
-
-        def fn(d, i, s):
-            return torch.put(d, i, s, accumulate=accumulate)
-
-        compare_with_cpu(
-            fn,
-            dst,
-            idx,
-            src,
-            run_eager=run_eager,
-            run_compile=run_compile,
-            atol=0.01,
-            rtol=0.016,
-        )
-
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_PUT_UNSUPPORTED)
-    @pytest.mark.parametrize("accumulate", _PUT_ACCUMULATE_OPTIONS)
-    def test_put_noncontig_index(self, mode: str, accumulate: bool):
-        """PUT-GAP-B (ii): Non-contiguous index tensor.
-
-        Model shape: Gemma-4-26B (kv_heads=16, head_dim=256) — 1D flat write into 16×256 cache.
-        Index is a step-2 slice (non-unit stride); destination and source are
-        contiguous.  torch.put flattens the index through its stride to resolve
-        the target flat positions.
-        """
-        torch.manual_seed(0)
-        run_eager, run_compile = _mode_flags(mode)
-        dst = torch.zeros(256, dtype=torch.bfloat16)
-        src = torch.randn(8, dtype=torch.bfloat16)
-        if accumulate:
-            idx_base = torch.randint(0, 256, (16,), dtype=torch.int64)
-        else:
-            selected = torch.randperm(256, dtype=torch.int64)[:8]
-            idx_base = torch.empty(16, dtype=torch.int64)
-            idx_base[::2] = selected
-            idx_base[1::2] = 0
-        idx = idx_base[::2]
-        assert not idx.is_contiguous()
-
-        def fn(d, i, s):
-            return torch.put(d, i, s, accumulate=accumulate)
-
-        compare_with_cpu(
-            fn,
-            dst,
-            idx,
-            src,
-            run_eager=run_eager,
-            run_compile=run_compile,
-            atol=0.01,
-            rtol=0.016,
-        )
-
-    @pytest.mark.parametrize("mode", _MODE_PARAMS_PUT_UNSUPPORTED)
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_PUT_ALL_NONCONTIG_XFAIL)
     @pytest.mark.parametrize("accumulate", _PUT_ACCUMULATE_OPTIONS)
     def test_put_all_three_noncontig(self, mode: str, accumulate: bool):
         """PUT-GAP-B (iii): dst, src, and index all non-contiguous simultaneously.
