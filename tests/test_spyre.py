@@ -267,7 +267,14 @@ class TestSpyre(TestCase):
                 v.copy_(torch.zeros(v.shape, dtype=torch.uint8))
         self.assertTrue(torch.equal(d.cpu(), expected))
 
-    def test_copy_dtype_view_of_kv_layout_page_rejected(self):
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.float16, name="fp16"),
+            subtest(torch.float8_e4m3fn, name="fp8"),
+        ],
+    )
+    def test_copy_dtype_view_of_kv_layout_page_rejected(self, dtype):
         # Copying a uint8 view of a KV-cache page (a layout with
         # valid_elements) segfaulted in spyre_copy_from. It must raise, and
         # the page itself must still copy to the CPU.
@@ -277,7 +284,6 @@ class TestSpyre(TestCase):
             get_elem_in_stick,
         )
 
-        dtype = torch.float16
         num_blocks, kv_heads, block_size, head_size = 2, 2, 64, 128
         eps = get_elem_in_stick(dtype)
         num_pages = num_blocks * kv_heads
@@ -296,7 +302,7 @@ class TestSpyre(TestCase):
         p.zero_()
         with self.assertRaisesRegex(RuntimeError, "without a device layout"):
             p.view(torch.uint8).cpu()
-        self.assertTrue((p.cpu() == 0).all())
+        self.assertTrue((p.cpu().view(torch.uint8) == 0).all())
 
     @parametrize(
         "view",
