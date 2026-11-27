@@ -28,6 +28,7 @@ import torch_spyre._sharded_api as sharded_api
 from device_env import emulation_ready
 from side_effect_utils import subprocess_import_side_effects
 from torch_spyre._sharded_api import (
+    is_replicated,
     is_sharded,
     sharding_info,
     to_sharded,
@@ -121,7 +122,7 @@ def test_valid_request_reaches_the_runtime(no_runtime):
 
 @pytest.mark.parametrize("placement", [Partial(), object(), None, 0])
 def test_placement_must_be_shard_or_replicate(no_runtime, placement):
-    with pytest.raises(TypeError, match="Shard"):
+    with pytest.raises(TypeError, match="exactly .*Shard or Replicate"):
         to_sharded(_source(), placement)
     assert no_runtime == []
 
@@ -185,7 +186,7 @@ def test_tp_style_single_element_list_placement_is_accepted(no_runtime):
 
 @pytest.mark.parametrize("placement", [[Shard(0), Shard(1)], [], [Shard(0), None]])
 def test_placement_list_must_hold_exactly_one_entry(no_runtime, placement):
-    with pytest.raises(TypeError, match="single Shard"):
+    with pytest.raises(TypeError, match="single Shard or Replicate"):
         to_sharded(_source((16,)), placement)
     assert no_runtime == []
 
@@ -467,20 +468,34 @@ def test_device_replicate_is_one_tagged_unified_copy(shape):
     assert result.device.type == "spyre"
     assert result.shape == source.shape
     assert _C._spyre_is_replicated(result)
+    assert torch.spyre.is_replicated(result)
     assert not torch.spyre.is_sharded(result)
-    with pytest.raises(TypeError, match="sharded"):
+    with pytest.raises(TypeError, match="is_replicated"):
         torch.spyre.sharding_info(result)
     assert torch.equal(result.cpu(), _expected_round_trip(source))
 
 
 @_requires_spyre
 def test_device_plain_tensor_is_not_replicated():
-    from torch_spyre import _C
-
-    assert not _C._spyre_is_replicated(_source((16,)).to("spyre"))
-    assert not _C._spyre_is_replicated(
+    assert not torch.spyre.is_replicated(_source((16,)).to("spyre"))
+    assert not torch.spyre.is_replicated(
         torch.spyre.to_sharded(_source((16, 64)), Shard(0))
     )
+
+
+def test_is_replicated_is_false_for_non_spyre_values():
+    assert not is_replicated(torch.empty(4))
+    assert not is_replicated(None)
+
+
+@_requires_spyre
+def test_device_mark_replicated_rejects_a_view_of_unified_storage():
+    from torch_spyre import _C
+
+    base = _source((16, 64)).to("spyre")
+    with pytest.raises(RuntimeError, match="zero storage offset"):
+        _C._spyre_mark_replicated(base[4:8])
+    assert not torch.spyre.is_replicated(base)
 
 
 @_requires_spyre

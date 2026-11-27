@@ -169,10 +169,19 @@ the compile guards and cache key (address-free), so a replicated tensor never
 shares a compiled entry with a plain or sharded one. It takes no
 `num_shards` (that raises `ValueError`), needs no divisible dimension, and
 is not sharded: `is_sharded` is `False` and `sharding_info` raises
-`TypeError`. There is exactly one copy; its compile signature is
+`TypeError`. Use `torch.spyre.is_replicated(tensor)` to query the tag. There is
+exactly one copy; its compile signature is
 `("replicate", 1)`, where the second field is the copy count, so a later
 per-core replica (a different copy count) can never share a compiled entry with
-it. Per-HBM-group copies for locality are
+it.
+
+The tag costs compiles today: the same bias used once as a plain tensor and
+once as `Replicate()` compiles twice, to a bit-identical kernel. That
+separation has no behavioral benefit now. It is kept deliberately, as
+forward-compatibility, so that per-core replicas (`copies != 1`) can never hit
+a cache entry compiled for the one-copy path. The tag marks the storage, not
+the tensor, so it is only applied to a whole, contiguous base tensor.
+Per-HBM-group copies for locality are
 not provided: they need a receipt that can describe a whole-tensor replica per
 core, and are deferred until broadcasting (#5821) defines how a replica is
 read per core.
@@ -186,6 +195,16 @@ supported dtype with compact storage. Degenerate shapes and out-of-range
 placement dims are rejected by the planner before allocation. If validation
 passes but allocation or any shard copy fails, no tensor is returned — the
 result is dropped and freed; nothing falls back to unified storage.
+
+### `is_replicated`
+
+```python
+torch.spyre.is_replicated(tensor) -> bool
+```
+
+Returns whether `tensor` carries the `Replicate()` tag from
+`to_sharded(x, Replicate())` — `False` for any other value, including
+non-Spyre tensors and sharded tensors; never raises.
 
 ### `is_sharded`
 

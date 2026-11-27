@@ -1885,6 +1885,11 @@ std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
 void spyre_mark_replicated(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone() && tensor.has_storage(),
               "expected a Spyre tensor with storage");
+  // The tag lives on the storage, so it would silently cover every other
+  // tensor sharing it. Only a whole, contiguous base may be marked.
+  TORCH_CHECK(tensor.storage_offset() == 0 && tensor.is_contiguous(),
+              "only a contiguous Spyre tensor with zero storage offset can be "
+              "marked as replicated (the mark applies to the whole storage)");
   auto* ctx =
       static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context());
   TORCH_CHECK(ctx != nullptr, "cannot mark empty Spyre storage as replicated");

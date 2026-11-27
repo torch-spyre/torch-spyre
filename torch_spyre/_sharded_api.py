@@ -115,18 +115,19 @@ def _validate_core_match(num_shards: int) -> None:
 
 
 def _normalize_placement(placement: object):
-    """Accept ``Shard(0)`` or the tensor-parallel idiom ``[Shard(0)]``.
+    """Accept ``Shard(0)``, ``Replicate()`` or the tensor-parallel list idiom.
 
     PyTorch's ``distribute_tensor`` takes one placement per mesh dimension;
     this device has no mesh, so exactly one placement is admitted and the
-    list form is accepted for familiarity with that idiom.
+    list form (``[Shard(0)]``, ``[Replicate()]``) is accepted for familiarity
+    with that idiom.
     """
 
     if isinstance(placement, (list, tuple)):
         if len(placement) != 1:
             raise TypeError(
-                "placement must be a single Shard (one placement per tensor; "
-                "this device has no multi-dimensional mesh)"
+                "placement must be a single Shard or Replicate (one placement "
+                "per tensor; this device has no multi-dimensional mesh)"
             )
         placement = placement[0]
     return placement
@@ -183,6 +184,12 @@ def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo:
     """
 
     if not is_sharded(tensor):
+        if is_replicated(tensor):
+            raise TypeError(
+                "expected a sharded Spyre tensor; this tensor is Replicate() "
+                "(one unified copy, no shard table). Use "
+                "torch.spyre.is_replicated to query it"
+            )
         raise TypeError("expected a sharded Spyre tensor")
     from torch_spyre import _C
 
@@ -218,6 +225,21 @@ def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo:
         shard_device_bytes=shard_device_bytes,
         receipt=receipt,
     )
+
+
+def is_replicated(tensor: object) -> bool:
+    """Return whether ``tensor`` is a ``Replicate()``-tagged Spyre tensor.
+
+    ``True`` only for the result of ``to_sharded(x, Replicate())`` (and views
+    of it); ``False`` for any other value, including non-Spyre tensors. Never
+    raises.
+    """
+
+    if not isinstance(tensor, torch.Tensor) or tensor.device.type != "spyre":
+        return False
+    from torch_spyre import _C
+
+    return bool(_C._spyre_is_replicated(tensor))
 
 
 def _to_replicated(tensor: object, num_shards: object) -> torch.Tensor:
@@ -283,10 +305,15 @@ def to_sharded(
     fails, and nothing falls back to unified storage.
     """
 
-    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor import Replicate, Shard
 
-    if type(_normalize_placement(placement)) is Replicate:
+    placement = _normalize_placement(placement)
+    if type(placement) is Replicate:
         return _to_replicated(tensor, num_shards)
+    if type(placement) is not Shard:
+        raise TypeError(
+            "placement must be exactly torch.distributed.tensor.Shard or Replicate"
+        )
     if num_shards is None:
         num_shards = _active_core_count()
     request = _validate_sharding_request(tensor, placement, num_shards)

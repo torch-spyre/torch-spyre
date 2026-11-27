@@ -136,8 +136,10 @@ std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
                                                       int64_t storage_offset);
 
 // Replicate() placement. A replicated tensor is ordinary unified storage with
-// a placement tag: one copy that every core reads. Tagging fails closed unless
-// the storage is a plain unified allocation (not sharded, not a shard view).
+// a placement tag: one copy that every core reads. The tag marks the storage,
+// not the tensor, so tagging fails closed unless `tensor` is a contiguous
+// whole base (zero storage offset) of plain unified storage (not sharded, not
+// a shard view).
 void spyre_mark_replicated(const at::Tensor& tensor);
 
 // Whether `tensor`'s storage carries the Replicate() tag.

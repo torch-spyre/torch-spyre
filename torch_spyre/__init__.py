@@ -193,10 +193,16 @@ def make_spyre_module() -> types.ModuleType:
     mod.device_count = lambda: impl.device_count()
     mod.current_device = lambda: impl.current_device()
     mod.set_device = lambda idx: impl.set_device(idx)
-    from torch_spyre._sharded_api import is_sharded, sharding_info, to_sharded
+    from torch_spyre._sharded_api import (
+        is_replicated,
+        is_sharded,
+        sharding_info,
+        to_sharded,
+    )
 
     mod.to_sharded = to_sharded
     mod.is_sharded = is_sharded
+    mod.is_replicated = is_replicated
     mod.sharding_info = sharding_info
     mod._is_compiled = lambda: True
     mod.memory = memory
