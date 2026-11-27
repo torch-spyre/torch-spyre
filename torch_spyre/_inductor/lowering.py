@@ -1992,6 +1992,13 @@ def lower_active_count_marker(count, max_value):
     # A one-element op that reads the count's first value, so the read (buffer
     # and index over the enclosing loop variables) survives the splice like any
     # other. splice_while_loops records it on the loop and removes the op.
+    if not isinstance(sympy.sympify(max_value), sympy.Integer):
+        # for_each_tile's own check sees a plain int under Dynamo; a loop over a
+        # declared dynamic dimension shows its symbolic trip count only here.
+        raise Unsupported(
+            "for_each_tile() active_count needs a static trip count, got "
+            f"{max_value} (the loop walks a declared dynamic dimension)"
+        )
     count.realize()
     loader = count.make_loader()
     first = [sympy.Integer(0)] * len(count.get_size())

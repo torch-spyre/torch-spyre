@@ -106,6 +106,26 @@ class TestActiveCountOnDevice(unittest.TestCase):
     def test_nested_loop_reads_one_count_per_outer_trip(self):
         self._check(_nested(32), [1, 4, 32], trips=32)
 
+    def test_a_declared_dynamic_dimension_is_refused(self):
+        """The loop walks a dimension declared with dynamic=, so its trip count
+        is symbolic: the device-read count has no static maximum."""
+
+        def fn(x, cnt):
+            rows = x.shape[0]
+            torch._check(rows >= G)
+            torch._check(rows <= 8 * G)
+            torch._check(rows % G == 0)
+            return _flat(x, cnt)
+
+        x = torch.randn(4 * G, C).to(
+            DEVICE_NAME, dynamic={0: {"min": G, "max": 8 * G, "granularity": G}}
+        )
+        cnt = _count_rows([2]).to(DEVICE_NAME)
+        with self.assertRaisesRegex(
+            Exception, "Unsupported.*active_count needs a static trip count"
+        ):
+            torch.compile(fn, fullgraph=True)(x, cnt)
+
 
 if __name__ == "__main__":
     unittest.main()
