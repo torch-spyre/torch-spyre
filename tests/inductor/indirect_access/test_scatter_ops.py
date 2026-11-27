@@ -291,17 +291,16 @@ class TestIndexFillEagerCompile:
     def test_index_fill_1d_dest_length_8(self, execution_mode):
         """index_fill_ 1-D dest length 8 — the only dim is the stick dim.
 
-        Eager runs the compiled index_fill.out kernel (#4414) and aborts in the
-        restickify codegen (#4327); compiled fails to re-tile (#4399).
+        Eager runs the compiled index_fill.out kernel (#4414), so both modes
+        fail to re-tile the stick-dim scatter (#4399).
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
             eager=rejection(
-                4327,
-                "eager index_fill_ on a 1-D dest: restickify op_spec has 3 args.",
-                r"restickify op_spec has 3 args",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
+                r"cannot re-tile \S+: no size-1 stick target",
             ),
             compiled=rejection(
                 4399,
@@ -665,11 +664,11 @@ class TestScatterValueStamp:
         """scatter_(0, idx, 1.0) onto fp16 dest [128], T=192 — leftover extra (#4436 Python).
 
         Eager is aten::scatter.value_out (#4473). Compiled, scatter.value is
-        rewritten to scatter.src, which on a 1-D dest fails to re-tile like the
-        other 1-D scatters (#4399).
+        rewritten to scatter.src, whose restickify of the 1-D dest aborts in
+        codegen (#4327).
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4473
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -678,9 +677,9 @@ class TestScatterValueStamp:
                 r"Could not run 'aten::scatter.value_out'",
             ),
             compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+                4327,
+                "compile scatter_(value=) on an fp16 dest [128]: restickify op_spec has 3 args.",
+                r"restickify op_spec has 3 args",
             ),
         )
         G, T = 128, 192
