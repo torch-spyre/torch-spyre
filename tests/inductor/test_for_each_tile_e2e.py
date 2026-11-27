@@ -101,6 +101,8 @@ from for_each_tile_fixtures import (
     upcast_add_tiled_reference,
     add_tiled_fn,
     add_tiled_reference,
+    gate_up_silu_tiled_fn,
+    gate_up_silu_tiled_reference,
     batched_online_softmax_fn,
     carried_expert_sum_fn,
     carried_reduction_fn,
@@ -539,6 +541,54 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
 
+    def test_carry_mode_split_k_self_matmul(self):
+        """A coarse-tiled self-matmul: one input is both operands of a split-K
+        matmul in the loop (issue #4198).
+
+        ``insert_restickify`` once copied a consumer's stored per-read advance to
+        each restickify copy, finding the read by buffer name alone and zeroing it
+        after the first, so the second read of the same buffer got no advance. The
+        stored record is gone (#5863 stage 7); a copy's advance now comes from its
+        own read's index, resolved by name and index. The input is passed twice
+        because one tile read twice in a body is a separate gap (#6479).
+        """
+        from torch_spyre._inductor import insert_restickify as restickify
+
+        X = cached_xavier((M, K))
+        ref = dl16_round(X.float()) @ dl16_round(X.float()).T
+
+        def self_split_k(A, B):
+            def body(acc, ops):
+                a, b = ops
+                return acc + a @ b.T, None
+
+            final, _ = for_each_tile(
+                body,
+                (A, B),
+                dims=(-1, -1),
+                tile_size=64,
+                init=torch.zeros(M, M, device=A.device, dtype=A.dtype),
+            )
+            return final
+
+        X_spyre = X.to(DEVICE_NAME)
+        # Caches off: a cache hit skips the passes, and the call count with them
+        # (#6047).
+        with (
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                restickify, "_moved_loop_term", wraps=restickify._moved_loop_term
+            ) as moved_loop_term,
+        ):
+            compiled = torch.compile(self_split_k, backend="inductor", fullgraph=True)
+            out = compiled(X_spyre, X_spyre)
+
+        # The restickify of a looped consumer ran: the path #4198 was about.
+        self.assertGreaterEqual(moved_loop_term.call_count, 1)
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
     @staticmethod
     def _exact_split_k_operands(acc0_shape):
         """Small-integer operands whose split-K sums stay exact.
@@ -823,6 +873,31 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
 
+    def test_gate_up_silu_chunk_tiled_multi_stick(self):
+        """#6329: silu(gate) * up, splitting the tile's last dim with `chunk`
+        inside the body. The upper half's load index is a loop symbol plus
+        the chunk-boundary offset within the same tile dimension, which used
+        to fail to delinearize back into per-dim marker coordinates.
+
+        Each half of the chunk is a full 64-element stick wide
+        (STICK_COLS=128 // 2): a chunk boundary narrower than one stick hits
+        a separate, unrelated restickify-padding limitation (not this bug;
+        `LoopStructureError`/`counted loop ... not all members of it`), so
+        this fixture is only exercised at the stick-aligned size.
+        """
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = gate_up_silu_tiled_reference(X.float())
+
+        compiled = torch.compile(
+            gate_up_silu_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 128)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
     def _check_upcast_add_tiled(self, downcast_in_body):
         # Multiples of 1/64 below 5 are exact in fp16 and fp32, so a staggered
         # stick read as standard cannot hide inside a tolerance.
@@ -840,16 +915,6 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     def test_upcast_add_downcast_in_body(self):
         self._check_upcast_add_tiled(downcast_in_body=True)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "for_each_tile fails to preserve input EA tag in identity op. The "
-            "output is incorrectly tagged STANDARD (default) when data is "
-            "staggered it causes EA DCI to incorrectly apply / restore EA. "
-            "See issue #6462."
-        ),
-    )
     def test_upcast_add_in_body_downcast_after_loop(self):
         self._check_upcast_add_tiled(downcast_in_body=False)
 
@@ -1541,7 +1606,6 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
     """
 
     def test_substick_indirect_advance_is_refused(self):
-        import pytest
         from torch._inductor.exc import InductorError
 
         ids = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32).to(DEVICE_NAME)

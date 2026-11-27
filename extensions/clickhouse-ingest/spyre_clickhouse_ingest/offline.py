@@ -358,6 +358,19 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+# The twin of vllm.REPEAT_DIR_PREFIX, spelled again rather than imported: this module seals
+# bundles with the standard library alone (test_the_offline_path_needs_only_the_standard_library),
+# and importing vllm would pull in clickhouse_connect.
+REPEAT_DIR_PREFIX = "repeat-"
+
+
+def _repeat_prefix(path: Path) -> str:
+    """`repeat-003` when the file sits in a repeat subdir, else '' -- the staged path keeps it."""
+    parent = path.parent.name
+    stem = parent.removeprefix(REPEAT_DIR_PREFIX)
+    return parent if parent.startswith(REPEAT_DIR_PREFIX) and stem.isdigit() else ""
+
+
 def bundle_files(root: Path) -> list:
     """Every file under `root` but bundle.json and macOS tar litter, as relative posix paths."""
     return sorted(
@@ -1308,9 +1321,13 @@ def write(args, validate_times: bool = True) -> Path:
         if not args.vllm_results_dir:
             raise BundleError("--kind vllm needs --vllm-results-dir")
         src = Path(args.vllm_results_dir)
-        results = sorted(src.glob("*.json"))
+        # The repeat-NNN subdirs too: a repeated benchmark writes one set of files per repeat.
+        results = sorted(p for g in ("*.json", "repeat-*/*.json") for p in src.glob(g))
         extra = sorted(
-            p for p in src.iterdir() if p.is_file() and p.suffix in (".cmd", ".log")
+            p
+            for g in ("*", "repeat-*/*")
+            for p in src.glob(g)
+            if p.is_file() and p.suffix in (".cmd", ".log")
         )
     else:
         results = (
@@ -1399,12 +1416,13 @@ def write(args, validate_times: bool = True) -> Path:
         raise BundleError(f"{root} is not empty")
     (root / "results").mkdir(parents=True, exist_ok=True)
     for p in results:
-        shutil.copy2(
-            p,
-            root
-            / "results"
-            / ("invalidation.json" if kind == "bench-invalidation" else p.name),
-        )
+        if kind == "bench-invalidation":
+            dest = root / "results" / "invalidation.json"
+        else:
+            # Keep a repeat's own subdir: flattening would make its files collide with the next repeat's.
+            dest = root / "results" / _repeat_prefix(p) / p.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, dest)
     if staged:
         shutil.rmtree(staged, ignore_errors=True)
     if getattr(args, "redact_host", False):
@@ -1421,7 +1439,9 @@ def write(args, validate_times: bool = True) -> Path:
     if extra:
         (root / "attachments").mkdir(exist_ok=True)
         for p in extra:
-            shutil.copy2(p, root / "attachments" / p.name)
+            dest = root / "attachments" / _repeat_prefix(p) / p.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dest)
     meta["files"] = [
         {"path": p, "sha256": sha256(root / p)} for p in bundle_files(root)
     ]
