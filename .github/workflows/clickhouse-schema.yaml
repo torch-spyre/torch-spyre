@@ -1,12 +1,13 @@
 name: clickhouse-schema
 
-# Applies extensions/clickhouse-ingest/schema/ to an empty throwaway server twice; the second
+# Applies extensions/clickhouse-ingest/schema/ (and schema-ch-mgmt/ to its own database) to an empty throwaway server twice; the second
 # pass must change nothing. Live databases are applied by the spyre-frameworks Jenkins job
 # Spyre/ops/clickhouse-schema, never from here.
 on:
   pull_request:
     paths:
       - extensions/clickhouse-ingest/schema/**
+      - extensions/clickhouse-ingest/schema-ch-mgmt/**
       - extensions/clickhouse-ingest/spyre_clickhouse_ingest/**
       - extensions/clickhouse-ingest/tests/**
       - extensions/clickhouse-ingest/spyre_clickhouse_ingest/apply_schema.py
@@ -58,3 +59,33 @@ jobs:
           uv run python -m spyre_clickhouse_ingest.apply_schema --database v2
           uv run python -m spyre_clickhouse_ingest.apply_schema --database v2 --check
 
+      - name: Apply ch_mgmt to an empty database, then prove it converged
+        working-directory: extensions/clickhouse-ingest
+        env:
+          CLICKHOUSE_HOST: localhost
+          CLICKHOUSE_PORT: '8123'
+          CLICKHOUSE_SECURE: '0'
+          CLICKHOUSE_DB: default
+        run: |
+          set -euo pipefail
+          curl -sf localhost:8123 --data-binary 'CREATE DATABASE ch_mgmt'
+          uv run python -m spyre_clickhouse_ingest.apply_schema --schema-dir schema-ch-mgmt --database ch_mgmt
+          uv run python -m spyre_clickhouse_ingest.apply_schema --schema-dir schema-ch-mgmt --database ch_mgmt --check
+      - name: Grant the ch_mgmt roles and check them
+        working-directory: extensions/clickhouse-ingest
+        run: |
+          set -euo pipefail
+          sed 's/--.*//' schema-ch-mgmt/roles/chlogins-roles.sql | tr '\n' ' ' | tr ';' '\n' |
+            while IFS= read -r stmt; do
+              if [ -n "${stmt// /}" ]; then curl -sf localhost:8123 --data-binary "$stmt"; fi
+            done
+          curl -sf localhost:8123 --data-binary "SELECT role_name, access_type, database, table
+            FROM system.grants WHERE role_name LIKE 'dashboard_chlogins_%' ORDER BY ALL" > grants.actual
+          printf '%b\n' \
+            'dashboard_chlogins_reader\tSELECT\tch_mgmt\tlogin_events' \
+            'dashboard_chlogins_reader\tSELECT\tch_mgmt\tlogin_requests' \
+            'dashboard_chlogins_writer\tINSERT\tch_mgmt\tlogin_events' \
+            'dashboard_chlogins_writer\tINSERT\tch_mgmt\tlogin_requests' \
+            'dashboard_chlogins_writer\tSELECT\tch_mgmt\tlogin_events' \
+            'dashboard_chlogins_writer\tSELECT\tch_mgmt\tlogin_requests' > grants.expected
+          diff <(sort grants.expected) <(sort grants.actual)
