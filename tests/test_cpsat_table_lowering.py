@@ -1561,6 +1561,18 @@ def test_a_factor_that_is_never_0_or_reads_no_0_1_variable_is_no_gate(
     assert type(plan) is SwitchRealization and plan.values == values
 
 
+def test_a_divisor_is_not_printed_to_look_for_a_gate():
+    """1/a is never 0, so no table of 1/a is made, even where a has two rows, as a
+    literal does."""
+    case = Case()
+    case.integer("k", 1, 3)
+    case.add_input("a", a=[7.0, 49.0])
+    a = case.symbol("a")
+    printer = Recording(case.inputs)
+    assert type(printer.print(case.symbol("k") / a)) is TableRealization
+    assert 1 / a not in printer.printed
+
+
 def test_a_gates_fractional_value_adds_no_rounding(monkeypatch):
     """Half a unit, its list's; Stage 6's switch on 0.5 - 0.5*x adds one unit for its
     floor."""

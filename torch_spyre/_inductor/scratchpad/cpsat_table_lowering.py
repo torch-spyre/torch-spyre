@@ -386,7 +386,6 @@ class SwitchRealization(SymbolicRealization):
     index: Index
     rest: AbstractRealization
     positions: tuple[Index, ...]
-    quotient: TableRealization | None = None  # its table, for a product that divides
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -412,12 +411,6 @@ class SwitchRealization(SymbolicRealization):
                 model.add(p * w <= q * g + q - 1).only_enforce_if(case)
         return g
 
-    def table(self, cap: int) -> TableRealization:
-        """A product that divides is its quotient's table, divided as lambdify prints
-        it (_quotient): its factor times its rest's table multiplies by a reciprocal,
-        and floor(98 * (1/49)) is 1."""
-        return self.quotient or super().table(cap)
-
     def _list(
         self, index: Index, grid: Mapping[Index, np.ndarray], cap: int
     ) -> np.ndarray:
@@ -426,10 +419,7 @@ class SwitchRealization(SymbolicRealization):
 
     def scaled(self, factor: float) -> SwitchRealization:
         rest = self.rest.scaled(factor)
-        quotient = self.quotient and self.quotient.scaled(factor)
-        return SwitchRealization(
-            self.values, self.index, rest, self.positions, quotient
-        )
+        return SwitchRealization(self.values, self.index, rest, self.positions)
 
     def bounds(self) -> tuple[int, int]:
         q = self.denominator()
@@ -448,7 +438,6 @@ class SwitchRealization(SymbolicRealization):
         return self.index, self.values
 
     def joined(self, others: Sequence[Self]) -> SwitchRealization:
-        """A sum of products, so it has no quotient of its own."""
         rest, positions = _joined((self, *others))
         return SwitchRealization(self.values, self.index, rest, positions)
 
@@ -706,7 +695,8 @@ class TableLowering(Printer):
         reads that literal only and is 0 at exactly one of its values, as x, 1 - x and
         2 - 2*x are and 1 + x is not. None for any other operand."""
         positions = self._inputs(operand)
-        literal = positions[0] if len(positions) == 1 else None
+        one = len(positions) == 1 and not divides(operand)  # 1/a is never 0
+        literal = positions[0] if one else None
         if isinstance(literal, InputIndex) and (literal.lo, literal.size) == (0, 2):
             zero = self._table(operand).values == 0
             if np.count_nonzero(zero) == 1:
