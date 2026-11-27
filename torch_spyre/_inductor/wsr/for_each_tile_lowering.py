@@ -3553,10 +3553,15 @@ def _take_active_counts(graph) -> None:
     count in the body of the loop it counts. Its read, the count buffer and the
     index over the enclosing loop variables, becomes the ``LoopNode``'s
     ``count_source``, and the marker is removed: it is compile-time only.
+
+    #6506: a loop whose count is read on the device holds no collective. Under
+    tensor parallelism each rank reads its own count, so a collective in the
+    body could hang or combine tiles of different trips.
     """
     from torch._inductor.dependencies import MemoryDep
 
     from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.ir import SpyreCollectiveKernel
     from torch_spyre._inductor.loop_node import (
         LoopCountSource,
         LoopNode,
@@ -3595,6 +3600,14 @@ def _take_active_counts(graph) -> None:
             )
             remove_op(graph.operations, marker)
             graph.removed_buffers.add(marker.get_name())
+            for op in all_ops(node.body):
+                if isinstance(op, SpyreCollectiveKernel):
+                    raise Unsupported(
+                        f"collective {op.get_name()} inside loop {node.get_name()}, "
+                        "whose trip count is read from device memory: every rank "
+                        "would run its own count; move the collective before or "
+                        "after the loop"
+                    )
 
     visit(graph.operations)
     stray = [op.get_name() for op in all_ops(graph.operations) if is_marker(op)]

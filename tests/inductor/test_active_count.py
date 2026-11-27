@@ -34,7 +34,7 @@ from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 
 from torch_spyre._inductor.deadcode_elimination import live_operations
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.ir import AllReduceKernel, FixedTiledLayout
 from torch_spyre._inductor.loop_checker import find_violations
 from torch_spyre._inductor.loop_node import LoopCountSource, LoopNode, OpsView
 from torch_spyre._inductor.op_spec import CountSource, LoopSpec
@@ -95,6 +95,13 @@ def _graph(ops, inputs=()):
         constants={},
         get_output_names=lambda: [],
     )
+
+
+def _all_reduce(name):
+    # Only the class matters to the splice; the kernel's __init__ is not run.
+    op = AllReduceKernel.__new__(AllReduceKernel)
+    op.name = op.operation_name = name
+    return op
 
 
 class TestTheSpelling(unittest.TestCase):
@@ -192,7 +199,7 @@ class TestTheMarker(unittest.TestCase):
 
 class TestTheSplice(unittest.TestCase):
     """Plan 2.3: the splice records the marker's read on its loop and removes
-    the marker."""
+    the marker. #6506: no collective in such a loop."""
 
     def test_the_read_becomes_the_loops_count_source(self):
         marker = _marker("m", "cnt", 32 * U0)
@@ -213,6 +220,14 @@ class TestTheSplice(unittest.TestCase):
     def test_a_marker_outside_any_loop_is_refused(self):
         with self.assertRaisesRegex(Unsupported, "outside any loop"):
             _take_active_counts(_graph([_marker("m", "cnt", 0)]))
+
+    def test_a_collective_in_the_loop_is_refused(self):
+        loop = _node("loop", [_all_reduce("all_reduce_0"), _marker("m", "cnt", 0)])
+        with self.assertRaisesRegex(Unsupported, "collective all_reduce_0"):
+            _take_active_counts(_graph([_Op("cnt"), loop]))
+
+    def test_a_collective_in_an_ordinary_loop_is_left_alone(self):
+        _take_active_counts(_graph([_node("loop", [_all_reduce("all_reduce_0")])]))
 
 
 class TestTheReadEdges(unittest.TestCase):
