@@ -2726,6 +2726,8 @@ def plan(cat, request, leg, existing=(), invalidations=(), now=None):
     sel, ov = request.get("selection") or {}, request.get("overrides") or {}
     sels = {d.name: d for d in cat.docs if d.kind == "Selection"}
     chosen, sel_of = [], {}
+    # Named by the request, or by a Selection stating its own `types`: the default type must not drop these.
+    asked_for = set()
     if sel.get("cases"):
         for n in sel["cases"]:
             if n in sels:
@@ -2735,14 +2737,18 @@ def plan(cat, request, leg, existing=(), invalidations=(), now=None):
                     if "cases" in s.spec
                     else cat.select(s.spec["selector"])
                 )
+                declares_type = bool((s.spec.get("selector") or {}).get("types"))
                 for c in found:
                     chosen.append(c)
                     sel_of[c["name"]] = s
+                    if declares_type:
+                        asked_for.add(c["name"])
             else:
                 hit = [c for c in cat.cases if c["name"] == n]
                 if not hit:
                     raise PlanError(f"unknown case or selection {n!r}")
                 chosen += hit
+                asked_for.update(c["name"] for c in hit)
     else:
         groupings = dict(sel.get("groupings") or {})
         if "tier" in sel:
@@ -2755,8 +2761,13 @@ def plan(cat, request, leg, existing=(), invalidations=(), now=None):
         chosen = cat.select(
             {"suites": sel.get("suites") or cat.project.spec.get("default_suites", []), "groupings": groupings}
         )
-    ttype = sel.get("type", "perf")
-    chosen = [c for c in dict((c["name"], c) for c in chosen).values() if c["type"] == ttype]
+    # An explicit type narrows everything; the `perf` default only filters what nothing asked for.
+    ttype, explicit = sel.get("type", "perf"), "type" in sel
+    chosen = [
+        c
+        for c in dict((c["name"], c) for c in chosen).values()
+        if c["type"] == ttype or (not explicit and c["name"] in asked_for)
+    ]
     records = []
     for c in chosen:
         env_name = request.get("environment") or c["environment"]
