@@ -106,7 +106,7 @@ from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     carried_expert_sum_fn,
     carried_reduction_fn,
-    cast_fp32_to_int32_tiled_fn,
+    cast_to_int32_tiled_fn,
     embedding_restickify_inputs,
     embedding_restickify_table_fn,
     fill_add_tiled_fn,
@@ -458,18 +458,32 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                 )
                 torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
 
-    def test_cast_fp32_to_int32_in_tile_body_matches_eager(self):
+    def test_cast_to_int32_in_tile_body_matches_eager(self):
         """Regression test for issue #6410.
 
-        `cast_fp32_to_int32_tiled_fn`'s per-tile ``fp32 -> int32`` cast is
-        lowered inside a `for_each_tile` body, where `lower_trunc`'s fused
+        `cast_to_int32_tiled_fn`'s per-tile cast to ``int32`` is lowered
+        inside a `for_each_tile` body, where `lower_trunc`'s fused
         ``floor(|x|) * clip(x, -1, 1)`` synthesis of the cast used to reach
         `SpyreKernel.store` undecomposed (see that fixture's docstring) and
         raise `InductorError: ... unexpected argument
-        PointwiseOp(op='floor', ...) to mul`. Reverting the `lower_trunc`
-        fix (realizing ``abs(x)``/``floor(|x|)`` eagerly instead of leaving
-        them fused for `split_multi_ops` to split later) reproduces the
-        crash here.
+        PointwiseOp(op='floor', ...) to mul`. Disabling
+        `split_multi_ops_in_while_loop_bodies` (the fix: running
+        `split_multi_ops` against each loop body's own FX subgraph before
+        `splice_while_loops` disconnects it) reproduces the crash here.
+
+        Looped over `bfloat16` in addition to `float32`: it round-trips
+        through an extra `float32` conversion fused around the same
+        `lower_trunc` body (`to_dtype`'s `float16_format` branch), so a
+        dtype-specific fix in `lower_trunc` alone -- as opposed to a general
+        one covering every fused body inside a loop -- would not reach it.
+        `self.subTest` reports each dtype's failure independently rather
+        than stopping at the first.
+
+        `float16` is deliberately excluded here: the device's `float16` <->
+        `float32` round-trip is itself lossy for some values (confirmed
+        independent of `for_each_tile`/this fix -- the same mismatch
+        reproduces on a plain, unlooped `x.to(torch.int32)`), a separate,
+        pre-existing issue this PR does not address.
 
         Values include both positive and negative fractions so the fix is
         checked against `trunc`-toward-zero value semantics, not just that
@@ -478,17 +492,19 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         torch.manual_seed(6410)
         rows, cols, tile_size = 128, 64, 64
 
-        x = (torch.rand(rows, cols) * 200 - 100).to(torch.float32)
-        expected = x.to(torch.int32)
+        for src_dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(src_dtype=src_dtype):
+                x = (torch.rand(rows, cols) * 200 - 100).to(src_dtype)
+                expected = x.to(torch.int32)
 
-        torch._dynamo.reset()
-        compiled = torch.compile(
-            cast_fp32_to_int32_tiled_fn, fullgraph=True, dynamic=False
-        )
-        with torch.inference_mode():
-            actual = compiled(x.to(DEVICE_NAME), tile_size=tile_size)
+                torch._dynamo.reset()
+                compiled = torch.compile(
+                    cast_to_int32_tiled_fn, fullgraph=True, dynamic=False
+                )
+                with torch.inference_mode():
+                    actual = compiled(x.to(DEVICE_NAME), tile_size=tile_size)
 
-        torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+                torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
     def test_computed_where_condition_in_broadcast_tile(self):
         from torch_spyre.ops.fallbacks import FallbackWarning

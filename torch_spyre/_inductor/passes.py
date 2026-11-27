@@ -57,7 +57,11 @@ from .temp_passes import (
 )
 from .wsr.coarse_tile import reject_nested_loops, validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
-from .wsr.for_each_tile_lowering import clear_marker_maps, splice_while_loops
+from .wsr.for_each_tile_lowering import (
+    clear_marker_maps,
+    splice_while_loops,
+    split_multi_ops_in_while_loop_bodies,
+)
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
@@ -558,6 +562,17 @@ class CustomPreSchedulingPasses:
             # into this compile's ShapeEnv. Runs first so that every pass that
             # reads size bounds sees the declared range.
             apply_reserved_dims_contract,
+            #
+            # Split any fused multi-op body (e.g. lower_trunc's floor(abs(x)))
+            # inside each for_each_tile WhileLoop's own body_subgraph.graph
+            # while that body's FX graph is still intact. Must run before
+            # splice_while_loops, below: once that pass flattens a loop body
+            # into graph.operations, a fused op's origin no longer names a
+            # node reachable from the top-level graph, and split_multi_ops
+            # (which runs much later, near stickification) silently skips it.
+            # See split_multi_ops_in_while_loop_bodies's own docstring
+            # (issue #6410).
+            split_multi_ops_in_while_loop_bodies,
             #
             # Convert for_each_tile WhileLoops bodies into inlined IR with loop_infos
             splice_while_loops,
