@@ -27,6 +27,9 @@ from pathlib import Path
 
 import regex as re
 
+# The FMS Granite run's name when no model is recorded; kept in sync with results.py's.
+LEGACY_GRANITE_MODEL = "granite-8b-fms"
+
 REPORT_KIND = "perf-suite-sendnn-txt"
 COMPONENT = "torch-spyre"
 
@@ -60,7 +63,9 @@ def _section(line: str) -> dict | None:
         cfg = _GRANITE_CONFIG_RE.search(m["config"])
         return {
             "record_type": "model",
-            "operation_name": "granite",
+            # The report names no model (`Granite Config: bs1_pl512_...` only): the FMS Granite
+            # run's rows take results.LEGACY_GRANITE_MODEL, never the bare family "granite".
+            "operation_name": LEGACY_GRANITE_MODEL,
             "config_name": m["config"],
             "batch_size": int(cfg["batch_size"]) if cfg else None,
             "prompt_length": int(cfg["prompt_length"])

@@ -61,6 +61,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
 | `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
+| `multi_aiu.py` | the perf suite's Multi-AIU report XMLs (`generate_multi_aiu_report.py`) -> `benchmark_runs`, a benchmark per card, step and kernel (`report_kind=perf-suite-multi-aiu-xml`): `results --xml-file` / `--xml-dir` ([below](#multi-aiu-reports)) |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
 | `reference.py` | `bench-reference` bundles: file format and validation, identity, approval rules, lifecycle, and the writer that runs at approval (docs/references.md) |
 | `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay, and a connected vllm / sendnn / benchmarks run) |
@@ -182,6 +183,26 @@ python -m spyre_clickhouse_ingest dispatch request --subscription <id> --artifac
 `request` prints the request and the `dispatch_id` its outcome will be recorded under in
 `artifact_dispatches`; the dispatcher picks it up within one 5-minute run. A request skips the
 subscription's conditions, exclusions, rate limits and coalescing.
+
+## Multi-AIU reports
+
+`results --xml-file` / `--xml-dir` recognises the four files the perf suite's
+`generate_multi_aiu_report.py` writes, by their `<testsuites name>`: `report_rank_N.xml`
+(`spyre-perf-suite`, with a `card_rank` suite property, which separates it from CI's `report.xml`),
+`spyre_kernel_report_rank_N.xml`, `cpu_kernel_report_rank_N.xml` and `multi_aiu_summary.xml`.
+
+```bash
+python -m spyre_clickhouse_ingest results --xml-dir xml_reports --schema v2 \
+  --trigger-type perf --artifact <spec> --arch <arch> --jenkins-run-key <key>
+```
+
+A testcase is a benchmark named `multi_aiu/<suite>/<testcase without _rank_N>`, whose `time` (ms)
+is `duration_ms` (`n_flex`, a span count, is stored as `n_flex`). Its `card_rank`, `step`, `scope`,
+`metric` and `kernel` tags are identity, so each card and step has its own trend and a card is
+never averaged into another. CPU kernels are backend `cpu`, the rest `spyre`. v2 only: without
+`--schema v2` and `CLICKHOUSE_DB_V2` nothing is written. Pass the same run coordinate
+(`--run-id`, `--gha-run-id` or `--jenkins-run-key`) for every file of a run; without one, the files
+of a single invocation share a run and a second invocation is a second run.
 
 ## Moving off ingest_xml.py
 
