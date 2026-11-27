@@ -841,6 +841,11 @@ jobs:
       # used in a step `if:`. Empty (caller passed no ClickHouse secrets) => the
       # ingest step is skipped and the perf run still succeeds.
       CLICKHOUSE_INGEST_HOST: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+      # What compiling cost: one compile_summary.<pid>.json at exit. Absolute, and outside RESULTS_DIR because the ingest globs it.
+      COMPILE_SUMMARY_DIR: ${{ github.workspace }}/compile-summary
+      TORCH_SPYRE_COMPILE_SUMMARY_DIR: ${{ github.workspace }}/compile-summary
+      # total_s and passes come from the timing recorder; without this the summary holds cache counters only.
+      TORCH_SPYRE_TIMING: '1'
     steps:
       # ALWAYS sparse-checkout .github from the workflow ref, in BOTH prebaked
       # and normal mode. `uses: ./.github/actions/*` resolves the action
@@ -940,6 +945,19 @@ jobs:
           test -f "${RESULTS_DIR}/report.xml" \
             || { echo "::error::perf run did not produce report.xml"; exit 1; }
           echo "perf report written to \${RESULTS_DIR} (not uploaded)"
+
+      # Uploadable where report.xml is not: frontend compile cost and cache counters, no benchmark numbers.
+      # always() + warn: a benchmark that died before any process exited leaves no summary, which must not fail the job.
+      - name: Upload compile summary
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: compile-summary
+          path: ${{ env.COMPILE_SUMMARY_DIR }}/compile_summary.*.json
+          if-no-files-found: warn
+          retention-days: ${{ inputs.report_retention_days }}
+          overwrite: true
 
       # Push the perf report to ClickHouse INLINE on this card runner. The
       # report is never uploaded as a workflow artifact (public repo: artifacts

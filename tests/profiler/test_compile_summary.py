@@ -137,7 +137,13 @@ def test_untimed_dump_says_why_it_is_empty(clean_recorder, tmp_path, caplog):
 
 
 def test_timed_dump_does_not_warn(no_card, tmp_path, caplog):
-    with caplog.at_level(logging.WARNING):
+    """Silent when the recorder is on, so the warning means what it says.
+
+    `timing` is held across the dump, not just the compile: in a real run it comes
+    from the environment at import and is still on at exit, which is when the hook
+    dumps. `_compile_timed`'s own patch has closed by then.
+    """
+    with config.patch({"timing": True}), caplog.at_level(logging.WARNING):
         _compile_timed()
         _compile_summary.dump(str(tmp_path))
     assert _compile_summary.TIMING_VAR not in caplog.text

@@ -279,6 +279,16 @@ it cannot change what a compile does.
 useful in a long-lived server, where waiting for the exit hook means waiting for
 the process to end.
 
+The directory is joined verbatim, so a relative path resolves against the
+process working directory at exit; prefer an absolute one. The name carries the
+pid, so an xdist run leaves one file per worker, and each is written through a
+temporary file so a reader globbing the directory never sees a partial summary.
+
+In CI, the `perf` job of `_test_matrix.yaml` sets both variables and uploads the
+result as the `compile-summary` artifact. The benchmark's own `report.xml` is
+never uploaded (on a public repo its numbers must stay private); the summary
+holds frontend compile times and cache counters, not benchmark numbers.
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |
