@@ -136,14 +136,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "eager .to(torch.float16) on a spyre fp32 tensor returns values "
-            "that differ from the CPU result (#2847)"
-        ),
-    )
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_eager_to_dtype_fp32_to_fp16(self):
         """Eager fp32→fp16 cast on a Spyre tensor."""
@@ -164,7 +156,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @_rejected("no supported output layout found", "#2851")
     def test_to_dtype_strided_slice_fp16_to_fp32(self):
         """fp16->fp32 on a stride-2 sliced non-contiguous tensor."""
         x = cached_randn((4, 128), differentiation="ncex02_stride")
@@ -194,15 +185,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to fp16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_half_shortcut_value_correctness(self):
         """fp32.half() shortcut — FP32TODL16_OP path, SKIP #2205."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="sc02_half")
@@ -221,15 +203,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to bf16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_bfloat16_shortcut_from_fp32_value_correctness(self):
         """fp32.bfloat16() uses FP32TODL16_OP, SKIP #2205."""
         x = cached_randn(
@@ -340,14 +313,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, z, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_explicit_fp16_to_fp32_add_3d_unaligned(self):
         """explicit cast — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="exp3du_x")
@@ -361,14 +326,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_explicit_fp16_to_fp32_add_4d_unaligned(self):
         """explicit cast — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="exp4du_x")
@@ -401,7 +358,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_working_implicit_add_fp16_to_fp32(self):
         """explicit fp16->fp32 cast still hits #2252 arrangement mismatch."""
         x = cached_randn((4, 64), differentiation="newim01_x")
@@ -413,7 +369,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_arrangement_error(self):
         """direct add of H2D fp32 + on-device fp16 hits arrangement mismatch."""
         x = cached_randn((4, 64), differentiation="newim02_fp16")
@@ -424,7 +379,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_4d_stick_aligned(self):
         """direct fp16+fp32 add on 4D (2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 4, 64), differentiation="dir4d_fp16")
@@ -437,7 +391,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_5d_stick_aligned(self):
         """direct fp16+fp32 add on 5D (2,2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 2, 4, 64), differentiation="dir5d_fp16")
@@ -450,7 +403,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_large_values(self):
         """direct fp16+fp32 add with large values (scale=100)."""
         x = cached_randn((4, 64), differentiation="dirlrg_fp16", scale=100.0)
@@ -463,7 +415,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_small_values(self):
         """direct fp16+fp32 add with small values (scale=1e-3)."""
         x = cached_randn((4, 64), differentiation="dirsml_fp16", scale=1e-3)
@@ -516,7 +467,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("cannot rescale device layout", "#3809")
     def test_implicit_add_fp16_2d_unaligned(self):
         """implicit add workaround — 2D unaligned (4,32)."""
         x = cached_randn((4, 32), differentiation="imp2du_x")
@@ -529,14 +479,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_implicit_add_fp16_3d_unaligned(self):
         """implicit add workaround — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="imp3du_x")
@@ -549,14 +491,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_implicit_add_fp16_4d_unaligned(self):
         """implicit add workaround — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="imp4du_x")
@@ -569,9 +503,8 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_sub_fp16_fp32_via_explicit_cast_roundtrip(self):
-        """sub with explicit fp16->fp32 cast hits #2252."""
+        """sub with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe09_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe09_y")
 
@@ -581,9 +514,8 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_mul_fp16_fp32_via_explicit_cast_roundtrip(self):
-        """mul with explicit fp16->fp32 cast hits #2252."""
+        """mul with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe10_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe10_y")
 
@@ -593,9 +525,8 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_div_fp16_by_fp32_via_explicit_cast_workaround(self):
-        """div with explicit fp16->fp32 cast hits #2252."""
+        """div with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe12_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe12_y")
 
@@ -616,7 +547,6 @@ class TestImplicitPromotion(unittest.TestCase):
         self.assertEqual(fn(x, y).dtype, torch.float16)
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_sub_fp32_tensor_fp16_tensor(self):
         """fp32_tensor - fp16_tensor (reversed operand order)."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="tp02_fp32")
@@ -739,9 +669,13 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
+    # The transposed (4, 64) fp32 result has a stick dim of 4, narrower than one
+    # 64-element stick pair, so the DL16_TO_FP32 layout is rejected ("requires
+    # whole stick pairs").
+    @_rejected("requires whole stick pairs", None)
     def test_implicit_tensor_add_non_contiguous_fp16_fp32(self):
-        """non-contiguous fp16 + fp32 hits arrangement mismatch."""
+        """non-contiguous fp16 + fp32: the transposed fp32 output has a stick dim
+        (4) narrower than a whole stick pair so this is rejected."""
         x = cached_randn((64, 4), differentiation="ncim02_fp16")
         y = cached_randn((64, 4), dtype=torch.float32, differentiation="ncim02_fp32")
 
@@ -766,6 +700,52 @@ class TestImplicitPromotion(unittest.TestCase):
             return a + scalar_fp32
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_fp16_with_0dim_fp32_tensor_keeps_fp16(self):
+        """fp16 tensor (op) 0-dim fp32 tensor gives eager's dtype and values (#6061).
+
+        Torch keeps the result fp16 because a 0-dim tensor does not promote a
+        dimensioned one of the same category. The lowerings used to broadcast
+        first and return fp32, which was also read back permuted (#4393).
+        ``compare_with_cpu`` does not check dtype, so it is checked here.
+        """
+        ops = {
+            "add": torch.add,
+            "sub": torch.sub,
+            "mul": torch.mul,
+            "div": torch.div,
+            "floor_divide": torch.floor_divide,
+            "maximum": torch.maximum,
+            "minimum": torch.minimum,
+            "eq": torch.eq,
+            "ne": torch.ne,
+            "lt": torch.lt,
+            "le": torch.le,
+            "gt": torch.gt,
+            "ge": torch.ge,
+        }
+        # Whole numbers >= 1: exact in fp16 and never zero, so division is safe
+        # in either operand order and comparisons have no rounding edge cases.
+        x = (torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)) + 1).to(
+            torch.float16
+        )
+        s = torch.tensor(3.0, dtype=torch.float32)
+        for name, op in ops.items():
+            for order in ("tensor_first", "scalar_first"):
+
+                def fn(a, b, op=op, order=order):
+                    return op(a, b) if order == "tensor_first" else op(b, a)
+
+                expected = fn(x, s)
+                for mode in ("compiled", "eager"):
+                    with self.subTest(op=name, order=order, mode=mode):
+                        run = torch.compile(fn) if mode == "compiled" else fn
+                        got = run(x.to("spyre"), s.to("spyre")).cpu()
+                        self.assertEqual(got.dtype, expected.dtype)
+                        # Device fp16 division can be 1 ulp off; every other op is
+                        # exact. A permuted readback would be off by whole numbers.
+                        tol = 1e-2 if name == "div" else 0
+                        torch.testing.assert_close(got, expected, atol=tol, rtol=tol)
 
 
 class TestDataTransfer(unittest.TestCase):
@@ -861,15 +841,6 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"D2H fp32→fp16 value mismatch: got {result}, expected {expected}",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the copy compiles (#2852 is fixed), but the fp16 result is staggered and "
-            "its readback is permuted: converting it back on the device restores the "
-            "values (#4393)"
-        ),
-    )
     def test_compiled_copy_cross_dtype_fp32_to_fp16(self):
         """Compiled copy_() from fp32 into fp16 Spyre tensor."""
         src_fp32 = cached_randn(
@@ -894,15 +865,6 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"copy_ value mismatch: got {dst_spyre.cpu()}, expected {expected}",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            ".float() on a Spyre tensor gives a staggered (DL16_TO_FP32) result whose "
-            "readback is permuted (#4393), and the eager .half() of it is also wrong, "
-            "though the compiled .half() of the same tensor is right; see also #2205"
-        ),
-    )
     def test_float_half_methods_on_spyre_tensor(self):
         """.float() and .half() shortcut methods on Spyre tensors."""
         x_cpu = torch.randn(4, 64, dtype=torch.float16)
@@ -977,6 +939,48 @@ class TestUnsupportedGates(unittest.TestCase):
         x = torch.randn(2, 2, dtype=torch.float64)
         with self.assertRaises(RuntimeError):
             x.to("spyre")
+
+    def test_kernel_to_dtype_without_src_dtype_raises_unsupported(self):
+        """A kernel cast without src_dtype is rejected with Unsupported (#5783).
+
+        OpsHandler.to_dtype declares src_dtype optional, and some upstream
+        Inductor lowerings omit it. Spyre picks the hardware op from the
+        (src_dtype, dtype) pair, so it must reject the cast with a clear
+        message instead of failing with TypeError.
+        """
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.spyre_kernel import SpyreOpFuncs
+
+        for kwargs in ({}, {"use_compute_types": False}, {"src_dtype": None}):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(Unsupported, "without a source dtype"):
+                    SpyreOpFuncs.to_dtype(object(), torch.float16, **kwargs)
+
+    @_rejected(r"aten::sort\.values_stable", "#4500")
+    def test_compiled_conversion_of_multi_output_op_does_not_crash(self):
+        """A dtype conversion of a multi-output op's result compiles (#5831).
+
+        argsort lowers through aten.sort, whose FX node carries a (values,
+        indices) tuple as meta["val"]. split_multi_ops called .to() on it and
+        crashed with "'tuple' object has no attribute 'to'". With the fix the
+        graph compiles, and the run stops at aten.sort, which has no Spyre
+        kernel yet (#4500).
+
+        TODO(#4500): once aten.sort is supported, drop @_rejected so the
+        compiled result is compared with the CPU.
+
+        Caches are off: a cached graph would skip split_multi_ops and hide the
+        bug.
+        """
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, dtype=torch.float16)
+
+        def fn(a):
+            return torch.argsort(a, dim=1).to(torch.float16)
+
+        with torch._inductor.config.patch(force_disable_caches=True):
+            out = torch.compile(fn, dynamic=False)(x.to("spyre")).cpu()
+        torch.testing.assert_close(out, fn(x))
 
 
 class TestModelIntegration(unittest.TestCase):

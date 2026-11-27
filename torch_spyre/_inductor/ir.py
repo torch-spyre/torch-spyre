@@ -145,10 +145,13 @@ def _resize_device_layout(
     dim grows: growing back is ambiguous where the tile has two host dims of
     extent 1.
 
-    ``stride_map`` semantics: a value of ``-1`` means "this device dimension has
-    extent 1 and is never stepped through; its stride is undefined."  For
-    non-contiguous (transposed / col-major) dims, the *physical* stride on
-    device is invariant to resizing, so it is left unchanged.
+    ``stride_map`` semantics: a value of ``0`` means "every access lands at
+    host coordinate zero along this dimension; its stride is undefined."  This
+    covers size-1 dims (broadcast collapsed to one element), broadcast dims
+    with device_size > 1 (every device coordinate reads the same host element),
+    and gap dims inserted by padding.  For non-contiguous (transposed / col-major)
+    dims, the *physical* stride on device is invariant to resizing, so it is
+    left unchanged.
 
     Device-dim classification (as produced by ``get_generic_stick_layout``):
 
@@ -164,8 +167,8 @@ def _resize_device_layout(
       spanning the stick host dim ``p*``.  Updated to
       ``ceil(new_host_size[p*] / eps)``.  Same stride-update rule as non-stick.
       Of size 1 when ``p*`` is at most one stick long, told from a singleton
-      by its ``stride_map`` (never ``-1``).
-    * **singleton** (``device_size == 1, stride_map == -1``) — either a sparse
+      by its ``stride_map`` (never ``0``).
+    * **singleton** (``device_size == 1, stride_map == 0``) — either a sparse
       placeholder (no corresponding host dim) or a non-stick dim tiled to
       extent 1.  Left as-is when there is no host dim to match; matched by
       size-1 to a host dim of size 1 when one exists.
@@ -196,7 +199,7 @@ def _resize_device_layout(
     Multi-pass algorithm:
 
     * **Pass 1**: match non-inner-stick device dims to host dims by size.
-      Size-1 dims with ``stride_map == -1`` match only to host dims of size 1;
+      Size-1 dims with ``stride_map == 0`` match only to host dims of size 1;
       other size-1 dims are tile-count.  Size > 1 dims match by
       ``device_size == old_host_size[p]``, with stride as tiebreaker when sizes
       collide.  Unmatched dims are candidates for tile-count.
@@ -261,8 +264,8 @@ def _resize_device_layout(
 
     for j in range(ndev - 1):  # j == ndev-1 is always inner stick
         dsz = orig_ds[j]
-        if dsz == 1 and orig_sm[j] != -1:
-            # A host dim of extent 1 always has stride_map -1: this is the
+        if dsz == 1 and orig_sm[j] != 0:
+            # A host dim of extent 1 always has stride_map 0: this is the
             # tile count of a stick host dim at most one stick long.
             unmatched_j.append(j)
         elif dsz == 1:
@@ -362,14 +365,25 @@ def _resize_device_layout(
     for j, p in matched_host.items():
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
-            new_sm[j] = -1
+            new_sm[j] = 0
         elif orig_sm[j] == old_hs[p]:
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; physical layout is invariant — leave unchanged.
 
+    # Build new valid_elements: for dims matched to a host dim, update the count
+    # to the new host size; dims not matched (inner stick, size-1 placeholders)
+    # keep their existing valid count.
+    new_ve: dict[tuple[int, ...], int] = {}
+    for key, val in orig_stl.valid_elements.items():
+        matched_dev = [d for d in key if d in matched_host]
+        if matched_dev:
+            new_ve[key] = new_host_size[matched_host[matched_dev[0]]]
+        else:
+            new_ve[key] = val
+
     if pstar is None:  # reduction output: tile-count / inner-stick entries frozen
         return SpyreTensorLayout(
-            new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
+            new_ds, new_sm, orig_stl.device_dtype, new_ve, orig_stl.element_arrangement
         )
 
     # Pass 3: update tile-count dims (unmatched_j — all must equal expected
@@ -400,7 +414,7 @@ def _resize_device_layout(
             )
         new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil division
         if new_host_size[pstar] == 1:
-            new_sm[j] = -1
+            new_sm[j] = 0
         elif orig_sm[j] == tc_stride:
             new_sm[j] = new_tc_scale * new_hs[pstar]
         # else: non-contiguous stick; physical stride invariant.
@@ -408,13 +422,18 @@ def _resize_device_layout(
     # Pass 4: inner stick (j == ndev-1) — device_size is always eps, update stride only.
     j = ndev - 1
     if new_host_size[pstar] == 1:
-        new_sm[j] = -1
+        new_sm[j] = 0
     elif orig_sm[j] == old_hs[pstar]:
         new_sm[j] = new_hs[pstar]
     # else: non-contiguous stick; physical stride invariant.
 
+    # Update the stick group's valid count to the new stick host dim size.
+    for key in list(new_ve):
+        if j in key:
+            new_ve[key] = new_host_size[pstar]
+
     return SpyreTensorLayout(
-        new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
+        new_ds, new_sm, orig_stl.device_dtype, new_ve, orig_stl.element_arrangement
     )
 
 
@@ -443,6 +462,69 @@ class SpyreConstantFallback(ir.ExternKernel):
             (value,),
             python_kernel_name="torch.ops.spyre.constant",
             cpp_kernel_name=cpp_kernel_name,
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
+class SpyreArangeFallback(ir.ExternKernel):
+    """IR node for a cacheable coordinate: a ramp, or a mask's row coordinate.
+
+    Emits ``spyre_arange_tensor``, which memoizes coordinates up to a bounded
+    length across forward passes, so the construction cost is paid once per
+    ``(dtype, device)`` and form rather than on every call.  ``column`` selects
+    the form: ``False`` for the ``[length]`` ramp, ``True`` for the
+    ``[length, 1]`` row coordinate.
+
+    Shares ``SpyreConstantFallback``'s contract: the runtime returns a shared
+    tensor, so ``should_allocate()`` is False and the node declares no mutation
+    names, keeping inductor from routing an in-place write at it.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        wrapper.generate_arange_tensor_fallback(self)
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        length,
+        dtype,
+        device,
+        column: bool = False,
+    ) -> None:
+        # A coordinate is a real buffer produced outside any kernel, so it
+        # carries its device layout from the start rather than acquiring one in
+        # finalize_layouts: no propagation step would assign it one.  For the
+        # ramp the ordinary contiguous stick layout is what makes the cached
+        # tensor interchangeable with a freshly constructed one; for the column
+        # the stick sits on the trailing extent-1 dim, which is what gives a
+        # comparison against a ramp a feasible assignment.
+        size = [length, 1] if column else [length]
+        device_layout = SpyreTensorLayout(size, dtype)
+        layout = FixedTiledLayout(
+            device,
+            dtype,
+            [sympy.Integer(v) for v in size],
+            [sympy.Integer(1)] * len(size),
+            device_layout,
+        )
+        super().__init__(
+            None,
+            layout,
+            [],
+            (length, column),
+            python_kernel_name="torch.ops.spyre.arange",
+            cpp_kernel_name="aoti_torch_arange",
             op_overload=op_overload,
         )
         self.name = V.graph.register_buffer(self)
@@ -596,8 +678,8 @@ class SpyreCollectiveKernel(ir._CollectiveKernel, metaclass=abc.ABCMeta):
 
     * ``create_inplace`` (all_reduce): ``NoneLayout`` node plus a
       ``MutationOutput`` on each input; the lowering returns the input.
-    * ``create_out_of_place`` (broadcast, all_gather): the node is the output
-      buffer.
+    * ``create_out_of_place`` (broadcast, all_gather, reduce_scatter): the
+      node is the output buffer.
 
     ``op_overload`` is the ``_c10d_functional`` op, whose Meta impl drives
     ``process_kernel``; ``constant_args`` are its non-tensor args in schema
@@ -683,6 +765,86 @@ class AllGatherKernel(SpyreCollectiveKernel):
     def _run_call(self, input_name: str, plan_var: str) -> str:
         group_size, _ = self.constant_args
         return f"torch.ops.spyre.allgather_run({input_name}, {plan_var}, {group_size})"
+
+
+class ReduceScatterKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.reduce_scatter_tensor``.
+
+    The input is the ``(A, g, B)`` staging buffer built by the lowering
+    (``_reduce_scatter``); the output is one rank's ``(A, B)`` chunk.
+    spyre-comms hands rank ``r`` the ``r``-th contiguous ``1/g`` of the device
+    buffer, which is ``chunk(0)[r]`` only when that buffer's default device
+    layout has ``g`` outermost, as checked in ``codegen``.
+    """
+
+    plan_prefix = "rs"
+
+    @classmethod
+    def create_staged(
+        cls,
+        staged: IRNode,
+        reduce_op: str,
+        group_size: int,
+        group_name: str,
+        out_size: list[int],
+    ) -> "ReduceScatterKernel":
+        """Build the node for a staged ``(A, g, B)`` input with an ``(A, B)`` output.
+
+        The upstream ``create_out_of_place`` derives the output from the
+        ``reduce_scatter_tensor`` meta (``size(0) // g``), which does not hold
+        for the staged shape.  Building the node directly is safe because the
+        output is a plain fresh buffer: it aliases no input and mutates
+        nothing, so there are no ``MutationOutput`` or alias annotations for
+        the factory to set up.
+        """
+        layout = FixedLayout(
+            staged.get_device(),
+            staged.get_dtype(),
+            [sympy.Integer(s) for s in out_size],
+        )
+        node = cls(
+            layout,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            [staged],
+            [reduce_op, group_size, group_name],
+            lambda *a: a,
+        )
+        node.outputs = [node]
+        return node
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        _, group_size, _ = self.constant_args
+        input_layout = _collective_input_layout(self.inputs[0])
+        # Same condition as the run-time check in spyre_reducescatter_run_impl
+        # (spyre_distributed.cpp); keep the two in sync.
+        a_dim, g, b_dim = (int(s) for s in input_layout.size)
+        expected = SpyreTensorLayout([a_dim, g, b_dim], input_layout.dtype)
+        if (
+            g != group_size
+            or input_layout.device_layout != expected
+            or expected.device_size[0] != group_size
+        ):
+            raise Unsupported(
+                f"reduce_scatter: staged input must use the default device "
+                f"layout with the group dim outermost ({expected}) so each "
+                f"rank's chunk is one contiguous device slab; got "
+                f"{input_layout.device_layout}"
+            )
+        super().codegen(wrapper)
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        reduce_op, group_size, group_name = self.constant_args
+        return (
+            f"torch.ops.spyre.reducescatter_plan("
+            f"{num_elems}, {dtype_code}, {group_size}, "
+            f"'{reduce_op}', '{group_name}')"
+        )
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        _, group_size, _ = self.constant_args
+        return (
+            f"torch.ops.spyre.reducescatter_run({input_name}, {plan_var}, {group_size})"
+        )
 
 
 class AllReduceKernel(SpyreCollectiveKernel):

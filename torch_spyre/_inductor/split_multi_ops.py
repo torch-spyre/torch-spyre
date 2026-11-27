@@ -24,14 +24,14 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
-from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch.fx.traceback import NodeSource, NodeSourceAction
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
-from .loop_info import ReadCopyElisionRecord
+from .read_copy_elision import ReadCopyElisionRecord
+from .loop_node import move_before
 from .errors import Unsupported
 from .pass_utils import (
     replace_computed_buffer_body,
@@ -39,9 +39,7 @@ from .pass_utils import (
     patch_env,
     find_fx_node,
 )
-from .constants import is_ea_compatible
 from .provenance import decompose_provenance
-from torch_spyre._C import SpyreTensorLayout, ElementArrangement
 from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("split_multi_ops")
@@ -450,23 +448,36 @@ def _init_vid_to_bufname(trace):
     return {vid: kwargs["_name"] for op, vid, _, kwargs in trace if op == "load"}
 
 
-def _lower_fx_node(node, gl, ops, idx):
+def _lower_fx_node(node, gl, ops, before):
     """Lower an FX node to a buffer and insert it into operations list.
+
+    A lowering may register more than one operation: a host fallback registers
+    a FallbackKernel and then the MultiOutput that reads it, and a lowering can
+    realize helper buffers before its result. register_operation appends them
+    all at the end of gl.operations, after the consumer being split, so all of
+    them are moved to just before ``before`` in registration order to keep the list
+    in topological order.
 
     Args:
         node: FX node to lower
         gl: GraphLowering instance
         ops: Operations list to insert into
-        idx: Index position for insertion
+        before: The op being split; the new ops go right before it, in the list
+            that holds it (the loop body, when it is in one)
 
     Returns:
         The created buffer
     """
+    start = len(gl.operations)
     tb = gl.run_node(node)
     gl.env[node] = tb  # run_node does not record it in the env
+    # buf is the lowering's result, not every operation it registered: for a
+    # host fallback it is the MultiOutput, registered after its FallbackKernel.
+    # new_ops below holds all of them, so the whole group moves together.
     buf = tb.data.data
-    gl.operations.remove(buf)
-    ops.insert(idx, buf)
+    new_ops = [gl.operations[i] for i in range(start, len(gl.operations))]
+    for new_op in new_ops:
+        move_before(ops, before, new_op)
     gl.name_to_buffer[buf.get_name()] = buf
     return buf
 
@@ -477,7 +488,7 @@ def _make_intermediate_bufs(
     vid_to_bufname,
     layout,
     operations,
-    insert_idx,
+    before,
     gl,
     orig_node,
     orig_buffer,
@@ -502,7 +513,7 @@ def _make_intermediate_bufs(
         vid_to_bufname: Mapping from value ID to buffer name (updated)
         layout: Layout of the original fused operation
         operations: List of operations to insert into
-        insert_idx: Starting index for insertion
+        before: The op being split; the new buffers go right before it
         gl: GraphLowering instance
         orig_node: Original FX node being split
         orig_buffer: Original ComputedBuffer being split
@@ -561,13 +572,11 @@ def _make_intermediate_bufs(
                 inherit_origins=False,
             )
             # Move the buffer to our desired position, then continue with it wrapped.
-            gl.operations.remove(new_buf)
-            operations.insert(insert_idx, new_buf)
+            move_before(operations, before, new_buf)
             buf_name = new_buf.get_name()
             vid_to_bufname[vid] = buf_name
             # Track this materialized constant for the handler's constant_map.
             constant_map[(fill_value, out_dtype)] = buf_name
-            insert_idx += 1
             continue
 
         def assert_fx_node(v):
@@ -588,14 +597,17 @@ def _make_intermediate_bufs(
             new_node = gl.graph.create_node("call_function", target, args, clean_kw)
         _set_split_child_provenance(orig_node, new_node, target)
 
-        # Propagate metadata for shape inference
-        if input_nodes and "val" in input_nodes[0].meta:
-            new_node.meta["val"] = input_nodes[0].meta["val"].to(out_dtype)
+        # Propagate metadata for shape inference. The input's val is a tuple
+        # when the input is a multi-output op (aten.sort for argsort, topk,
+        # min/max with indices); fall back to the original node's val then.
+        input_val = input_nodes[0].meta.get("val") if input_nodes else None
+        if isinstance(input_val, torch.Tensor):
+            new_node.meta["val"] = input_val.to(out_dtype)
         elif "val" in orig_node.meta:
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
-        # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
-        new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
+        # Lower the FX node; _lower_fx_node moves what it registers before ``before``.
+        new_buf = _lower_fx_node(new_node, gl, operations, before)
         # This child node is the sole semantic origin of the new buffer.
         object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
         decompose_provenance(
@@ -613,7 +625,6 @@ def _make_intermediate_bufs(
         if op_name not in op_queues:
             op_queues[op_name] = collections.deque()
         op_queues[op_name].append(buf_name)
-        insert_idx += 1
 
     return constant_map, op_queues
 
@@ -699,97 +710,6 @@ def _patch_original_buf(
             direct_inner_fn=direct_inner_fn,
         )
     V.graph.name_to_buffer[new_op.get_name()] = new_op
-
-
-def _get_op_name(op) -> str:
-    """Extract the operation name from a node for validation."""
-    if not hasattr(op.data, "origins") or not op.data.origins:
-        return ""
-
-    # Prefer the origin in the current lowering graph (subgraph-safe); fall back
-    # to an arbitrary origin when no graph context is available. That fallback
-    # may yield a parent-graph node for a subgraph buffer, which is safe *here*
-    # because this function only extracts a name string and never inserts into
-    # or mutates a graph. Do not gate graph-mutating logic on the result.
-    gl = V.graph
-    origin_node = None
-    if hasattr(gl, "graph"):
-        origin_node = origin_in_graph(op.data.origins, gl.graph)
-    if origin_node is None:
-        origin_node = next(iter(op.data.origins))
-
-    # Try to get the target and its name
-    target = getattr(origin_node, "target", None)
-    if target and hasattr(target, "name"):
-        full_name = target.name()
-        if "::" in full_name:
-            # Extract just the operation name (e.g., "add" from "aten::add.Tensor")
-            return full_name.split("::")[1].split(".")[0]
-        return full_name
-
-    # If we got here, just return the target as string
-    return str(target) if target else str(origin_node)
-
-
-def validate_ops(graph: GraphLowering) -> None:
-    """Validate inputs to ops have same ElementArrangement.
-
-    This pass need to be run after propagate_spyre_tensor_layouts so that it
-    has all the required SpyreTensorLayouts.
-    """
-    for op in graph.operations:
-        if not hasattr(op, "data"):
-            continue
-        if not isinstance(op.data, Pointwise):
-            continue
-
-        read_writes = op.get_read_writes()
-        inputs = [r for r in read_writes.reads if isinstance(r, MemoryDep)]
-
-        # Exclude single input ops
-        if len(inputs) <= 1:
-            continue
-
-        layouts = []
-        input_names = []
-        for inp in inputs:
-            buf = V.graph.get_buffer(inp.name)
-            # Skip buffers without layouts
-            if not hasattr(buf, "layouts"):
-                continue
-            for layout in buf.layouts:
-                if isinstance(layout, SpyreTensorLayout):
-                    layouts.append(layout)
-                    input_names.append(inp.name)
-
-        if len(layouts) <= 1:
-            continue
-
-        op_name = _get_op_name(op)
-
-        # Check ElementArrangement compatibility
-        stl_eas = [layout.element_arrangement for layout in layouts]
-
-        # Skip ops with special ElementArrangement e.g. layernormnorm/scale with ElementArrangement.EXX2
-        skip_ops = {"layernormnorm", "layernormscale"}
-        skip_eas = {ElementArrangement.EXX2}
-        if op_name in skip_ops and any(ea in skip_eas for ea in stl_eas):
-            continue
-
-        # Valid EA patterns (see is_ea_compatible):
-        # 1. All operands share one EA.
-        # 2. Exactly one distinct non-STANDARD EA (not EXX2) mixed with STANDARD
-        #    operands (the broadcast pattern).
-        if not is_ea_compatible(stl_eas):
-            args_str = ", ".join(
-                f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)
-            )
-            raise Unsupported(
-                f"Incompatible ElementArrangement in multi-arg op. "
-                f"Valid patterns: all inputs share one EA, or one non-STANDARD EA "
-                f"broadcast against STANDARD inputs. "
-                f"op: {op_name}, args: {args_str}"
-            )
 
 
 def _validate_split_supported(op, trace, intermediate_ops) -> None:
@@ -894,9 +814,7 @@ def split_multi_ops(graph: GraphLowering):
         dtype_map = _propagate_dtypes(trace, layout.dtype)
         bufname_map = _init_vid_to_bufname(trace)
 
-        try:
-            insert_idx = operations.index(op)
-        except ValueError:
+        if op not in operations:
             continue
 
         # Skip if no FX graph origin node in the current (sub)graph. A buffer
@@ -948,7 +866,7 @@ def split_multi_ops(graph: GraphLowering):
             bufname_map,
             layout,
             operations,
-            insert_idx,
+            op,
             gl,
             orig_node,
             op,

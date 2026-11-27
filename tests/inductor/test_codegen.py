@@ -53,6 +53,7 @@ from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from utils_inductor import mock_backend_compiler
+from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
     _effective_size,
@@ -171,14 +172,19 @@ class TestSpyreConfig(InductorTestCase):
         s0 = sympy.Symbol("s0", integer=True, positive=True)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with patch(
-                "torch_spyre._inductor.pass_utils.V",
-                self._mock_v(lower=sympy.Integer(2), upper=sympy.Integer(512)),
+            with (
+                patch(
+                    "torch_spyre._inductor.pass_utils.V",
+                    self._mock_v(lower=sympy.Integer(2), upper=sympy.Integer(512)),
+                ),
+                # Pinned at the old default: the test checks the divisor pick,
+                # not the current max_buckets default.
+                config.patch(max_buckets=32),
             ):
                 result = _collect_symbol_metadata({s0: s0})
         # max comes straight from the ShapeEnv upper bound;
         # granularity is the smallest divisor of 512 with d >= 4 and
-        # 512/d <= 32, which is 16.
+        # 512/d <= 32 (the pinned cap), which is 16.
         self.assertEqual(result, {s0: (512, 16)})
 
     def test_collect_symbol_metadata_auto_dynamic_skipped(self):
@@ -1452,3 +1458,136 @@ class TestMatmulReuseDims(InductorTestCase):
             "expected x's SDSCArgs to include a reuse dim (scale == -1) for "
             "the broadcast batch dim E",
         )
+
+
+class TestMatmulCoordinateMask(InductorTestCase):
+    """A matmul masks the pure-padding lanes of one padded dim with 0.
+
+    The masked dim is N (iterated by the output and the kernel but not the
+    activation) or, failing that, K (iterated by both inputs but not the
+    output). The mask covers the lanes past the dim's logical extent.
+    """
+
+    def _compiled_matmul_specs(self, fn, *inputs) -> list:
+        captured = []
+        real_parse_op_spec = superdsc.parse_op_spec
+
+        def _spy(*args, **kwargs):
+            result = real_parse_op_spec(*args, **kwargs)
+            captured.append(result[0])
+            return result
+
+        with (
+            patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
+            patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
+            mock_backend_compiler(),
+            patch.object(superdsc, "parse_op_spec", side_effect=_spy),
+        ):
+            run_and_get_code(torch.compile(fn), *(t.to("spyre") for t in inputs))
+        specs = [s for s in captured if s.opfunc == "batchmatmul"]
+        self.assertTrue(specs, "no batchmatmul SDSC generated")
+        return specs
+
+    def _assert_masks_columns(self, spec, n: int, padded_n: int):
+        (dim,) = spec.coordinate_masking
+        self.assertEqual(str(dim), "out")
+        self.assertEqual(spec.iteration_space[dim], padded_n)
+        self.assertEqual(spec.coordinate_masking[dim], [[n, padded_n - n]])
+        constants = list(spec.constants)
+        self.assertEqual(constants[spec.masking_const_id], "samv-maskvalue")
+        self.assertEqual(spec.constants["samv-maskvalue"], 0.0)
+
+    def test_unaligned_n_is_masked(self):
+        x = torch.randn(64, 128, dtype=torch.float16)
+        w = torch.randn(128, 100, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            self._assert_masks_columns(spec, 100, 128)
+
+    def test_batched_unaligned_n_and_k_masks_only_n(self):
+        # The backend masks one dim at a time; N wins over K.
+        x = torch.randn(3, 64, 100, dtype=torch.float16)
+        w = torch.randn(3, 100, 100, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            self._assert_masks_columns(spec, 100, 128)
+
+    def test_unaligned_k_is_masked(self):
+        # The activation's K padding lanes hold whatever its producer left
+        # there; against the kernel's zero-padded K rows, inf * 0 = NaN.
+        x = torch.randn(64, 32, dtype=torch.float16)
+        w = torch.randn(32, 64, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            (dim,) = spec.coordinate_masking
+            self.assertEqual(str(dim), "in")
+            self.assertEqual(spec.iteration_space[dim], 64)
+            self.assertEqual(spec.coordinate_masking[dim], [[32, 32]])
+            self.assertEqual(spec.constants["samv-maskvalue"], 0.0)
+
+    def test_aligned_n_is_not_masked(self):
+        x = torch.randn(64, 128, dtype=torch.float16)
+        w = torch.randn(128, 128, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            self.assertEqual(spec.coordinate_masking, {})
+            self.assertEqual(spec.masking_const_id, -1)
+
+    def test_symbolic_n_is_not_masked(self):
+        # The iteration space holds a symbolic dim's maximum, so a mask built
+        # from it would not match the runtime extent.
+        mb, n, k = sympy.symbols("mb out in")
+        args = [
+            SimpleNamespace(scales={mb: 1, k: 1}),
+            SimpleNamespace(scales={k: 1, n: 1}),
+            SimpleNamespace(scales={mb: 1, n: 1}),
+        ]
+        it_space = {mb: 64, n: 128, k: 128}
+        mask = superdsc._get_coordinate_mask(
+            it_space, args[-1], {n: 28}, "batchmatmul", args[:-1]
+        )
+        self.assertEqual(mask, {n: [[100, 28]]})
+        mask = superdsc._get_coordinate_mask(
+            it_space,
+            args[-1],
+            {n: 28},
+            "batchmatmul",
+            args[:-1],
+            symbolic_dim_names={"out"},
+        )
+        self.assertEqual(mask, {})
+
+
+class TestStaggeredFp32Consumer(InductorTestCase):
+    """An op that keeps the staggered arrangement iterates the whole stick pair.
+
+    A widened FP32 value spans a pair of FP32 sticks per FP16 stick, so an op
+    whose operands both carry the arrangement covers both sticks of the pair.
+    """
+
+    def test_staggered_output_covers_the_stick_pair(self):
+        row, lane = sympy.symbols("c0 c1")
+        coords = [sympy.floor(lane / 32), row, sympy.Mod(lane, 32)]
+        iteration_space = {row: (sympy.Integer(4), 1), lane: (sympy.Integer(32), 1)}
+        spec = OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=is_input,
+                    arg_index=arg_index,
+                    device_dtype=DataFormats.IEEE_FP32,
+                    device_size=[2, 4, 32],
+                    device_coordinates=coords,
+                    allocation={"hbm": address},
+                    element_arrangement=ElementArrangement.DL16_TO_FP32,
+                    stride_map=[32, 64, 1],
+                )
+                for arg_index, (is_input, address) in enumerate(
+                    [(True, 0), (False, 0x100000)]
+                )
+            ],
+            op_info={},
+        )
+        simplify_op_spec(spec)
+        sdsc_spec, _ = parse_op_spec(spec)
+        sizes = sorted(int(size) for size in sdsc_spec.iteration_space.values())
+        self.assertEqual(sizes, [4, 64])

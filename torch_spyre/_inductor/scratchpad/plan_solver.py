@@ -771,8 +771,8 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     data: a resident copy needs its source resident under a priced division, a
     consumer reads the copy only under a division pair its candidates list, and
     a resident copy must serve at least one consumer (``CpSatLayoutSolver``
-    carries the CP-SAT encoding; the annealer does not decide relayouts yet and
-    is never handed a copy, see ``CoOptimizingAllocator``).
+    carries the CP-SAT encoding; ``SaCoOptimizingSolver`` keeps the division
+    half as eligibility and the placement half after packing).
 
     ``size`` is the destination's per-core span (the candidates'
     ``destination_footprint_bytes``, the bound the committed path reserves for
@@ -893,7 +893,12 @@ def build_relayout_copy(
         name=relayout_copy_name(parent.name, group),
         size=spans.pop() * num_cores,
         uses=sorted({consumer_ticks[c.consumer] for c in ordered}),
-        core_divisions=[CoreDivision(splits={"relayout_copy": num_cores})],
+        # A copy has no reduction axis.
+        core_divisions=[
+            CoreDivision(
+                splits={"relayout_copy": num_cores}, reduction_syms=frozenset()
+            )
+        ],
         relayout_parent=parent.name,
         group=group,
         candidates=ordered,

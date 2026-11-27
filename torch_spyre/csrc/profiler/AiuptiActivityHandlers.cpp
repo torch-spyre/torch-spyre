@@ -523,7 +523,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
                               ? "estimated (host completion, 1 ns/tick)"
                               : "calibrated");
   kernel_activity->id = activity->correlation_id;
-  kernel_activity->device = activity->device_id;
+  kernel_activity->device = activity->device_index;
   kernel_activity->resource = activity->stream_id;
   kernel_activity->threadId = activity->stream_id;
   kernel_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
@@ -599,7 +599,7 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
   uint32_t overlap_offset = 0;
   uint32_t base_resource_id = getBaseResourceId(activity);
   const auto it =
-      activeThreadMap_.find({activity->device_id, base_resource_id});
+      activeThreadMap_.find({activity->device_index, base_resource_id});
   if (it != activeThreadMap_.end()) {
     std::vector<int64_t>& last_active_times = (*it).second;
     bool found_useable_thread = false;
@@ -615,10 +615,11 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
       last_active_times.push_back(activity->end);
       overlap_offset = last_active_times.size() - 1;
     }
-    activeThreadMap_[{activity->device_id, base_resource_id}][overlap_offset] =
-        activity->end;
+    activeThreadMap_[{activity->device_index, base_resource_id}]
+                    [overlap_offset] = activity->end;
   } else {
-    activeThreadMap_[{activity->device_id, base_resource_id}] = {activity->end};
+    activeThreadMap_[{activity->device_index, base_resource_id}] = {
+        activity->end};
   }
   return base_resource_id + overlap_offset;
 }
@@ -647,7 +648,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
                               ? "estimated (host completion, 1 ns/tick)"
                               : "calibrated");
   memcpy_activity->id = activity->correlation_id;
-  memcpy_activity->device = activity->device_id;
+  memcpy_activity->device = activity->device_index;
   memcpy_activity->resource = getResourceId(activity);
   memcpy_activity->threadId = activity->stream_id;
   memcpy_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
@@ -717,7 +718,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     // Memory management uses host timestamps, not calibrated device ticks.
     mem_activity->addMetadataQuoted("timestamp_source", "host");
     mem_activity->id = activity->correlation_id;
-    mem_activity->device = activity->device_id;
+    mem_activity->device = activity->device_index;
     mem_activity->resource = getResourceId(activity);
     mem_activity->threadId = activity->stream_id;
     mem_activity->flow.id = 0;
@@ -771,7 +772,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
   memory_event->addMetadata("Total Allocated", totalAllocatedBytes_);
   memory_event->addMetadata("Bytes", bytes);
   memory_event->addMetadata("Addr", activity->address);
-  memory_event->addMetadata("Device Id", activity->device_id);
+  memory_event->addMetadata("Device Id", activity->device_index);
   memory_event->addMetadata("Device Type", 1);
 
   memory_event->log(*logger);
@@ -792,7 +793,7 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   // Libaiupti represents host-timed allocations as MEMSET records.
   memset_activity->addMetadataQuoted("timestamp_source", "host");
   memset_activity->id = activity->correlation_id;
-  memset_activity->device = activity->device_id;
+  memset_activity->device = activity->device_index;
   // TODO(mcalman): investigate why memset activities are being processed out
   // of order This prevents us from using getResourceId which handles overlap
   memset_activity->resource = getBaseResourceId(activity);

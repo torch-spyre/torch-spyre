@@ -202,9 +202,10 @@ contracted dimension of the input. External kernels, which include custom ops an
 receive a safe default tiled layout.
 
 **Core work division** also runs on the LoopLevel IR, after layout propagation. Two passes
-cooperate. `span_reduction()` identifies which iteration dimensions can be parallelized across
-cores and how the span of each reduction partitions. `work_distribution()` then assigns those
-spans to the 32 cores and embeds the plan into the IR for codegen to consume.
+cooperate. `cost_model_matmul_division()` picks the split of matmuls from a cost model, and
+`work_distribution()` assigns the iteration dimensions of every other op to the 32 cores. Both
+start from the op's span floors, the minimum splits that keep each core's memory span within
+the hardware limit, and embed the plan into the IR for codegen to consume.
 
 One caveat is worth mentioning. The scheduler pass hooks are underscore-prefixed private APIs.
 They have been stable for us, but they can change between PyTorch releases without notice. We
@@ -322,8 +323,9 @@ Three components cooperate to produce a SuperDSC artifact for each scheduled nod
 
 Two passes run after layout propagation, and together they handle one of the decisions that
 differs most from a GPU. That decision is the static partitioning of work across all 32 cores
-at compile time. `span_reduction()` analyzes the iteration space of each reduction and determines
-how its span can be split. `work_distribution()` then assigns those spans to cores.
+at compile time. `cost_model_matmul_division()` prices matmul splits with a cost model, and
+`work_distribution()` assigns the iteration dimensions of every other op to cores. Both start
+from the op's span floors (`span_floors()`), which they compute when they choose the split.
 
 The algorithm does four things. It identifies which iteration dimensions can be parallelized
 across cores. It uses a two-pass approach that first satisfies the minimum splits required per
@@ -633,7 +635,7 @@ scalar to a size-1 constant tensor. This runs at the LoopLevelIR level in
 `dedup_and_promote_constants`, which also deduplicates identical constants so they share one
 device buffer.
 
-**CPU fallbacks** cover the long tail. The current set is `arange`, `cumsum`, `repeat`,
+**CPU fallbacks** cover the long tail. The current set is `arange`, `repeat`,
 `tril`, `isin`, `where`, `index_copy`, `any`, `normal_`, `random_`, `argmax`,
 `argmin`, `bitwise_or`, `bitwise_xor`, and the int64 variants of `max` and `min`. The runtime
 automatically transfers data to the CPU, executes the op, and returns the result to Spyre. This
@@ -720,7 +722,8 @@ in proof-of-concept form. See [Scratchpad planning](../compiler/scratchpad_plann
 **Distributed inference.** The `spyreccl` torch.distributed backend is implemented under
 `csrc/distributed/`. Synchronous `send`, `recv`, `broadcast`, `barrier`, `gather`, `allgather`,
 `reduce`, and `allreduce` work today. The remaining work is async support and the missing
-collectives (`scatter`, `reduce_scatter`, `alltoall`). See
+collectives (`scatter`, `reduce_scatter`, `alltoall`) in the eager process group;
+compiled graphs already lower `reduce_scatter_tensor` to spyre-comms. See
 [Runtime — Multi-card and distributed execution](../runtime/index.md).
 
 **Profiling.** The `SpyreActivityProfiler` Kineto bridge for `ProfilerActivity.PrivateUse1`
@@ -787,7 +790,7 @@ module. `flex::RuntimeContext::create()` starts only on the first device use.
 |---|---|---|---|
 | `FixedTiledLayout` | `inductor.ir.FixedLayout` (subclass) | Bridges the PyTorch stride model and Spyre tiled memory | Carries a `SpyreTensorLayout` descriptor with tiled device shape, dimension mapping (stick dims appear twice, once as tile index and once as intra-stick offset), stride mapping, and 128-byte padding |
 | `propagate_spyre_tensor_layouts()` | `CustomPreSchedulingPasses` (runs before `Scheduler` construction through a `GraphLowering._update_scheduler` monkey-patch) | Converts `FixedLayout` to `FixedTiledLayout` across the operation graph | Topological traversal of IR operations. Pointwise ops inherit the input layout. Matmul and reduction require special handling for the contracted output dimension. External kernels use a generic stick format. |
-| `span_reduction()` and `work_distribution()` | `CustomPreSchedulingPasses` (run after `propagate_spyre_tensor_layouts` in the same pre-scheduling pass) | Partitions iteration dimensions across 32 cores at compile time | Constrained by `SENCORES=32`. `span_reduction` determines how the span of each reduction can be split. `work_distribution` assigns spans to cores. Each core receives an equal number of sticks. Enforces the per-core addressable device memory limit (a hardware constraint that is distinct from the 2 MB LX SRAM scratchpad). Two-pass algorithm: minimum splits first, then remaining cores by priority. |
+| `cost_model_matmul_division()` and `work_distribution()` | `CustomPreSchedulingPasses` (run after `propagate_spyre_tensor_layouts` in the same pre-scheduling pass) | Partitions iteration dimensions across 32 cores at compile time | Constrained by `SENCORES=32`. Every split meets the op's span floors (`span_floors()`), computed when the split is chosen. `cost_model_matmul_division` picks matmul splits, and `work_distribution` assigns the rest. Each core receives an equal number of sticks. Enforces the per-core addressable device memory limit (a hardware constraint that is distinct from the 2 MB LX SRAM scratchpad). Two-pass algorithm: minimum splits first, then remaining cores by priority. |
 
 *Why the scheduler phase.* Tiled layouts must be resolved before codegen because they are
 needed for memory planning and core work division. Propagating through Dynamo and FakeTensor
@@ -810,7 +813,7 @@ would require invasive core changes. Deferring to codegen is too late.
 | Native ops (Deeptools-supported) | Direct mapping to OpFuncs | Pointwise and matrix ops supported natively by the hardware | Pointwise: `add`, `sub`, `mul`, `truediv`, `relu`, `sigmoid`, `abs`, `neg`, `exp`, `log`, `sqrt`, `rsqrt`, `reciprocal`, `tanh`, `floor`, `eq`, `ne`, `ge`, `le`, `lt`, `gt`, `square`, `where`, `logical_and`, `to_dtype`, plus lowered forms of `clamp`/`gelu`/`softplus`/`layernormscale`/`layernormnorm`. Matrix: `mm`, `bmm` (`matmul` is decomposed to these by Inductor upstream). Matrix ops need custom layout propagation for the contracted dimension, but both kinds map to single SDSCs. |
 | `torch.library.custom_op` | Custom op registration | Layer 3 normalization, activation, quantization, and ops that need a single named lowering target | Each op requires `@register_fake` for shape/dtype inference during tracing, plus a lowering rule mapping to Spyre primitives. User-facing ops: `spyre::rms_norm`, `spyre::layer_norm`, `spyre::gelu`, `spyre::silu`, `spyre::softplus`, `spyre::clamp`, `spyre::topkvalue`, `spyre::topkindex`, `spyre::logical_not`, `spyre::constant`. FP8 quantization: `spyre::qfp8ch`, `spyre::qfp8wt` (E4M3 format conversion), and `spyre::scaled_mm` (the raw 2D FP8 matmul that `torch._scaled_mm` decomposes onto). Infrastructure ops: `spyre::restickify`, `spyre::overwrite` / `spyre::overwrite_f`, `spyre::copy_from_d2d`. |
 | Decompositions | Registered in `enable_spyre_context()` | Layer 4 ops not natively available | `logical_not` → `eq(input, ne(input, input))` (bool), `addmm` → `matmul+scale+add`, `linear` → `matmul+add` (with weight transpose), `rms_norm` → `spyre::rms_norm`, `layer_norm` → `spyre::layer_norm`, `gelu` → `spyre::gelu`, `softplus` → `spyre::softplus`, `topk` → `spyre::topkvalue`/`spyre::topkindex`, `max.dim` → split value/index decomp, `scaled_dot_product_attention` → explicit Q·K^T·V, `cat`, `constant_pad_nd`, `ones`/`new_ones` → `full`, `bitwise_not`, `bitwise_and`, `cos`/`sin` → Cody-Waite range reduction plus a degree-9 Taylor polynomial (`floor`, `mul`, `add`, `sub` only), `flip` → `index_select` with a descending index (reversing the last stick dimension raises), `masked_scatter` → whole-row gather (the mask must broadcast along the last dimension). `torch._scaled_mm` decomposes to `spyre::scaled_mm` (the raw FP8 matmul) followed by the `scale_a` and `scale_b` multiplies and the `bias` add. |
-| CPU fallback (auto-transfer) | PyTorch fallback dispatch | Infrequent ops that are off the critical path | `arange`, `cumsum`, `repeat`, `tril`, `isin`, `where`, `index_copy`, `any`, `normal_`, `random_`, `argmax`, `argmin`, `bitwise_or`, `bitwise_xor`, int64 variants of `max` and `min`. Data auto-transfers to the CPU, executes, and returns to Spyre. Transparent to the model. |
+| CPU fallback (auto-transfer) | PyTorch fallback dispatch | Infrequent ops that are off the critical path | `arange`, `repeat`, `tril`, `isin`, `where`, `index_copy`, `any`, `normal_`, `random_`, `argmax`, `argmin`, `bitwise_or`, `bitwise_xor`, int64 variants of `max` and `min`. Data auto-transfers to the CPU, executes, and returns to Spyre. Transparent to the model. |
 
 ### Profiling
 

@@ -98,7 +98,7 @@ def _ops(feats_list, monkeypatch, loop_infos=None):
     monkeypatch.setattr(cmp, "ComputedBuffer", OpFeatures)
     for f, li in zip(feats_list, loop_infos or [None] * len(feats_list)):
         if li is not None:
-            f.loop_info = li
+            f.loop_member = li
     return feats_list
 
 
@@ -169,7 +169,7 @@ def test_loop_ids_are_recorded_for_labelling(monkeypatch):
     group = cmp.build_report(ops).groups[0]
     assert group.loop_group_ids == [(0,)]
     assert group.has_loop
-    assert group.loop_trip == 1  # loop_trip comes from OpFeatures, not loop_info
+    assert group.loop_trip == 1  # loop_trip comes from OpFeatures, not loop_member
 
 
 def test_a_malformed_loop_id_does_not_raise(monkeypatch):
@@ -670,7 +670,8 @@ def test_a_broken_attribution_keeps_the_price(monkeypatch):
 def test_ops_that_run_different_numbers_of_times_are_grouped_apart(monkeypatch):
     """A coarse_tile_fill sits OUTSIDE the loop and runs once beside ops that do not.
 
-    coarse_tiling_loops.md: the fill op is inserted "outside the loop, no loop_info".
+    The fill writes the identity once, before the loop, and is in no loop
+    (``_insert_fill`` in ``wsr/loop_tiling_lowering.py``).
     A kernel therefore has no single iteration count, so the count is stated per loop
     rather than in one column beside every op in the kernel.
     """

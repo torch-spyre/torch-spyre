@@ -1,0 +1,90 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# A non-AI system on the same engine: pgbench against PostgreSQL 16, default vs tuned settings.
+# The pg pack is not built in: validate with  spyre-bench validate examples/postgres-demo --pack examples/packs/postgres-example
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: pg-perf, owner: example-team}
+spec:
+  packs: [{name: postgres-example, version: "0.2"}]
+  default_suites: [oltp]
+  default_environment: pg-oltp-host
+  visibility: internal
+  series_labels: [env.label.node.class, env.label.storage.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: oltp}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: db-metal-nvme}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/instance-type: type-a}}
+  host_profile: {governor: performance, thp: never}
+  qualification: {expiry_days: 30, probe: repeat-probe, cv_limit_pct: 3.0, checks: [host_profile]}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: pg-oltp-host, description: "CPU sockets and local NVMe are devices like any other"}
+spec:
+  devices:
+    requests:
+      - {name: cpus, device_class: cpu/socket, count: 2, selectors: [{attribute: cpu.arch, eq: x86_64}]}
+      - {name: data, device_class: storage/nvme, count: 1, selectors: [{attribute: storage.min_iops, gte: 500000}]}
+  host: {node_class: db-metal-nvme, arch: x86_64, reference_node: true, exclusive: true, resources: {memory: 256Gi}}
+  labels: {node.class: db-metal-nvme, storage.class: nvme-local}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: pgbench-data-sf100, description: "pgbench -i at scale 100: a pure function of its parameters"}
+spec:
+  type: generator
+  version: "1"
+  license: PostgreSQL
+  visibility: public
+  source: {generator: {tool: pgbench-init, seed: 0, params: {scale: 100}}}
+---
+apiVersion: bench/v1alpha1
+kind: ValidityPolicy
+metadata: {name: pg-default, owner: example-team, description: "same purposes, same gates"}
+spec:
+  purposes:
+    pr:
+      description: "ordinary CI on shared nodes: usable for a PR check, never a baseline"
+      floor: shared_env
+      requires: {qualification: any, clean: any, min_repeats: 1, max_cv_pct: 10, discard_warmup: 1, placement: optional}
+      baseline: false
+      reference: false
+    investigate:
+      floor: suspect
+      requires: {qualification: any, clean: any, min_repeats: 1, discard_warmup: 0, placement: optional}
+      baseline: false
+      reference: false
+    nightly:
+      floor: shared_env
+      requires: {qualification: current, clean: any, min_repeats: 3, max_cv_pct: 5, discard_warmup: 1, placement: required}
+      baseline: true
+      reference: false
+    weekly:
+      floor: shared_env
+      requires: {qualification: current, clean: any, min_repeats: 5, max_cv_pct: 5, discard_warmup: 1, placement: required}
+      baseline: true
+      reference: false
+    release:
+      floor: valid
+      requires: {qualification: current, clean: clean, min_repeats: 5, max_cv_pct: 3, discard_warmup: 1, placement: required}
+      baseline: true
+      reference: true
+    reference:
+      floor: valid
+      requires: {qualification: current, clean: enforced, min_repeats: 5, max_cv_pct: 2, discard_warmup: 2, placement: required}
+      baseline: true
+      reference: true
+    qualification:
+      description: "A/A probe runs that create qualification rows; they cannot require what they establish"
+      floor: unqualified_env
+      requires: {qualification: any, clean: clean, min_repeats: 5, max_cv_pct: 2, discard_warmup: 2, placement: required}
+      baseline: false
+      reference: false

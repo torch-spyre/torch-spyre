@@ -41,6 +41,13 @@ if TYPE_CHECKING:
 
 DEVICE = torch.device("spyre")
 
+try:
+    from ortools.sat.python import cp_model as _cp_model  # noqa: F401
+
+    HAS_ORTOOLS = True
+except ImportError:
+    HAS_ORTOOLS = False
+
 
 def _make_generator(*args) -> torch.Generator:
     """Return a seeded Generator whose seed is a stable hash of ``args``.
@@ -88,6 +95,23 @@ def cached_randn(
     gen = _make_generator(shape, differentiation, abs, dtype, scale)
     out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
+
+
+@functools.lru_cache(maxsize=None)
+def cached_randint(
+    shape,
+    differentiation=None,
+    low=0,
+    high=512,
+    dtype=torch.int32,
+):
+    """Return a cached integer tensor with the given shape and dtype.
+
+    Uses a stable seed derived from the arguments so results are identical
+    across processes regardless of PYTHONHASHSEED.
+    """
+    gen = _make_generator(shape, differentiation, low, high, dtype)
+    return torch.randint(low, high, shape, dtype=dtype, generator=gen)
 
 
 @functools.lru_cache(maxsize=None)
@@ -817,7 +841,7 @@ def _compile_and_run(
     if compile:
         comp_func = torch.compile(fn, backend=backend)
 
-        if source_check is not None and device == "spyre":
+        if source_check is not None and device.type == "spyre":
             result, source_codes = run_and_get_code(
                 comp_func, *device_args, **device_kwargs
             )
@@ -1277,3 +1301,26 @@ class patch_tiling_helper:
 
     def __exit__(self, *exc_info: Any) -> None:
         self.stop()
+
+
+def loop_member_view(op):
+    """The loop facts of ``op`` as a ``LoopMember``, read from the nodes around it
+    (``enclosing_loops``), or ``None`` for an op in no loop.
+
+    The lowering's ``op.loop_member`` is spent when the nodes are built (stage
+    9.4.3), so a test that inspects an op after the pipeline asks the nodes."""
+    from torch_spyre._inductor.loop_facts import enclosing_loops, strict_loop_vars
+    from torch_spyre._inductor.loop_node import LoopMember
+
+    levels = enclosing_loops(op)
+    if not levels:
+        return None
+    return LoopMember(
+        loop_group_id=levels[-1].group_path,
+        loop_count=[level.trip_count for level in levels],
+        loop_tiled_dims=[list(level.tiled_dims) for level in levels],
+        loop_tiled_reduction_dims=[
+            list(level.tiled_reduction_dims) for level in levels
+        ],
+        strict_loop_vars=strict_loop_vars(op),
+    )

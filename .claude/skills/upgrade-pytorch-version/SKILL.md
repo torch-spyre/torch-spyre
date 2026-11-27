@@ -563,13 +563,13 @@ After all changes:
      ```bash
      python -m pytest tests/inductor/test_loop_scheduler.py \
        tests/inductor/test_loop_scheduler_readers.py \
-       tests/inductor/test_loop_scheduler_review.py \
-       tests/inductor/test_loop_scheduler_equivalence.py -q
+       tests/inductor/test_loop_scheduler_review.py -q
      ```
-     `test_loop_scheduler_equivalence.py` is the gate: it compiles real loops
-     with the flow-through on and off and compares kernels, numerics and the
-     scheduler's structure. A numerics-only test cannot stand in for it: a loop
-     wrapped twice still matches a CPU reference for online softmax.
+     `test_loop_scheduler_review.py` is the gate: it compiles real loops on
+     the device and checks the scheduler's structure (the loop tree, the
+     once-run nodes, the work division) as well as the numerics against a CPU
+     reference. A numerics-only test cannot stand in for it: a loop wrapped
+     twice still matches a CPU reference for online softmax.
 
 7. **Run the full CI.** Local runs cover only a slice, and the local lower
    stack may differ from CI's. The fastest full signal is a draft PR.
@@ -668,6 +668,14 @@ After upgrading, watch for:
    `TestCopyFromD2DNestedCompile` in `test_copy_from_d2d_offsets.py` on supported
    patch releases; it exercises the private `_use_eager_on_nested_compile`
    context as well as the predicate.
+5b. **Compile phase timing** — `torch_spyre/_inductor/torch_phases.py`
+   wraps `ChromiumEventLogger.log_event_start` and `log_event_end` in
+   `torch/_dynamo/utils.py` with `*args`, so a change in their positional
+   order raises no error. Check that `event_name` is still the first
+   argument of both and `metadata` the third of `log_event_start` (the
+   wrapper reads `args[2]`). `tests/inductor/test_torch_phases.py` fails on
+   a renamed phase or on metadata that is no longer read, but only on a
+   runner that has the new torch.
 6. **Skipped-version accumulation** — If skipping versions, multiple breaking
    changes may compound. Consider reading PyTorch release notes for each
    skipped version to anticipate issues.

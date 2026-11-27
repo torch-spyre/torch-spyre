@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# References to credentials only, never values.
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: demo-store}
+spec:
+  type: core/artifactory
+  endpoint: {env: STORE_BASE_URL}
+  root: {env: STORE_DATA_PATH}
+  auth:
+    mode: token
+    refs: [{env: STORE_TOKEN}, {secret: store-token}]
+  visibility: internal
+  mirrors: [demo-cache]
+  resolve: [node-cache, mirrors, primary]
+---
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: demo-cache}
+spec: {type: core/filesystem, path: /datasets, auth: {mode: none}, visibility: internal}
+---
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: huggingface}
+spec:
+  type: core/hf
+  endpoint: {value: huggingface.co}
+  auth: {mode: token, optional: true, refs: [{env: HF_TOKEN}]}
+  visibility: public
+  resolve: [node-cache, primary]

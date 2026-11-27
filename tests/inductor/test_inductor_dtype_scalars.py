@@ -19,7 +19,13 @@ import pytest
 import torch
 import torch._dynamo as dynamo
 
-from utils_inductor import DEVICE, cached_randn, compare_with_cpu, strict_xfail
+from utils_inductor import (
+    DEVICE,
+    cached_randn,
+    compare_with_cpu,
+    expects_raise,
+    strict_xfail,
+)
 
 
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
@@ -397,7 +403,6 @@ class TestDatatypeScalarOperations:
         # For large numbers, atol must be large, but rtol is the real gate
         _compare_modes(execution_mode, large_scalar_mul, x, atol=1e25, rtol=1e-3)
 
-    @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_dtype_conversion_with_symbolic_dimensions(self, execution_mode):
         """
         Test dtype conversion with symbolic dimensions (dynamic shapes).
@@ -413,6 +418,9 @@ class TestDatatypeScalarOperations:
         Note: This test verifies the symbolic dimension fix works (no TypeError during
         compilation). Full numerical correctness testing is blocked by Issue #2185
         ("anywhere valid" coordinate bug in dtype conversions causing data corruption).
+
+        The dims are marked dynamic on the input tensor, because
+        ``torch.compile(dynamic=True)`` is refused on Spyre.
         """
         # Reset compilation cache to ensure clean state
         dynamo.reset()
@@ -433,9 +441,14 @@ class TestDatatypeScalarOperations:
             differentiation="symbolic_dim_fp16_to_fp32",
         )
 
+        # Make the sequence and hidden (stick) dims symbolic. The size-1 batch dim
+        # stays static: Dynamo always specializes sizes 0 and 1.
+        x_dev = x.to(DEVICE)
+        dynamo.mark_dynamic(x_dev, [1, 2])
+
         # Test that compilation succeeds without TypeError
         # (the bug we're fixing would cause: TypeError: cannot determine truth value of Relational)
-        result = _run_spyre(execution_mode, convert_fp16_to_fp32, x)
+        result = _run_spyre(execution_mode, convert_fp16_to_fp32, x_dev)
 
         # Verify basic properties (shape, dtype, device)
         assert result.shape == x.shape, f"Shape mismatch: {result.shape} != {x.shape}"
@@ -530,7 +543,7 @@ class TestNegativeScalarOperations:
             return x / 0.0
 
         x = cached_randn((10, 10))
-        # Checked on the host: the device has no aten::index kernel (#1219).
+        # Checked on the host: the device has no boolean-mask index kernel (#1219).
         result = _run_spyre(execution_mode, div_zero, x).cpu()
         non_zero_mask = x.abs() > 1e-6
         if non_zero_mask.any():
@@ -562,8 +575,8 @@ class TestNegativeScalarOperations:
             strict_xfail(
                 request,
                 NotImplementedError,
-                "the test indexes the device result with a mask, which needs "
-                "aten::index.Tensor_out (#1219)",
+                "the test indexes the device result with a boolean mask; the Spyre "
+                "aten::index.Tensor kernel supports only a 1-D integer index (#1219)",
             )
         elif expected_behavior == "all_neg_inf":
             strict_xfail(
@@ -678,6 +691,7 @@ class TestNegativeScalarOperations:
         result = _run_spyre(execution_mode, int_float_add, x)
         assert result.dtype in (torch.float32, torch.float64)
 
+    @expects_raise
     def test_bool_tensor_scalar_multiply(self, execution_mode):
         """Bool tensor * float scalar."""
 
@@ -685,11 +699,9 @@ class TestNegativeScalarOperations:
             return x * 2.0
 
         x = torch.tensor([[True, False], [False, True]], device=DEVICE)
-        result = _run_spyre(execution_mode, bool_mul, x)
-        assert result.dtype in (torch.float32, torch.float64, torch.int64)
-        expected = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
-        # Compared on the host: the device has no kernel for allclose.
-        assert torch.allclose(result.cpu().float(), expected)
+        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
+            result = _run_spyre(execution_mode, bool_mul, x)
+            result.cpu()
 
     # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1588
     @pytest.mark.skip(

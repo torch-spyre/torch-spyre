@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import torch
+from torch.utils import _pytree as pytree
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
-from .fallbacks import _get_op_overloads
+from .fallbacks import _get_op_overloads, warn_fallback
 from .warning_types import RetileWarning
 import warnings
+import collections
 import contextlib
 import functools
 import inspect
@@ -93,6 +95,152 @@ def _guard_reentry(op):
         active.discard(op)
 
 
+# Attributes dynamo reads off a tensor to decide that a dim must be symbolic
+# (``mark_dynamic``, ``maybe_mark_dynamic``, ``mark_unbacked``, and
+# ``_dynamo_dynamic_range`` which carries the bounds for ``mark_dynamic``).
+# These are private torch names: ``test_mark_attributes_are_all_known`` fails
+# if a torch upgrade adds or renames one. ``detach()`` drops every Python
+# attribute of a tensor, not only these, so the twin is unmarked whatever the
+# list holds; the list only decides which tensors get a twin.
+_DYNAMO_DYNAMIC_MARKS = (
+    "_dynamo_dynamic_indices",
+    "_dynamo_dynamic_range",
+    "_dynamo_weak_dynamic_indices",
+    "_dynamo_unbacked_indices",
+    "_dynamo_strict_unbacked_indices",
+)
+
+
+def _has_dynamo_marks(t):
+    # The marks are plain instance attributes, so one ``__dict__`` read replaces
+    # five ``getattr`` calls; most tensors have an empty one.
+    attrs = t.__dict__
+    return bool(attrs) and any(attrs.get(name) for name in _DYNAMO_DYNAMIC_MARKS)
+
+
+def _any_marked(values):
+    """Whether any tensor in ``values`` carries a mark, looking inside lists,
+    tuples and dicts, which is every container an op's arguments use. This runs
+    on every eager op, so it avoids a pytree flatten; ``_strip_dynamo_marks``
+    uses pytree and so sees a superset of what this finds.
+    """
+    for v in values:
+        if isinstance(v, torch.Tensor):
+            if _has_dynamo_marks(v):
+                return True
+        elif isinstance(v, (list, tuple)):
+            if _any_marked(v):
+                return True
+        elif isinstance(v, dict):
+            if _any_marked(v.values()):
+                return True
+    return False
+
+
+def _strip_dynamo_marks(args, kwargs):
+    """Replace every tensor carrying a dynamo dynamic-dim mark by a ``detach()``.
+
+    The marks are plain Python attributes on one tensor object, and ``detach()``
+    returns a new object that shares storage and layout but not those
+    attributes. Returns ``(args, kwargs, pairs)`` where ``pairs`` is a list of
+    ``(twin, original)``. ``_static_shape_call`` turns it into the
+    ``id(twin) -> original`` map ``_remap_result`` expects, so an op that
+    returns one of its arguments hands back the caller's own tensor. ``pairs``
+    keeps the twins alive until the result has been remapped, so their ids
+    cannot be reused in the meantime.
+    """
+    pairs = []
+
+    def strip(a):
+        if isinstance(a, torch.Tensor) and _has_dynamo_marks(a):
+            twin = a.detach()
+            pairs.append((twin, a))
+            return twin
+        return a
+
+    return pytree.tree_map(strip, args), pytree.tree_map(strip, kwargs), pairs
+
+
+def _metadata(t):
+    return (tuple(t.shape), tuple(t.stride()), t.storage_offset())
+
+
+def _static_shape_call(compiled, *, autograd_handled=True):
+    """Wrap a ``dynamic=False`` compiled kernel so it never sees dynamic marks.
+
+    A tensor declared with ``.to("spyre", dynamic=...)`` carries ``mark_dynamic``,
+    a promise that its dim stays symbolic. ``dynamic=False`` kernels must
+    specialise on the concrete size (a symbolic one is not yet correct, see
+    #3826), and specialising a marked dim makes dynamo raise
+    ``ConstraintViolationError`` (#6030). The promise is about the caller's
+    ``torch.compile`` code, not about this internal kernel, so the kernel gets
+    unmarked twins and the caller's tensors, marks intact, are returned.
+
+    Stripping the marks, rather than telling dynamo to ignore a violated one
+    (``allow_ignore_mark_dynamic``), is deliberate: that knob only silences the
+    error, and a kernel that does not itself specialise the marked dim (``add``,
+    ``gelu``) would still see a symbolic dim the Spyre lowering rejects.
+
+    The twin shares storage, so a write to the data reaches the caller's tensor.
+    A change to its metadata (size, strides, offset, e.g. an ``out=`` that the
+    kernel resizes) would not, so that case raises instead of silently leaving
+    the caller's tensor stale. The kernel has already written its data by then,
+    as with any op that fails part-way.
+
+    ``detach()`` also cuts autograd history. ``autograd_handled`` says whether
+    an autograd kernel above this one has already recorded the op, which is the
+    case for the ``compile_once`` kernels. ``_OPWrapper`` ops have no autograd
+    kernel above them (they fall through, and ``torch.compile`` derives the
+    gradient from the inputs), so a twin would silently return a result with no
+    ``grad_fn``. With ``autograd_handled=False`` a marked tensor that requires
+    grad raises instead.
+    """
+
+    @functools.wraps(compiled)
+    def call(*args, **kwargs):
+        # Common case, nothing marked: a cheap scan, no rebuild of the args.
+        if not (_any_marked(args) or _any_marked(kwargs.values())):
+            return compiled(*args, **kwargs)
+        args, kwargs, pairs = _strip_dynamo_marks(args, kwargs)
+        if (
+            not autograd_handled
+            and torch.is_grad_enabled()
+            and any(original.requires_grad for _, original in pairs)
+        ):
+            raise RuntimeError(
+                "A tensor marked dynamic (mark_dynamic, e.g. through "
+                ".to('spyre', dynamic=...)) requires grad, and this eager op "
+                "cannot track gradients through it. Run it under "
+                "torch.no_grad() or on a tensor that is not marked."
+            )
+        result = compiled(*args, **kwargs)
+        for twin, original in pairs:
+            before, after = _metadata(original), _metadata(twin)
+            if before != after:
+                raise RuntimeError(
+                    "A Spyre eager kernel changed the size, strides or offset of a "
+                    "tensor marked dynamic (mark_dynamic, e.g. through "
+                    ".to('spyre', dynamic=...)): "
+                    f"(size, strides, offset) {before} -> {after}. The change "
+                    "cannot be applied to the caller's tensor (the kernel's data "
+                    "writes already have been); resize it with resize_() first."
+                )
+        return _remap_result(result, {id(t): o for t, o in pairs})
+
+    return call
+
+
+def _static_compile(fn, *, autograd_handled=True, **compile_kwargs):
+    """``torch.compile(fn, dynamic=False)`` for an eager kernel, wrapped so it
+    never sees dynamic marks (``_static_shape_call``). Use this for every
+    static-shape compile on the eager path, so a new one cannot forget the strip.
+    """
+    return _static_shape_call(
+        torch.compile(fn, dynamic=False, **compile_kwargs),
+        autograd_handled=autograd_handled,
+    )
+
+
 # Decorator to keep track of compiled variant
 def compile_once(op, **compile_kwargs):
     def decorator(fn):
@@ -105,7 +253,13 @@ def compile_once(op, **compile_kwargs):
             if compiled is None:
                 if isinstance(op, str):
                     op = operator.attrgetter(op)(torch.ops)
-                compiled = torch.compile(_op_frame(op), **compile_kwargs)
+                if compile_kwargs.get("dynamic") is False:
+                    static_kwargs = {
+                        k: v for k, v in compile_kwargs.items() if k != "dynamic"
+                    }
+                    compiled = _static_compile(_op_frame(op), **static_kwargs)
+                else:
+                    compiled = torch.compile(_op_frame(op), **compile_kwargs)
             with _guard_reentry(op):
                 return fn(*args, compiled=compiled, **kwargs)
 
@@ -155,6 +309,135 @@ def _materialize_offset_view(x):
         return x
     if isinstance(x, (list, tuple)):
         return type(x)(_materialize_offset_view(e) for e in x)
+    return x
+
+
+# Compiled view rebuilders by (base shape, base dtype, view geometry).  Bounded
+# like ``_layout_serves_view``: a workload with many shapes would otherwise keep
+# one compiled function per geometry forever.
+_VIEW_REBUILDER_CACHE_SIZE = 256
+_view_rebuilders: collections.OrderedDict = collections.OrderedDict()
+
+
+def _rebuild_view_on_device(x):
+    """Copy the Spyre view ``x`` into a fresh tensor with the canonical layout,
+    without leaving the device.
+
+    ``x.clone()``, ``copy_`` and ``contiguous()`` read the view through its base's
+    layout, which is the read that fails, so they cannot be used.  Compiling
+    ``base.as_strided(...)`` followed by a real pointwise op reads the BASE buffer,
+    as the compiled path does.  ``-(-t)`` flips the sign twice: it is exact in any
+    float format (``t * 2 * 0.5`` turns ``inf`` into ``nan`` on the device), and a
+    plain copy such as ``+ 0`` or ``* 1.0`` is folded away and fails like
+    ``clone()``.  ``bool`` has no ``neg``, so it uses ``logical_not`` twice.
+
+    One compiled function per geometry, each with its own code object so dynamo
+    gives it its own cache line (see ``_op_frame``).
+    """
+    base = x._base
+    size, stride, offset = tuple(x.shape), tuple(x.stride()), x.storage_offset()
+    key = (tuple(base.shape), base.dtype, size, stride, offset)
+    rebuild = _view_rebuilders.get(key)
+    if rebuild is not None:
+        _view_rebuilders.move_to_end(key)
+    else:
+        twice = torch.logical_not if x.dtype == torch.bool else torch.neg
+
+        def view_copy(b):
+            return twice(twice(b.as_strided(size, stride, offset)))
+
+        # Not a no-op: ``replace`` mints a distinct code object, so each geometry
+        # gets its own dynamo cache line and recompile budget instead of sharing
+        # one with every other ``view_copy`` closure (see ``_op_frame``). Keep it.
+        view_copy.__code__ = view_copy.__code__.replace(
+            co_varnames=view_copy.__code__.co_varnames
+        )
+        # ``base`` can be a tensor declared with ``.to("spyre", dynamic=...)``,
+        # which carries ``mark_dynamic``; this kernel is ``dynamic=False`` (#6030).
+        rebuild = _static_compile(view_copy)
+        _view_rebuilders[key] = rebuild
+        if len(_view_rebuilders) > _VIEW_REBUILDER_CACHE_SIZE:
+            _view_rebuilders.popitem(last=False)
+    return rebuild(base)
+
+
+def _layout_serves_own_view(x) -> bool:
+    """Whether ``x``'s device layout can express reads of ``x``'s own host view.
+
+    A view shares its base's device layout.  ``x[8, 65].reshape(-1)`` or
+    ``x[1, 2, 4, 8, 7].reshape(1, 8, 56)`` keep a layout whose stick coordinate
+    for the new shape is ``Mod(Mod(c0, 65), 64)`` or ``Mod(d1, 7)``, which the
+    compiler cannot represent, so every op reading the view fails.
+
+    The answer depends only on the layout and the view's geometry, so it is
+    cached on them: a view seen before costs one dict lookup, not a coordinate
+    computation.
+    """
+    from torch_spyre._C import get_spyre_tensor_layout
+
+    return _layout_serves_view(
+        get_spyre_tensor_layout(x),
+        tuple(x.shape),
+        tuple(x.stride()),
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _layout_serves_view(stl, size, stride) -> bool:
+    # Imported here: torch_spyre._inductor imports this module's package.
+    import sympy
+
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.pass_utils import _check_stick_expr_supported
+    from torch_spyre._inductor.views import compute_coordinates
+
+    syms = [
+        sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(len(size))
+    ]
+    ranges = {s: n for s, n in zip(syms, size) if n > 1}
+    index = sum((s * st for s, st in zip(syms, stride) if s in ranges), sympy.S.Zero)
+    try:
+        coords = compute_coordinates(
+            list(stl.device_size), list(stl.stride_map), ranges, index
+        )
+        _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    except Unsupported:
+        return False
+    return True
+
+
+def _materialize_unservable_view(x):
+    """Return a canonical-layout copy of a Spyre view whose inherited device
+    layout cannot serve its own shape; pass everything else through unchanged.
+
+    The eager op gets the view as a graph input with its base's layout, and the
+    restickify that ``insert_restickify`` adds has to read the input through that
+    same view, which ``device_coordinates`` rejects in ``insert_restickify_padding``.
+    The compiled path restickifies the base buffer, so the copy is made the same
+    way, on the device (``_rebuild_view_on_device``).
+
+    Inside a compiled graph's fallback (``_in_compiled_fallback``) the copy goes
+    through the host instead, as in ``_normalize_result_layout``: compiling again
+    from there nests ``torch.compile`` inside the kernel being compiled. That costs
+    a device-to-host and a host-to-device transfer, so it emits a
+    ``FallbackWarning``.
+    """
+    if isinstance(x, torch.Tensor):
+        if (
+            x.device.type == "spyre"
+            and x._base is not None
+            and x.dim() > 0
+            and not _layout_serves_own_view(x)
+        ):
+            if not _in_compiled_fallback():
+                return _rebuild_view_on_device(x)
+            warn_fallback("reading an unaligned view of a Spyre tensor")
+            out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+            out.copy_(x.to("cpu"))
+            return out
+        return x
+    if isinstance(x, (list, tuple)):
+        return type(x)(_materialize_unservable_view(e) for e in x)
     return x
 
 
@@ -403,12 +686,15 @@ def _make_offset_safe_dispatch(op):
                 return type(x)(prep_write(e) for e in x)
             return x
 
+        def prep_read(x):
+            return _materialize_unservable_view(_materialize_offset_view(x))
+
         args = tuple(
-            prep_write(a) if i in write_positions else _materialize_offset_view(a)
+            prep_write(a) if i in write_positions else prep_read(a)
             for i, a in enumerate(args)
         )
         kwargs = {
-            k: (prep_write(v) if k in write_names else _materialize_offset_view(v))
+            k: (prep_write(v) if k in write_names else prep_read(v))
             for k, v in kwargs.items()
         }
 
@@ -462,6 +748,7 @@ COMPILED_OPS = [
     aten.bmm,
     aten.cat,
     aten.div,
+    aten.floor_divide,
     aten.exp,
     aten.floor,
     aten.trunc,
@@ -499,6 +786,7 @@ COMPILED_OPS = [
     aten.linalg_vector_norm,
     aten.where.self,
     aten.where.self_out,
+    aten.masked_fill,
     aten.clamp,
     aten.constant_pad_nd,
     aten._scaled_mm,
@@ -628,6 +916,108 @@ def register_inplace_kernels(ops):
 
 register_inplace_kernels(COMPILED_OPS)
 
+# ``register_inplace_kernels`` cannot derive ``floor_divide_.Tensor``: it pairs
+# overloads by name, but the functional (Tensor, Tensor) overload is
+# ``floor_divide.default``, not ``floor_divide.Tensor``. Register it explicitly
+# so ``x //= tensor`` works (``floor_divide_.Scalar`` is derived normally).
+torch.library.register_kernel("aten::floor_divide_.Tensor", ["spyre"])(
+    _make_inplace_kernel(aten.floor_divide.default)
+)
+
+
+# cumsum's decomposition covers only aten.cumsum.default; out= and in-place
+# (cumsum_ reaches cumsum.out) run it and copy_ the result, like
+# _make_inplace_kernel.
+@torch.library.register_kernel("aten::cumsum.out", ["spyre"])  # type:ignore
+def spyre__cumsum_out(
+    self: torch.Tensor,
+    dim: int,
+    *,
+    dtype: torch.dtype | None = None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Functional cumsum + ``copy_`` into ``out``.
+
+    Without ``dtype`` the result takes ``out``'s dtype, as on CPU.
+    """
+    _check_same_device([(out, True), (self, False)])
+    if dtype is not None and dtype != out.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {dtype}, but got {out.dtype} instead"
+        )
+    result = torch.cumsum(self, dim, dtype=out.dtype)
+    if out.shape != result.shape:
+        out.resize_(result.shape)
+    out.copy_(result)
+    return out
+
+
+@torch.library.register_kernel("aten::cumsum_", ["spyre"])  # type:ignore
+def spyre__cumsum_(
+    self: torch.Tensor, dim: int, *, dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Functional cumsum in ``self``'s dtype + ``copy_`` back into ``self``."""
+    if dtype is not None and dtype != self.dtype:
+        raise RuntimeError(
+            f"Bad in-place call: input tensor dtype {self.dtype} and output "
+            f"tensor dtype {dtype} should match"
+        )
+    self.copy_(torch.cumsum(self, dim, dtype=self.dtype))
+    return self
+
+
+def _triangular_out(op, self: torch.Tensor, diagonal: int, out: torch.Tensor):
+    """``op(self, diagonal, out=out)``; ``out`` may alias ``self``."""
+    _check_same_device([(out, True), (self, False)])
+    if out.dtype != self.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {self.dtype}, but got {out.dtype} "
+            "instead"
+        )
+    return _copy_into_out(op(self, diagonal), out)
+
+
+def _copy_into_out(result: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Resize ``out`` to ``result``'s shape, as aten's out= does, and copy it in."""
+    if out.shape != result.shape:
+        out.resize_(result.shape)
+    out.copy_(result)
+    return out
+
+
+# The decompositions of arange, tril and triu cover the functional overloads;
+# out= runs the functional op on device and copies into ``out``, in its dtype.
+def _arange_out(start, end, step, out: torch.Tensor) -> torch.Tensor:
+    """``arange(start, end, step, out=out)`` in ``out``'s dtype."""
+    result = torch.arange(start, end, step, dtype=out.dtype, device=out.device)
+    return _copy_into_out(result, out)
+
+
+@torch.library.register_kernel("aten::arange.out", ["spyre"])  # type:ignore
+def spyre__arange_out(end, *, out: torch.Tensor) -> torch.Tensor:
+    return _arange_out(0, end, 1, out)
+
+
+@torch.library.register_kernel("aten::arange.start_out", ["spyre"])  # type:ignore
+def spyre__arange_start_out(start, end, step=1, *, out: torch.Tensor) -> torch.Tensor:
+    return _arange_out(start, end, step, out)
+
+
+@torch.library.register_kernel("aten::tril.out", ["spyre"])  # type:ignore
+def spyre__tril_out(
+    self: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor
+) -> torch.Tensor:
+    """``tril(self, diagonal, out=out)``."""
+    return _triangular_out(torch.tril, self, diagonal, out)
+
+
+@torch.library.register_kernel("aten::triu.out", ["spyre"])  # type:ignore
+def spyre__triu_out(
+    self: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor
+) -> torch.Tensor:
+    """``triu(self, diagonal, out=out)``."""
+    return _triangular_out(torch.triu, self, diagonal, out)
+
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
@@ -720,6 +1110,94 @@ def spyre__random_from(self, from_=0, to=1, generator=None) -> torch.Tensor:
     return self
 
 
+def _row_index(self, indices):
+    """The int32 Spyre row index for ``self[index]``, or raise for any other form.
+
+    Only one 1-D integer index on dim 0 is supported (row selection, e.g. the
+    sampled rows of a decoder's hidden states). The index is bounds-checked and
+    its negative entries wrapped on the host, as eager CPU indexing does, so an
+    index already on Spyre takes a D2H round trip, a host-side int32 cast and an
+    H2D back.
+    """
+    # Invalid on every device, so raise what CPU raises, before the scope check.
+    if any(
+        i is not None
+        and i.dtype not in (torch.int64, torch.int32, torch.uint8, torch.bool)
+        for i in indices
+    ):
+        raise IndexError(
+            "tensors used as indices must be long, int, byte or bool tensors"
+        )
+    if (
+        len(indices) != 1
+        or indices[0] is None
+        or indices[0].dim() != 1
+        or indices[0].dtype not in (torch.int32, torch.int64)
+    ):
+        raise NotImplementedError(
+            "Spyre aten::index.Tensor supports only x[index] with a single 1-D "
+            "int32/int64 index tensor on dim 0"
+        )
+    if self.dtype == torch.bool:
+        # TODO(#6043): the device copy of a bool tensor drops its values, so a
+        # gather or a broadcast would return wrong rows without an error.
+        raise NotImplementedError(
+            "Spyre aten::index.Tensor does not support bool source tensors"
+        )
+    index = indices[0]
+    if index.device.type != "cpu" and index.device != self.device:
+        raise RuntimeError(
+            "indices should be either on cpu or on the same device as the "
+            f"indexed tensor ({self.device})"
+        )
+    if self.dim() == 0:
+        raise IndexError("too many indices for tensor of dimension 0")
+    index = index.cpu()
+    rows = self.shape[0]
+    if index.numel() and (index.min() < -rows or index.max() >= rows):
+        raise IndexError(f"index out of range for dimension 0 with size {rows}")
+    index = torch.where(index < 0, index + rows, index)
+    # Spyre has no int64 index kernel.
+    return index.to(torch.int32).to(self.device)
+
+
+def _stick_runs_along_a_row(self):
+    """Whether the device stick of ``self`` lies along a non-singleton dim past 0.
+
+    Decided from the physical layout: the stride of a size-1 dim says nothing
+    about it, so equal views can carry different strides there.
+    """
+    stick_stride = self.device_tensor_layout().stride_map[-1]
+    return any(
+        self.shape[d] > 1 and self.stride(d) == stick_stride
+        for d in range(1, self.dim())
+    )
+
+
+@torch.library.register_kernel("aten::index.Tensor", ["spyre"])  # type:ignore
+def spyre__index_tensor(self, indices):
+    """``self[index]`` for a 1-D integer index, as an ``index_select`` on dim 0.
+
+    ``index_select`` compiles once per index length and source shape and layout
+    (``dynamic=False``), so a caller that sees many lengths should pad the index
+    onto a fixed set of them.
+
+    Eager only: the path choice reads the source's device layout, which a
+    FakeTensor does not have.
+    """
+    index = _row_index(self, indices)
+    if index.numel() == 0:
+        return torch.empty((0, *self.shape[1:]), dtype=self.dtype, device=self.device)
+    if self.shape[0] == 1 and _stick_runs_along_a_row(self):
+        # Every in-range index of a one-row source is 0, so this is a broadcast.
+        # index_select on a one-row source whose stick runs along the row lowers
+        # to an op the backend can't schedule (identity for one index, stick
+        # mismatch for more). When the stick runs across rows instead (e.g. a
+        # transposed column), index_select works and the broadcast does not.
+        return self.expand(index.numel(), *self.shape[1:]).clone()
+    return torch.index_select(self, 0, index)
+
+
 @torch.library.register_kernel("aten::_local_scalar_dense", "spyre")
 def spyre__local_scalar_dense(self):
     return self.cpu().item()
@@ -801,6 +1279,65 @@ def spyre__copy_from(self, dst, non_blocking=False):
 
         torch.ops.aten._copy_from.default(self, dst, non_blocking)
         return dst
+
+
+@torch.library.register_kernel("aten::_to_copy", ["spyre"])
+def spyre__to_copy(
+    self,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+    non_blocking=False,
+    memory_format=None,
+):
+    """``aten::_to_copy`` for Spyre, so ``.float()``/``.half()``/``.bfloat16()``
+    and ``.to(dtype)`` agree on the element arrangement.
+
+    ``Tensor.to`` is patched in Python (``spyre_to``) and sends a same-device
+    dtype change to the compiled ``spyre::to_dtype_d2d``, whose layout
+    propagation stamps the conversion's staggered element arrangement
+    (``DL16_TO_FP32`` / ``FP32_TO_DL16``) on the result. ``.float()`` and friends
+    are C++ methods that never reach ``spyre_to``; they land here. The stock
+    ``_to_copy`` allocates a fresh STANDARD buffer and ``copy_``s into it, which
+    drops the arrangement the compiled path produces, so every later eager op
+    sees STANDARD data where the compiled graph sees a staggered one (e.g. the
+    trailing ``(normed * (1 + w.float())).to(fp16)`` of GemmaRMSNorm).
+
+    Only a plain same-device dtype change is rerouted. Everything else keeps the
+    stock behaviour: allocate with ``empty_like`` and ``copy_``.
+    """
+    target_device = self.device if device is None else torch.device(device)
+    same_device_dtype_change = (
+        dtype is not None
+        and dtype != self.dtype
+        and target_device.type == "spyre"
+        and target_device.index in (None, self.device.index)
+        and layout in (None, torch.strided)
+        and not pin_memory
+        and memory_format in (None, torch.preserve_format)
+        and self.numel() != 0
+        # Same guard as ``spyre_to``: while tracing, the conversion must stay a
+        # graph op that Inductor lowers, not a nested compiled call.
+        and not torch.compiler.is_compiling()
+        and not isinstance(self, torch._subclasses.FakeTensor)
+        and not torch._is_functional_tensor(self)
+    )
+    if same_device_dtype_change:
+        return torch.ops.spyre.to_dtype_d2d(self, dtype, self.storage_offset())
+
+    result = torch.empty_like(
+        self,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        memory_format=(
+            torch.preserve_format if memory_format is None else memory_format
+        ),
+    )
+    return result.copy_(self, non_blocking)
 
 
 # INSERT_CODEGEN_HERE

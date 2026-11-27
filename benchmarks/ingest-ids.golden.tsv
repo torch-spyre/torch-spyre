@@ -1,0 +1,101 @@
+component	name	row	config_name	input_shapes	run_mode	kernel_name	benchmark_id
+torch-spyre	attention	report		[[1, 32, 512, 128], [1, 32, 4096, 128], [1, 32, 4096, 128]]	op_benchmark		1deb8f5d-6628-5b2f-ac94-362ffd6569a8
+torch-spyre	attention	kernel		[[1, 32, 512, 128], [1, 32, 4096, 128], [1, 32, 4096, 128]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	0315d605-6fb3-5dca-9f65-1f95fe3d986d
+torch-spyre	attention	kernel		[[1, 32, 512, 128], [1, 32, 4096, 128], [1, 32, 4096, 128]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	da34b8cf-2a44-5fb5-af22-10817ae0c7c7
+torch-spyre	attention	total		[[1, 32, 512, 128], [1, 32, 4096, 128], [1, 32, 4096, 128]]	op_benchmark	Total	e6374e42-a33c-5e4b-aebd-5679936c8541
+torch-spyre	attention	report		[[4, 32, 1, 128], [4, 32, 4096, 128], [4, 32, 4096, 128]]	op_benchmark		ecbc75e9-9744-5976-a36b-4e1a038fe950
+torch-spyre	attention	kernel		[[4, 32, 1, 128], [4, 32, 4096, 128], [4, 32, 4096, 128]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	77ada80c-bd25-5b0f-9f5a-20f2c72b4ea9
+torch-spyre	attention	kernel		[[4, 32, 1, 128], [4, 32, 4096, 128], [4, 32, 4096, 128]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	8e84cad1-ca16-55dc-a376-2222ffb91e3b
+torch-spyre	attention	total		[[4, 32, 1, 128], [4, 32, 4096, 128], [4, 32, 4096, 128]]	op_benchmark	Total	c4dd8f30-3b59-5d22-9dcd-eca4b3b0bcac
+torch-spyre	attention_gqa	report		[[1, 32, 512, 128], [1, 8, 4096, 128], [1, 8, 4096, 128]]	op_benchmark		877de30a-7d96-544e-a417-dd6b6e356361
+torch-spyre	attention_gqa	kernel		[[1, 32, 512, 128], [1, 8, 4096, 128], [1, 8, 4096, 128]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	80782d1d-54d2-5635-87b6-7b8df1130e83
+torch-spyre	attention_gqa	kernel		[[1, 32, 512, 128], [1, 8, 4096, 128], [1, 8, 4096, 128]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	20c05902-fc42-58dc-b92d-541cc530c1d4
+torch-spyre	attention_gqa	total		[[1, 32, 512, 128], [1, 8, 4096, 128], [1, 8, 4096, 128]]	op_benchmark	Total	c452023a-a041-516e-8fc0-0e2dfdff82bb
+torch-spyre	attention_gqa	report		[[4, 32, 1, 128], [4, 8, 4096, 128], [4, 8, 4096, 128]]	op_benchmark		bf575f36-61cc-5327-b852-c53279714a52
+torch-spyre	attention_gqa	kernel		[[4, 32, 1, 128], [4, 8, 4096, 128], [4, 8, 4096, 128]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	fb501464-d6fd-56e1-beb1-ae9c60cb9664
+torch-spyre	attention_gqa	kernel		[[4, 32, 1, 128], [4, 8, 4096, 128], [4, 8, 4096, 128]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	2b9a8c2e-8230-505f-9e60-b82034d85015
+torch-spyre	attention_gqa	total		[[4, 32, 1, 128], [4, 8, 4096, 128], [4, 8, 4096, 128]]	op_benchmark	Total	f2f944cf-43a8-5590-81c3-d367d22d419a
+torch-spyre	layernorm	report		[[1, 512, 4096]]	op_benchmark		accc7627-50b1-54e0-8dce-447e379a936e
+torch-spyre	layernorm	kernel		[[1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	f2a657bd-787b-54a1-ac66-6c270af7fb59
+torch-spyre	layernorm	kernel		[[1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	0dcae6ba-333f-5f02-a2fe-bb28d0955ec7
+torch-spyre	layernorm	total		[[1, 512, 4096]]	op_benchmark	Total	afff1953-75a5-55bd-9a6f-33eb302061e8
+torch-spyre	matmul	report		[[1, 512, 4096], [4096, 1024]]	op_benchmark		6c2336a8-2c6b-584c-bfe9-804db3207341
+torch-spyre	matmul	kernel		[[1, 512, 4096], [4096, 1024]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	c5ea5cae-cd2e-50c7-a450-437d66fe653d
+torch-spyre	matmul	kernel		[[1, 512, 4096], [4096, 1024]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	87618109-a506-59aa-8048-ce0d0476149c
+torch-spyre	matmul	total		[[1, 512, 4096], [4096, 1024]]	op_benchmark	Total	22f95876-e8ff-56e9-9c01-0c9457478567
+torch-spyre	matmul	report		[[1, 512, 4096], [4096, 4096]]	op_benchmark		c0994a96-44c0-5069-ab2d-924354712344
+torch-spyre	matmul	kernel		[[1, 512, 4096], [4096, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	0e2c9e0b-2f4f-56c4-88b1-7c74548300c1
+torch-spyre	matmul	kernel		[[1, 512, 4096], [4096, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	4badd80f-d08a-5f03-863d-a9791a913ef0
+torch-spyre	matmul	total		[[1, 512, 4096], [4096, 4096]]	op_benchmark	Total	ad40fe34-d0ca-5877-9371-37e0541fb4fd
+torch-spyre	matmul	report		[[1, 512, 4096], [4096, 12800]]	op_benchmark		9cdac7d4-93b8-572f-8caa-5a76c9e40822
+torch-spyre	matmul	kernel		[[1, 512, 4096], [4096, 12800]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	f09ecdb6-9e81-59fd-b3c8-34d46cddf9f7
+torch-spyre	matmul	kernel		[[1, 512, 4096], [4096, 12800]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	9f015a29-2b9b-5b1d-8dd7-de5ee9ffd2ac
+torch-spyre	matmul	total		[[1, 512, 4096], [4096, 12800]]	op_benchmark	Total	d6d52f62-cb87-5866-adcc-fcd6f3a05124
+torch-spyre	matmul	report		[[4, 1, 4096], [4096, 1024]]	op_benchmark		bbb198c2-f835-538d-8e52-f8ede09b41df
+torch-spyre	matmul	kernel		[[4, 1, 4096], [4096, 1024]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	2a8365c5-590b-5b1d-85e4-df896e10a64f
+torch-spyre	matmul	kernel		[[4, 1, 4096], [4096, 1024]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	5bd59dd5-0b88-5f16-9abe-ca28add21343
+torch-spyre	matmul	total		[[4, 1, 4096], [4096, 1024]]	op_benchmark	Total	8b9f4188-35d8-5720-817e-f772d5b493d2
+torch-spyre	matmul	report		[[4, 1, 4096], [4096, 4096]]	op_benchmark		522a7bbb-f406-5692-a260-c6ec42dfb698
+torch-spyre	matmul	kernel		[[4, 1, 4096], [4096, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	3d66c635-9ad8-550d-90b2-e19d12871bae
+torch-spyre	matmul	kernel		[[4, 1, 4096], [4096, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	d99ae421-229e-504e-b0c4-cada92bfb02c
+torch-spyre	matmul	total		[[4, 1, 4096], [4096, 4096]]	op_benchmark	Total	50999cac-df8b-5a3b-9748-da73f362ecff
+torch-spyre	matmul	report		[[4, 1, 4096], [4096, 12800]]	op_benchmark		3c086bfe-db98-51f8-a661-908f073dc177
+torch-spyre	matmul	kernel		[[4, 1, 4096], [4096, 12800]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	3d1ca673-49a8-594a-987b-a606611ea5bb
+torch-spyre	matmul	kernel		[[4, 1, 4096], [4096, 12800]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	2b7fbbc8-9f1e-57ae-b635-a029a5df4f4c
+torch-spyre	matmul	total		[[4, 1, 4096], [4096, 12800]]	op_benchmark	Total	19ee6d2a-9282-5a4d-9d2a-76359f81e5a2
+torch-spyre	mlp-linear-kn-t	report		[[1, 512, 4096]]	op_benchmark		ff8cff94-39b8-5e65-84eb-2a930cfe6467
+torch-spyre	mlp-linear-kn-t	kernel		[[1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	3d3aaae0-afe6-5d55-ad4b-3e838113a95d
+torch-spyre	mlp-linear-kn-t	kernel		[[1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	4be2c6cf-257e-5f4c-8512-d4eed39e1918
+torch-spyre	mlp-linear-kn-t	total		[[1, 512, 4096]]	op_benchmark	Total	85f1105a-6647-58be-b08b-754a50bb13fe
+torch-spyre	mlp-linear-kn-t	report		[[4, 1, 4096]]	op_benchmark		33a91ea9-df47-554a-a0e6-f52fffd14ba2
+torch-spyre	mlp-linear-kn-t	kernel		[[4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	cc40b532-66e7-5e09-b4bc-a1a4a5c7d0a1
+torch-spyre	mlp-linear-kn-t	kernel		[[4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	88cef678-87d7-5c49-a6ce-c97c639178f5
+torch-spyre	mlp-linear-kn-t	total		[[4, 1, 4096]]	op_benchmark	Total	b44d8c58-b64b-5523-9d66-c9b79397a643
+torch-spyre	mlp	report		[[1, 512, 4096]]	op_benchmark		582802b0-fb9e-542e-998b-dad64b1b81a4
+torch-spyre	mlp	kernel		[[1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	b0dcd892-603a-5f08-b60f-b123a766da40
+torch-spyre	mlp	kernel		[[1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	38f29453-698e-5ae0-a1c2-66ccfd3caecd
+torch-spyre	mlp	total		[[1, 512, 4096]]	op_benchmark	Total	88cc8a34-ab74-5b44-894f-64035505d213
+torch-spyre	mlp	report		[[4, 1, 4096]]	op_benchmark		2b762d5f-e8eb-5056-a6fd-da525f286b3b
+torch-spyre	mlp	kernel		[[4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	5ad95937-6dea-5d69-930a-6ccd3b9b10ea
+torch-spyre	mlp	kernel		[[4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	0da1e9cd-1a39-5d67-b0d5-54bb6fc6d60d
+torch-spyre	mlp	total		[[4, 1, 4096]]	op_benchmark	Total	9644e962-a276-53f8-afb0-3b2b9f02cad7
+torch-spyre	pointwise_add	report		[[1, 512, 4096], [1, 512, 4096]]	op_benchmark		9b763db9-f0f2-55e5-8701-6e7ec800bd38
+torch-spyre	pointwise_add	kernel		[[1, 512, 4096], [1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	a7575aca-a99a-5eb8-a679-c9986aba1f31
+torch-spyre	pointwise_add	kernel		[[1, 512, 4096], [1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	74ef8612-4601-5272-ba2a-b8cc4e51d951
+torch-spyre	pointwise_add	total		[[1, 512, 4096], [1, 512, 4096]]	op_benchmark	Total	d8411110-dce1-55d2-ae42-c61a6eb838bb
+torch-spyre	pointwise_add	report		[[4, 1, 4096], [4, 1, 4096]]	op_benchmark		d3f28b8a-33d8-50b8-be4c-0684594a3537
+torch-spyre	pointwise_add	kernel		[[4, 1, 4096], [4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	9903b024-f9e8-5236-9b70-c2e8946ffc68
+torch-spyre	pointwise_add	kernel		[[4, 1, 4096], [4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	97c2b96e-25fe-573b-88e3-dc7938d802cd
+torch-spyre	pointwise_add	total		[[4, 1, 4096], [4, 1, 4096]]	op_benchmark	Total	e2fc9ad4-53af-56c1-a3df-3c450ccb1a1a
+torch-spyre	softmax	report		[[1, 512, 4096]]	op_benchmark		d7f2cdc7-5745-5dca-8944-3a038bc2589b
+torch-spyre	softmax	kernel		[[1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	9cf66d19-c77b-58ac-b14a-a2ea9eec160a
+torch-spyre	softmax	kernel		[[1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	156b1e89-939e-57c6-a9d6-75035d7dbb09
+torch-spyre	softmax	total		[[1, 512, 4096]]	op_benchmark	Total	bcc96962-e0f5-534e-a063-81700373e390
+torch-spyre	softmax	report		[[4, 1, 4096]]	op_benchmark		a6ce2409-dfd4-57d7-9178-666ccfced973
+torch-spyre	softmax	kernel		[[4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	85439500-01bd-5ace-bb22-d4cba7865c63
+torch-spyre	softmax	kernel		[[4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	2fe00d42-61bc-5790-9e55-ea1616555ad7
+torch-spyre	softmax	total		[[4, 1, 4096]]	op_benchmark	Total	46b21032-7ac7-55a2-99c6-be3ce5273f0e
+torch-spyre	granite	report	full_model		prefill_only		c214d6b3-cf67-5f71-81ff-e7db0db942df
+torch-spyre	granite	kernel	full_model		prefill_only	spyre_kernel_v1_fused_add#2@2	863d6474-85b0-5de0-aa38-9419e8147b7a
+torch-spyre	granite	kernel	full_model		prefill_only	spyre_kernel_v1_fused_add#2@1	f2bf6db0-1066-5753-bb34-a9d40be9a06f
+torch-spyre	granite	total	full_model		prefill_only	Total	28f36639-4188-5469-ac16-d24bef5ef968
+torch-spyre	granite	report	full_model		decode_only		57080893-ff44-5133-92a7-21f6585bdeb5
+torch-spyre	granite	kernel	full_model		decode_only	spyre_kernel_v1_fused_add#2@2	7cf900c7-81c5-5aba-a05d-44f36b2ac199
+torch-spyre	granite	kernel	full_model		decode_only	spyre_kernel_v1_fused_add#2@1	7adb1d3e-39ee-5959-8a51-f44619aba0ea
+torch-spyre	granite	total	full_model		decode_only	Total	045f3a0b-d5bf-5f0c-97a9-505b4b4a172c
+torch-spyre	granite	report	full_model		generate		230277c7-0a03-536a-92bb-a31241448dc9
+torch-spyre	granite	kernel	full_model		generate	spyre_kernel_v1_fused_add#2@2	e112189b-cc63-54b1-83ec-8395173208b8
+torch-spyre	granite	kernel	full_model		generate	spyre_kernel_v1_fused_add#2@1	af468a2e-9589-51fd-a531-213fdbd66c7a
+torch-spyre	granite	total	full_model		generate	Total	4c71208d-0100-56e4-bc96-5f4a2cb3e5b1
+torch-spyre	granite	report	one_block		prefill_only		2103423c-ed79-5f3b-8041-dfa54ee6e313
+torch-spyre	granite	kernel	one_block		prefill_only	spyre_kernel_v1_fused_add#2@2	82375a4b-e95d-55ba-923b-fef9e1a98b03
+torch-spyre	granite	kernel	one_block		prefill_only	spyre_kernel_v1_fused_add#2@1	a1c8e042-3528-5ac4-b909-64f4ede4ce73
+torch-spyre	granite	total	one_block		prefill_only	Total	36dd0fe1-dc49-54e6-85de-c5403e88820e
+torch-spyre	granite	report	one_block		decode_only		85cf3877-f161-568b-afb4-614228b16109
+torch-spyre	granite	kernel	one_block		decode_only	spyre_kernel_v1_fused_add#2@2	cc8098cb-75d8-56d9-8b22-0f5586d6dc63
+torch-spyre	granite	kernel	one_block		decode_only	spyre_kernel_v1_fused_add#2@1	31449f56-cd17-5a4a-9612-d28500bf0fbf
+torch-spyre	granite	total	one_block		decode_only	Total	46287996-fb9c-5e31-8844-274215e7f969
+torch-spyre	granite	report	one_block		generate		8b365796-bf8a-507a-a97f-59dedff2926d
+torch-spyre	granite	kernel	one_block		generate	spyre_kernel_v1_fused_add#2@2	6d7fb4ee-bd03-5384-81cf-1d06ae0b86d7
+torch-spyre	granite	kernel	one_block		generate	spyre_kernel_v1_fused_add#2@1	51295cd1-d3fd-5591-8fd6-19c1628ef7c7
+torch-spyre	granite	total	one_block		generate	Total	1e598f4a-5c5e-5bc2-9606-50662a83ee5c

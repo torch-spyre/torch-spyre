@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import sympy
 import torch
 from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep
+from torch._inductor.ir import ExternKernel
 from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._inductor import loop_checker
@@ -30,7 +31,7 @@ from torch_spyre._inductor.loop_checker import (
     check_loops,
     find_violations,
 )
-from torch_spyre._inductor.loop_info import LoopCarryRecord
+from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import (
     LoopNode,
     all_ops,
@@ -84,6 +85,24 @@ class _StarOp(_Op):
         return ReadWrites(OrderedSet(), OrderedSet([StarDep(self._name)]), OrderedSet())
 
 
+class _LoopOp(_Op):
+    """An op whose ``loop_member`` names the counted loop it runs in."""
+
+    def __init__(self, name, path, **kwargs):
+        super().__init__(name, **kwargs)
+        self.loop_member = SimpleNamespace(loop_group_id=tuple(path))
+
+
+class _ExternLoopOp(_LoopOp, ExternKernel):
+    """Like ``_LoopOp`` but an ``ExternKernel``: it keeps its ``loop_member`` and
+    runs once, so it has no loop path. Only the base class matters to the checker;
+    ``ExternKernel.__init__`` is not run."""
+
+
+class _SpyreLoopOp(_LoopOp, _SpyreOp):
+    """A Spyre-device op with a ``loop_member``, so the pass pipeline runs on it."""
+
+
 def _node(name, body, induction=U0, carries=()):
     return LoopNode(
         name, body, induction=induction, trip_count=4, carries=tuple(carries)
@@ -135,6 +154,209 @@ class TestFindViolations(unittest.TestCase):
         # The storage is the carry's initial buffer, written before the loop.
         carry = LoopCarryRecord(storage_name="acc", update_name="a")
         tree = [_Op("acc"), _node("n0", [_Op("a")], carries=[carry])]
+        self.assertEqual(find_violations(tree), [])
+
+
+class TestMembership(unittest.TestCase):
+    """Rules 4 and 5: each op's ``loop_member`` agrees with the node it sits in."""
+
+    def test_members_in_their_own_nodes_have_none(self):
+        tree = [
+            _node("n0", [_LoopOp("a", (0,)), _LoopOp("b", (0,))]),
+            _node("n1", [_LoopOp("c", (1,))], U1),
+        ]
+        self.assertEqual(find_violations(tree), [])
+
+    def test_nested_members_have_none(self):
+        inner = _node("inner", [_LoopOp("b", (0, 1))], U1)
+        tree = [_node("outer", [_LoopOp("a", (0,)), inner])]
+        self.assertEqual(find_violations(tree), [])
+
+    def test_a_member_outside_every_node_is_reported(self):
+        # The copy-back placed after the loop by a flat index (#6101).
+        tree = [_node("n0", [_LoopOp("a", (0,))]), _LoopOp("late", (0,))]
+        problems = find_violations(tree)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("late runs in the counted loop (0,)", problems[0])
+        self.assertIn("outside every loop node", problems[0])
+
+    def test_a_flat_loop_no_node_covers_is_allowed(self):
+        # A loop a lowering has recorded but whose nodes are not built yet (the pass
+        # loop builds them once the pass returns): a node covers group 0 only, so
+        # the group-1 ops are such a loop, not misplaced.
+        tree = [
+            _node("n0", [_LoopOp("a", (0,))]),
+            _LoopOp("flat", (1,)),
+            _LoopOp("flat_copy", (1,)),
+        ]
+        self.assertEqual(find_violations(tree), [])
+
+    def test_a_member_of_an_uncovered_loop_is_not_misplaced_in_a_node_body(self):
+        # The same flat op INSIDE another loop's body is still wrong.
+        tree = [_node("n0", [_LoopOp("a", (0,)), _LoopOp("flat", (1,))])]
+        problems = find_violations(tree)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("flat runs in the counted loop (1,)", problems[0])
+
+    def test_a_member_of_another_loop_in_the_body_is_reported(self):
+        tree = [_node("n0", [_LoopOp("a", (0,)), _LoopOp("stray", (1,))])]
+        problems = find_violations(tree)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("stray runs in the counted loop (1,)", problems[0])
+        self.assertIn("in the body of the loop (0,)", problems[0])
+
+    def test_a_loop_nested_in_the_wrong_loop_is_reported(self):
+        inner = _node("inner", [_LoopOp("b", (1, 2))], U1)
+        tree = [_node("outer", [_LoopOp("a", (0,)), inner])]
+        problems = find_violations(tree)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("inner is a loop of group path (1, 2)", problems[0])
+
+    def test_an_extern_kernel_outside_a_node_is_allowed(self):
+        # It keeps its loop_member but runs once: it has no loop path.
+        tree = [_ExternLoopOp("const", (0,)), _node("n0", [_LoopOp("a", (0,))])]
+        self.assertEqual(find_violations(tree), [])
+
+    def test_an_op_with_no_loop_info_outside_a_node_is_allowed(self):
+        self.assertEqual(
+            find_violations([_Op("pre"), _node("n0", [_LoopOp("a", (0,))])]), []
+        )
+
+    def test_a_non_member_between_two_members_is_reported(self):
+        tree = [_node("n0", [_LoopOp("a", (0,)), _Op("mid"), _LoopOp("b", (0,))])]
+        problems = find_violations(tree)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("mid is in the body of n0 but is not a member", problems[0])
+
+    def test_a_non_member_at_the_head_or_tail_is_reported(self):
+        """The hand-off used to move such an op out of the node (stage 8.5 removed
+        that repair), so it is a violation: the node would run it every trip."""
+        tree = [_node("n0", [_Op("head"), _LoopOp("a", (0,)), _Op("tail")])]
+        problems = find_violations(tree)
+        self.assertEqual(len(problems), 2)
+        self.assertIn("head is in the body of n0", problems[0])
+        self.assertIn("tail is in the body of n0", problems[1])
+
+    def test_an_extern_kernel_at_the_head_or_tail_is_allowed(self):
+        tree = [
+            _node(
+                "n0",
+                [
+                    _ExternLoopOp("head", (0,)),
+                    _LoopOp("a", (0,)),
+                    _ExternLoopOp("t", (0,)),
+                ],
+            )
+        ]
+        self.assertEqual(find_violations(tree), [])
+
+    def test_an_extern_kernel_between_two_members_is_allowed(self):
+        tree = [
+            _node(
+                "n0",
+                [_LoopOp("a", (0,)), _ExternLoopOp("const", (0,)), _LoopOp("b", (0,))],
+            )
+        ]
+        self.assertEqual(find_violations(tree), [])
+
+    def test_a_node_with_no_member_is_not_checked(self):
+        # Hand-built nodes (and the tests above) have ops with no loop_member.
+        tree = [_node("n0", [_Op("a"), _Op("b")])]
+        self.assertEqual(find_violations(tree), [])
+
+
+class TestNodeChainRule(unittest.TestCase):
+    """Rule 6: an op in nodes the pipeline built points at them and carries no
+    ``loop_member`` (the nodes own the facts once they are built)."""
+
+    def _built(self, index=sympy.Integer(0)):
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.loop_node import LoopMember, collapse
+
+        a, b = _LoopOp("a", (0,), index=index), _LoopOp("b", (0,), index=index)
+        for op in (a, b):
+            op.loop_member = LoopMember(
+                loop_group_id=(0,),
+                loop_count=[4],
+                loop_tiled_dims=[[]],
+                loop_tiled_reduction_dims=[[]],
+            )
+        graph = SimpleNamespace(operations=[a, b])
+        collapse(graph, inductions={0: U0})
+        return graph, a, b
+
+    def test_a_built_node_is_clean_and_its_members_lose_the_record(self):
+        graph, a, b = self._built()
+        self.assertEqual(find_violations(graph.operations), [])
+        self.assertFalse(hasattr(a, "loop_member"))
+        self.assertFalse(hasattr(b, "loop_member"))
+
+    def test_a_record_written_after_the_build_is_reported(self):
+        from torch_spyre._inductor.loop_node import LoopMember
+
+        graph, a, b = self._built()
+        a.loop_member = LoopMember(
+            loop_group_id=(0,),
+            loop_count=[4],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[]],
+        )
+        (problem,) = find_violations(graph.operations)
+        self.assertIn("a: carries a loop_member inside built nodes", problem)
+        self.assertIn("record_member", problem)
+
+    def test_an_op_that_advances_with_the_loop_but_holds_no_tiling_is_reported(self):
+        """Without an entry an op reads as "not in the loop", which would drop its
+        advance silently; the loop variable in its index is what gives it away."""
+        from torch_spyre._inductor.loop_node import insert_before, record_member
+
+        graph, a, b = self._built(index=4 * U0)
+        self.assertEqual(find_violations(graph.operations), [])
+        late = _Op("late", index=4 * U0)
+        insert_before(graph.operations, b, late)
+        problems = find_violations(graph.operations)
+        self.assertTrue(
+            any("late advances with the loop variable" in p for p in problems),
+            problems,
+        )
+        self.assertTrue(any("record_member" in p for p in problems), problems)
+        record_member(late, [([], [])])
+        self.assertTrue(
+            not any("late advances" in p for p in find_violations(graph.operations))
+        )
+
+    def test_an_op_that_does_not_use_the_loop_variable_needs_no_entry(self):
+        from torch_spyre._inductor.loop_node import insert_before
+
+        graph, a, b = self._built(index=4 * U0)
+        once = _Op("once")  # index 0: a once-op beside the members
+        insert_before(graph.operations, b, once)
+        self.assertTrue(
+            not any("once advances" in p for p in find_violations(graph.operations))
+        )
+
+    def test_an_op_with_no_recorded_chain_is_reported(self):
+        graph, a, b = self._built()
+        del a._loop_chain
+        problems = find_violations(graph.operations)
+        self.assertTrue(
+            any("a: its recorded node chain" in problem for problem in problems),
+            problems,
+        )
+
+    def test_an_unstamped_op_placed_by_a_helper_is_a_rule_5_case_not_rule_6(self):
+        from torch_spyre._inductor.loop_node import insert_before
+
+        graph, a, b = self._built()
+        late = _Op("late")
+        insert_before(graph.operations, b, late)
+        (problem,) = find_violations(graph.operations)
+        self.assertIn("late is in the body", problem)
+
+    def test_a_hand_built_node_is_not_checked(self):
+        tree = [_node("n0", [_LoopOp("a", (0,))])]
+        tree[0].body[0].loop_member.loop_tiled_dims = [[1]]
         self.assertEqual(find_violations(tree), [])
 
 
@@ -289,6 +511,22 @@ class TestPipelineWiring(unittest.TestCase):
             pass
 
         self.run_passes([benign, benign], good)
+
+    def test_a_pass_that_places_a_member_outside_its_loop_is_named(self):
+        # What reorder_nonstick_dims_mutation did before #6101: a copy-back that
+        # belongs to the loop was inserted after it.
+        good = [_node("n0", [_SpyreLoopOp("a", (0,))], U0)]
+
+        def innocent(graph):
+            pass
+
+        def misplace(graph):
+            graph.operations.append(_SpyreLoopOp("copyback", (0,)))
+
+        with self.assertRaises(LoopStructureError) as caught:
+            self.run_passes([innocent, misplace], good)
+        self.assertEqual(caught.exception.where, "misplace")
+        self.assertIn("copyback runs in the counted loop (0,)", str(caught.exception))
 
     def test_the_checker_does_not_run_when_disabled(self):
         def corrupt(graph):
