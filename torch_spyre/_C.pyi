@@ -35,6 +35,8 @@ __all__: list[str] = [
     "CompositeChunkInfo",
     "CompositeAddressHandle",
     "get_composite_address",
+    "copy_buffer_ranges",
+    "convert_buffers",
     "empty_with_layout",
     "copy_tensor",
     "copy_kv_page_raw",
@@ -628,6 +630,17 @@ def spyre_empty_with_layout(
     device_layout: SpyreTensorLayout,
     device: torch.device | None = None,
 ) -> torch.Tensor: ...
+def copy_buffer_ranges(
+    entries: list[tuple[typing.Any, CompositeAddressHandle, int, int]],
+    *,
+    stream: typing.Any,
+) -> None:
+    """Enqueue pinned physical-range copies; caller retains buffers until completion."""
+
+def convert_buffers(
+    entries: list[tuple[typing.Any, typing.Any, list[int], str]],
+) -> None:
+    """Synchronously encode dense safetensors bytes on the calling thread."""
 
 class SpyreStreamError:
     Success: typing.ClassVar[SpyreStreamError]  # value = <SpyreStreamError.Success: 0>

@@ -72,6 +72,10 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
+void copy_buffer_ranges(const pybind11::list& entries,
+                        const pybind11::object& stream);
+void convert_buffers(const pybind11::list& entries);
+
 static constexpr int32_t kSpyreTensorLayoutPickleVersion = 5;
 static constexpr int32_t kPoolDescriptorPickleVersion = 1;
 
@@ -849,6 +853,11 @@ PYBIND11_MODULE(_C, m) {
         "Return a read-only handle over the device address backing a Spyre "
         "tensor's storage; the handle keeps that allocation alive",
         py::arg("tensor"));
+
+  // Caller-owned byte buffers; no Tensor conversion or loader policy.
+  m.def("copy_buffer_ranges", &spyre::copy_buffer_ranges, py::arg("entries"),
+        py::kw_only(), py::arg("stream"));
+  m.def("convert_buffers", &spyre::convert_buffers, py::arg("entries"));
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
