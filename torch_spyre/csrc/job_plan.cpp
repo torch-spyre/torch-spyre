@@ -35,6 +35,11 @@ void JobPlanStepH2D::construct(LaunchContext&,
       flex::createDmaParams(host_address_, device_address_.total_size(),
                             /*to_device=*/true, &device_address_);
   params->pipeline_barrier = pipeline_barrier_;
+  // The DMA reads host_buffer_ after this returns; the callback's reference
+  // keeps the buffer alive until the transfer completes, even if the JobPlan
+  // is destroyed first.
+  params->callback = [host_buffer = host_buffer_](
+                         void*, const flex::FlexCallbackMetadata*) {};
   stream.launchH2D(params);
   flex::destroyDmaParams(params);
 }
@@ -56,6 +61,10 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address.total_size(),
                               /*to_device=*/false, &device_address);
     params->pipeline_barrier = pipeline_barrier_;
+    // The DMA writes host_buffer_ after this returns; keep it alive until the
+    // transfer completes (see JobPlanStepH2D::construct).
+    params->callback = [host_buffer = host_buffer_](
+                           void*, const flex::FlexCallbackMetadata*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   } else {
@@ -87,8 +96,10 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address->total_size(),
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
-    params->callback = [device_address](void*,
-                                        const flex::FlexCallbackMetadata*) {};
+    // Both the device address and the host buffer the DMA writes must outlive
+    // the transfer, which completes after this returns.
+    params->callback = [device_address, host_buffer = host_buffer_](
+                           void*, const flex::FlexCallbackMetadata*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -315,8 +326,8 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   os << "Pinned buffers: " << plan.pinned_buffers.size() << "\n";
   for (size_t i = 0; i < plan.pinned_buffers.size(); ++i) {
     const auto& buf = plan.pinned_buffers[i];
-    os << "  Buffer " << i << ": ptr=" << buf.data() << ", size=" << buf.size()
-       << " bytes\n";
+    os << "  Buffer " << i << ": ptr=" << buf->data()
+       << ", size=" << buf->size() << " bytes\n";
   }
 
   // Detailed step information

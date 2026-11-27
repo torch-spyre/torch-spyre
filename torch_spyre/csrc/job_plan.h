@@ -423,13 +423,18 @@ inline std::ostream& operator<<(std::ostream& os, const JobPlanStep& step) {
 class JobPlanStepH2D final : public JobPlanStep {
  public:
   /**
-   * @brief Construct H2D step with raw host pointer
+   * @brief Construct H2D step reading from a pinned host buffer
    *
-   * @param host_address Host memory address (lifetime managed by JobPlan)
+   * @param host_buffer Pinned host buffer the DMA reads from. Shared with the
+   *        JobPlan; construct() hands a reference to the DMA's completion
+   *        callback, so the buffer outlives an in-flight transfer even if the
+   *        JobPlan is destroyed first.
    * @param device_address Device memory address
    */
-  JobPlanStepH2D(void* host_address, flex::CompositeAddress device_address)
-      : host_address_(host_address),
+  JobPlanStepH2D(std::shared_ptr<HostBuffer> host_buffer,
+                 flex::CompositeAddress device_address)
+      : host_buffer_(std::move(host_buffer)),
+        host_address_(host_buffer_->data()),
         device_address_(std::move(device_address)) {
     role_ = StreamRole::Prep;  // H2D runs on the prep stream (S_prep)
   }
@@ -439,7 +444,8 @@ class JobPlanStepH2D final : public JobPlanStep {
   void write(std::ostream& os) const override;
 
  private:
-  void* host_address_;  // Non-owning pointer (JobPlan owns the buffer)
+  std::shared_ptr<HostBuffer> host_buffer_;
+  void* host_address_;  // host_buffer_->data()
   flex::CompositeAddress device_address_;
 };
 
@@ -463,24 +469,32 @@ class JobPlanStepD2H final : public JobPlanStep {
    * @brief Construct D2H step
    *
    * @param device_address Device memory address
-   * @param host_address Host memory address (caller manages lifetime)
+   * @param host_buffer Pinned host buffer the DMA writes into. Shared with the
+   *        JobPlan; construct() hands a reference to the DMA's completion
+   *        callback, so the buffer outlives an in-flight transfer even if the
+   *        JobPlan is destroyed first.
    * @param size Size of data to transfer
    */
-  JobPlanStepD2H(flex::CompositeAddress device_address, void* host_address,
-                 size_t size)
+  JobPlanStepD2H(flex::CompositeAddress device_address,
+                 std::shared_ptr<HostBuffer> host_buffer, size_t size)
       : device_address_(std::move(device_address)),
-        host_address_(host_address),
+        host_buffer_(std::move(host_buffer)),
+        host_address_(host_buffer_->data()),
         size_(size) {}
 
   /**
    * @brief Construct D2H step
    *
    * @param dmva Device memory virtual address
-   * @param host_address Host memory address (caller manages lifetime)
+   * @param host_buffer Pinned host buffer the DMA writes into (see above)
    * @param size Size of data to transfer
    */
-  JobPlanStepD2H(uint64_t dmva, void* host_address, size_t size)
-      : device_address_(Dmva{dmva}), host_address_(host_address), size_(size) {}
+  JobPlanStepD2H(uint64_t dmva, std::shared_ptr<HostBuffer> host_buffer,
+                 size_t size)
+      : device_address_(Dmva{dmva}),
+        host_buffer_(std::move(host_buffer)),
+        host_address_(host_buffer_->data()),
+        size_(size) {}
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -488,7 +502,8 @@ class JobPlanStepD2H final : public JobPlanStep {
 
  private:
   std::variant<flex::CompositeAddress, Dmva> device_address_;
-  void* host_address_;
+  std::shared_ptr<HostBuffer> host_buffer_;
+  void* host_address_;  // host_buffer_->data()
   size_t size_;
 };
 
@@ -674,16 +689,18 @@ struct JobPlan {
   std::vector<std::vector<int64_t>> expected_input_shapes;
 
   /**
-   * @brief Pinned host buffers owned by this JobPlan
+   * @brief Pinned host buffers of this JobPlan
    *
-   * Stores pinned memory buffers (e.g., for correction tensors) that must
-   * remain alive for the lifetime of the JobPlan. Steps reference these
-   * buffers via raw pointers. Buffers are automatically freed when JobPlan
-   * is destroyed.
+   * Stores pinned memory buffers (e.g., for correction tensors and DataTransfer
+   * staging). Ownership is shared: the H2D/D2H steps that use a buffer hold a
+   * reference too, and each launch hands one to its DMA's completion callback.
+   * A buffer is freed only once the JobPlan is gone AND no transfer into or out
+   * of it is still in flight -- destroying a JobPlan right after a launch,
+   * before synchronizing, must not free memory a DMA is still writing.
    *
    */
   // TODO(jni): not safe for multi streams. Make it per-stream. See #2520.
-  std::vector<HostBuffer> pinned_buffers;
+  std::vector<std::shared_ptr<HostBuffer>> pinned_buffers;
 
   /**
    * @brief Compiled programs
