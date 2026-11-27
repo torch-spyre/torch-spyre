@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import dataclasses
 import logging
 from collections import defaultdict
@@ -26,11 +25,19 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
-from .loop_facts import counted_loop_path, enclosing_loops
-from .loop_info import ReadCopyElisionRecord
+from .loop_facts import counted_loop_path, enclosing_loops, is_looped
+from .read_copy_elision import ReadCopyElisionRecord
+from .loop_node import move_after, move_before, record_member
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import invalidate_op_read_writes, patch_env
+from .pass_utils import (
+    declared_max_or_none,
+    invalidate_op_read_writes,
+    loop_induction_symbols,
+    loop_var_ranges_from_dim_hints,
+    patch_env,
+    undeclared_maximum_message,
+)
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
@@ -62,7 +69,8 @@ logger = get_inductor_logger("insert_restickify")
 #   op.committed_stl          set by optimize_restickify; consumed+deleted by finalize_layouts
 #   op.layouts                set by propagate_layouts / stickify; consumed+deleted by finalize_layouts
 #   op.restick_cost_fn        set by propagate_layouts; consumed+deleted by finalize_layouts
-#   op.loop_info              set by coarse_tile; read (and cloned) by insert_restickify_on_node_inputs
+#   (loop facts)              owned by the LoopNodes once built; insert_restickify_on_node_inputs
+#                             records the copy's tiling with loop_node.record_member
 #   op._restickify_plan       set by propagate_layouts; consumed+deleted by insert_post_mutation_restickify
 #   op._tiled_reduction_accum_name  set by coarse_tile; read by finalize_layouts
 #   op._input_layout_overrides      set by insert_post_mutation_restickify; read by codegen
@@ -126,8 +134,14 @@ class InputEdgeSwapHandler(WrapperHandler):
     in dep.index, built positionally from inner_fn_args() at wrap time.
     """
 
-    def __init__(self, inner, swaps, name_map=None, index_replacements=None):
+    def __init__(
+        self, inner, swaps, name_map=None, index_replacements=None, moved_terms=None
+    ):
         super().__init__(inner)
+        # old buffer name -> loop term (coefficient * induction variable) that the
+        # restickify copy now carries. The consumer reads the new buffer at a
+        # fixed address, so a matched swap drops the term from its index.
+        self._moved_terms: dict = {} if moved_terms is None else moved_terms
         self._swaps_by_name: dict = defaultdict(list)
         for old_name, dep_index, occurrence, new_name in swaps:
             self._swaps_by_name[old_name].append((dep_index, occurrence, new_name))
@@ -181,7 +195,117 @@ class InputEdgeSwapHandler(WrapperHandler):
                 f"multiple targets {unique_targets}"
             )
             target = next(iter(unique_targets))
+        moved = self._moved_terms.get(name)
+        if moved is not None:
+            index = sympy.sympify(index) - moved
         return super().load(target, index)
+
+
+class _AddLoopTermHandler(WrapperHandler):
+    """Add a loop term to every load of ``name`` (the restickify copy's source)."""
+
+    def __init__(self, inner, name: str, term: sympy.Expr):
+        super().__init__(inner)
+        self._name = name
+        self._term = term
+
+    def load(self, name, index):
+        if name == self._name:
+            index = sympy.sympify(index) + self._term
+        return super().load(name, index)
+
+
+def _give_copy_the_loop_term(
+    restick_buff: ComputedBuffer,
+    consumer: ComputedBuffer,
+    source_name: str,
+    term: sympy.Expr,
+) -> None:
+    """Make the restickify copy read ``source_name`` at ``term`` more per trip.
+
+    A loop variable in an index is only understood by ``per_trip_index`` and
+    ``op_out_coords`` when the op declares it in ``dim_hints`` (a ``DimHint`` with
+    ``loop_var_range``); otherwise the kernel's coordinate computation raises
+    "indirect symbol not found". The copy gets the consumer's loop-variable hints.
+    """
+    loop_hints = [
+        hint
+        for hint in getattr(consumer, "dim_hints", None) or []
+        if getattr(hint, "loop_var_range", None) is not None
+    ]
+    if loop_hints:
+        # One hint per loop variable: cost_features pairs a loop variable to each
+        # level by position and pairs nothing when the counts differ.
+        existing = getattr(restick_buff, "dim_hints", None) or []
+        have = {hint.loop_var for hint in existing}
+        restick_buff.dim_hints = [  # type: ignore[attr-defined]
+            *existing,
+            *(hint for hint in loop_hints if hint.loop_var not in have),
+        ]
+    original = restick_buff.data.inner_fn
+
+    def inner(*args, _original=original):
+        with V.set_ops_handler(_AddLoopTermHandler(V.ops, source_name, term)):
+            return _original(*args)
+
+    object.__setattr__(restick_buff.data, "inner_fn", inner)
+    invalidate_op_read_writes(restick_buff)
+
+
+def _moved_loop_term(
+    op: ComputedBuffer,
+    restick_arg_info: RestickifyArgInfo,
+    restick_buff: ComputedBuffer,
+    n_levels: int,
+    shared_loop_depth: int,
+) -> sympy.Expr | None:
+    """The loop term the restickify copy takes over from ``op``'s read, or None.
+
+    When the swapped read advances with a loop the copy shares with the consumer,
+    the copy's read gains the term and the consumer's read of the new buffer, which
+    sits at a fixed address, loses it.
+
+    Only when every level of the consumer's loop is shared (``shared_loop_depth ==
+    n_levels``) is every loop term in the read the copy's, so no level-to-variable
+    mapping is needed. When only some levels are shared the term of a shared level
+    cannot be moved without that mapping, which raises ``Unsupported`` rather than
+    leave a fixed-address read advancing. With no shared level the consumer keeps
+    its term.
+    """
+    if not is_looped(op) or not is_looped(restick_buff):
+        return None
+    if not n_levels or shared_loop_depth == 0:
+        return None
+    deps = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+    dep_idx = _restickify_dep_index(deps, restick_arg_info)
+    if dep_idx is None:
+        return None
+    index = sympy.sympify(deps[dep_idx].index)
+    symbols = loop_induction_symbols(index, set())
+    if shared_loop_depth != n_levels:
+        hinted = list(loop_var_ranges_from_dim_hints(op))
+        shared = (
+            set(hinted[:shared_loop_depth]) if len(hinted) == n_levels else set(symbols)
+        )
+        if shared & set(symbols):
+            raise Unsupported(
+                f"insert_restickify: the read of {restick_arg_info.arg_name} advances "
+                f"with a loop the restickify copy shares with {op.get_name()} but "
+                "the consumer's loop is deeper, so its loop term cannot be moved"
+            )
+        return None
+    term = sympy.S.Zero
+    for symbol in symbols:
+        term += index.coeff(symbol) * symbol
+    if any(symbol in (index - term).free_symbols for symbol in symbols):
+        # ``coeff`` reads only the linear part: floor(u / 2) or Mod(u, 2) would
+        # leave the variable in the consumer's index while the copy took nothing.
+        raise Unsupported(
+            f"insert_restickify: the loop variable of {restick_arg_info.arg_name} "
+            f"is used non-linearly in {index}, so its advance cannot move to the "
+            "restickify copy"
+        )
+    return term if term != 0 else None
 
 
 def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayout:
@@ -317,7 +441,7 @@ def _create_restickify_node(
 #    ReadCopyElisionRecord, which redirect_computed_buffer_reads does not touch.
 
 
-def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args):
+def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args, moved_terms=None):
     """Wrap orig_fn with InputEdgeSwapHandler for per-edge load redirection.
 
     Builds index_replacements lazily at each call by mapping the live i*/r0_*
@@ -332,6 +456,7 @@ def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args):
         _map=name_map,
         _orig=orig_fn,
         _canonical=canonical_args,
+        _moved=moved_terms,
     ):
         assert len(args) == len(_canonical), (
             f"{_orig.__qualname__}: inner_fn argument cardinality changed: "
@@ -356,7 +481,7 @@ def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args):
                     f"{actual} -> {previous}, {canonical}"
                 )
         with V.set_ops_handler(
-            InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements)
+            InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements, _moved)
         ):
             return _orig(*args)
 
@@ -370,106 +495,148 @@ def _transfer_loop_info(
     restick_arg_info: RestickifyArgInfo,
     shared_loop_depth: int,
 ) -> None:
-    """Assign loop_info to a newly-created restickify buffer.
+    """Make a newly placed restickify buffer a member of its consumer's loops.
 
-    When coarse-tiling has already annotated the consumer op with loop_info,
-    the restickify node must also carry loop_info to remain contiguous in
-    build_loop_scheduler_nodes. The assignment depends on whether old_name_buf
-    shares any loop-nest levels with op (has_shared_loop_scope):
+    When the consumer is in a loop, the copy was just placed beside it (so it is in
+    the same nodes) and must be told what it tiles: it tiles what the consumer
+    tiles. That is how it stays contiguous in the loop's node. Which accesses
+    advance is the index's business (``_moved_loop_term`` moves the loop term to the
+    copy when the copy takes over the swapped read's advance).
 
-    Shared scope: restickify takes over the consumer's per-read advance for
-    shared levels; the consumer retains the advance for deeper levels. Sharing
-    one CoarseTileInfo object would apply the advance twice (issue #4008).
+    No shared loop scope (``old_name_buf`` is not itself a tiled stage): the copy
+    reads a fixed full copy of ``old_name_buf``, made once, and its output is
+    consumed at a fixed address by every trip, so its extent is pinned, and it tiles
+    nothing: the consumer's tiled dims (e.g. a per-tile token dim) would be misread
+    against this copy's own unrelated dim at the same index.
+    work_division_constraints.py reads them to pin a dim's split to 1, so a stale
+    entry would block the split this full, untiled copy needs to fit the per-core
+    span limit (issue #6277).
 
-    No shared scope (or old_name_buf has no loop_info): restickify gets a copy
-    of op's loop_info with all advances zeroed out; the consumer keeps its own.
+    TODO(#5863 8.3): that fixed full copy sits inside the loop body and runs on
+    every trip. Placing it before the node (insert_before) would run it once;
+    test_embedding_restickify_table_no_span_overflow is the acceptance case.
     """
-    source_li = getattr(old_name_buf, "loop_info", None)
-    consumer_li = getattr(op, "loop_info", None)
-    has_shared_loop_scope = source_li is not None and shared_loop_depth > 0
+    consumer_levels = enclosing_loops(op)
+    if not consumer_levels:
+        return
+    has_shared_loop_scope = is_looped(old_name_buf) and shared_loop_depth > 0
+    if has_shared_loop_scope:
+        tiling = [
+            (level.tiled_dims, level.tiled_reduction_dims) for level in consumer_levels
+        ]
+    else:
+        tiling = [((), ()) for _ in consumer_levels]
+    record_member(restick_buff, tiling)
+    if not has_shared_loop_scope:
+        # Only this case needs the pin: a tiled-stage copy advances per trip and
+        # takes its extent from the tile, while this fixed copy takes the whole
+        # operand's, which may be symbolic (a reserved pool).
+        _pin_fixed_copy_extent_to_declared_max(restick_buff)
 
-    if consumer_li is not None and has_shared_loop_scope:
-        n_levels = len(getattr(consumer_li, "loop_count", []) or [])
-        reads_per_dim = getattr(consumer_li, "tiled_dims_per_read", None)
-        if n_levels and reads_per_dim is not None:
-            mem_deps = [
-                d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
-            ]
-            dep_idx = _restickify_dep_index(mem_deps, restick_arg_info)
-            if dep_idx is not None and dep_idx >= len(reads_per_dim):
-                raise AssertionError(
-                    f"restickify metadata index {dep_idx} is outside "
-                    f"tiled_dims_per_read ({len(reads_per_dim)} entries)"
+
+def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None:
+    """Size a loop-invariant whole-operand restickify at the declared maximum.
+
+    A restickify that makes a FIXED full copy inside a loop (its source is not a
+    tiled stage, so neither its read nor its write advances per trip) copies the
+    whole operand on every trip. When that operand has a symbolic extent, e.g. a
+    gathered page pool reserved with ``.to("spyre", dynamic=...)``, the copy
+    would carry the symbol into the loop body, where every extent must be
+    static: the body is one compiled tile, and the symbol may live only in a
+    loop trip count.
+
+    So the symbolic extent is replaced by its declared maximum. That is valid at
+    every runtime size because the source buffer is reserved at that maximum:
+    the copy reads rows past the logical extent, which exist in the reservation,
+    and its consumer (a gather) only ever indexes rows below the real size. So
+    only a declared dimension is pinned: a ``mark_dynamic(max=...)`` or
+    ``torch._check`` bound reserves nothing, and the copy would read past it.
+
+    Mutated in place because ``restick_buff`` was created by this pass a moment
+    ago and nothing else holds a reference to it yet. Changing ``ranges``
+    changes the iteration space itself, so every cache derived from it is
+    dropped, and the list below is complete, not just sufficient. The derived
+    state lives in three places:
+
+    - the ``@cache_on_self`` methods of the two mutated objects. On the
+      ``Pointwise`` data those are ``get_free_symbol_uses``, ``inner_fn_str``
+      and ``inner_fn_opcount`` (all from ``Loops``); on the ``ComputedBuffer``
+      they are ``get_free_symbol_uses`` and ``get_default_sizes_body``. That is
+      every cached method either class has, all five are cleared, and
+      ``TestPinFixedCopyExtent.test_clears_every_cached_method`` in
+      ``tests/inductor/test_symbolic_gather.py`` derives the set from the IR
+      classes, so a cached method added upstream fails it instead of going
+      stale here;
+    - the memoized read/writes (``invalidate_op_read_writes``);
+    - the layout, which is rebuilt rather than mutated and so carries no cache.
+
+    This is the same list the loop tiling clears after its own ``ranges``
+    rewrite (``loop_tiling_common._divide_ranges``), the other place that
+    rewrites a ``Loops``' ranges in place. A stale entry would surface as a wrong extent in the
+    emitted copy rather than as an error.
+
+    Raises:
+        Unsupported: an extent is symbolic and not a declared dimension.
+    """
+    # Deferred import: coarse_tile and this module avoid importing each other
+    # at load time (see coarse_tile._NameSwapHandler).
+    from .wsr.coarse_tile import (
+        _COMPUTED_BUF_FREE_SYMS_KEY,
+        _COMPUTED_BUF_SIZES_KEY,
+        _LOOPS_FREE_SYMS_KEY,
+        _LOOPS_INNER_FN_OPCOUNT_KEY,
+        _LOOPS_INNER_FN_STR_KEY,
+        _clear_cache,
+    )
+
+    ranges = list(restick_buff.data.ranges)
+    syms = set()
+    for r in ranges:
+        syms |= set(getattr(r, "free_symbols", ()) or ())
+    if not syms:
+        return
+    subs: dict = {}
+    for sym in syms:
+        upper = declared_max_or_none(sym)
+        if upper is None:
+            raise Unsupported(
+                undeclared_maximum_message(
+                    f"restickify {restick_buff.get_name()}, a fixed copy inside a "
+                    f"loop with extent {ranges},",
+                    sym,
                 )
-            dep_advance = (
-                copy.deepcopy(reads_per_dim[dep_idx])
-                if dep_idx is not None
-                else [[] for _ in range(n_levels)]
             )
-            transferred_advance = [
-                level if level_idx < shared_loop_depth else []
-                for level_idx, level in enumerate(dep_advance)
-            ]
-            retained_advance = [
-                [] if level_idx < shared_loop_depth else level
-                for level_idx, level in enumerate(dep_advance)
-            ]
-            # squeezed_advance_per_read is the second, independent channel
-            # for the same per-read advance (see CoarseTileInfo), also
-            # matched to reads positionally, so it must be handed over the
-            # same way. Left shared, the stage inherits the consumer's whole
-            # list and its single read picks up whatever advance sat at
-            # index 0 -- for an in-body page gather that is the block
-            # table's per-trip step, applied to the staged pages copy.
-            adv_per_read = getattr(consumer_li, "squeezed_advance_per_read", [])
-            dep_squeezed = (
-                copy.deepcopy(adv_per_read[dep_idx])
-                if dep_idx is not None and adv_per_read and dep_idx < len(adv_per_read)
-                else []
-            )
-            transferred_squeezed = [
-                level if level_idx < shared_loop_depth else []
-                for level_idx, level in enumerate(dep_squeezed)
-            ]
-            retained_squeezed = [
-                [] if level_idx < shared_loop_depth else level
-                for level_idx, level in enumerate(dep_squeezed)
-            ]
-            if restick_arg_info.occurrence != 0 and (
-                any(transferred_advance) or any(transferred_squeezed)
-            ):
-                raise Unsupported(
-                    f"restickify edge {restick_arg_info.arg_name}[{restick_arg_info.dep_index}] "
-                    f"occurrence {restick_arg_info.occurrence} cannot "
-                    "transfer advancing read metadata independently"
-                )
-            restick_li = copy.deepcopy(consumer_li)
-            restick_li.tiled_dims_per_read = [transferred_advance]
-            restick_li.squeezed_advance_per_read = (
-                [transferred_squeezed] if any(transferred_squeezed) else []
-            )
-            restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
-            restick_buff.loop_info = restick_li
-            if dep_idx is not None:
-                consumer_li.tiled_dims_per_read = copy.deepcopy(reads_per_dim)
-                consumer_li.tiled_dims_per_read[dep_idx] = retained_advance
-                if adv_per_read:
-                    consumer_li.squeezed_advance_per_read = copy.deepcopy(adv_per_read)
-                    consumer_li.squeezed_advance_per_read[dep_idx] = retained_squeezed
-        else:
-            restick_buff.loop_info = consumer_li
-    elif hasattr(op, "loop_info"):
-        # old_name_buf is not itself a tiled stage: restickify still needs a
-        # copy of loop_info to stay contiguous in build_loop_scheduler_nodes,
-        # but neither its read (a fixed full copy of old_name_buf, made once)
-        # nor its output (consumed at a fixed address by every trip) advance —
-        # the consumer keeps whatever per-trip advance it already had.
-        restick_li = copy.deepcopy(op.loop_info)
-        n_levels = len(getattr(restick_li, "loop_count", []) or [])
-        restick_li.tiled_dims_per_read = [[[] for _ in range(n_levels)]]
-        restick_li.squeezed_advance_per_read = []
-        restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
-        restick_buff.loop_info = restick_li
+        subs[sym] = sympy.Integer(upper)
+
+    def pinned(exprs):
+        return [sympy.sympify(e).xreplace(subs) for e in exprs]
+
+    object.__setattr__(restick_buff.data, "ranges", pinned(ranges))
+    _clear_cache(restick_buff.data, _LOOPS_FREE_SYMS_KEY)
+    _clear_cache(restick_buff.data, _LOOPS_INNER_FN_STR_KEY)
+    _clear_cache(restick_buff.data, _LOOPS_INNER_FN_OPCOUNT_KEY)
+    _clear_cache(restick_buff, _COMPUTED_BUF_SIZES_KEY)
+    _clear_cache(restick_buff, _COMPUTED_BUF_FREE_SYMS_KEY)
+    invalidate_op_read_writes(restick_buff)
+    layout = restick_buff.layout
+    if isinstance(layout, FixedTiledLayout):
+        pinned_layout = FixedTiledLayout(
+            layout.device,
+            layout.dtype,
+            pinned(layout.size),
+            pinned(layout.stride),
+            layout.device_layout,
+            offset=layout.offset,
+        )
+        pinned_layout.allocation = layout.allocation
+        restick_buff.layout = pinned_layout
+    logger.info(
+        "[symbolic-gather] fixed in-loop copy %s sized at the declared maximum: "
+        "%s -> %s",
+        restick_buff.get_name(),
+        ranges,
+        list(restick_buff.data.ranges),
+    )
 
 
 def insert_restickify_on_node_inputs(
@@ -484,13 +651,7 @@ def insert_restickify_on_node_inputs(
     existing_record = getattr(op, "_read_copy_elision_record", None)
     edge_swaps: list[tuple] = []
     name_map: dict[str, str] = {}
-    try:
-        op_index = operations.index(op)
-    except ValueError:
-        raise AssertionError(
-            f"Consumer op {op.get_name()} not found in operations list"
-        ) from None
-
+    moved_terms: dict[str, sympy.Expr] = {}
     for restick_arg_info in resticks_needed:
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
         old_name_buf = V.graph.try_get_buffer(old_name)
@@ -509,10 +670,10 @@ def insert_restickify_on_node_inputs(
             name_map[old_name] = new_name
 
         # lower_restickify calls pw.realize() which appends restick_buff to operations.
-        # Move it to just before the consumer op to preserve topological order.
-        operations.remove(restick_buff)
-        operations.insert(op_index, restick_buff)
-        op_index += 1  # consumer shifted right by 1
+        # Move it to just before the consumer op to preserve topological order: in the
+        # consumer's loop body when the consumer is a body op, before the node when
+        # the consumer is a node.
+        move_before(operations, op, restick_buff)
 
         source_group_id = counted_loop_path(old_name_buf, include_extern=True)
         consumer_group_id = counted_loop_path(op, include_extern=True)
@@ -526,6 +687,25 @@ def insert_restickify_on_node_inputs(
         _transfer_loop_info(
             restick_buff, old_name_buf, op, restick_arg_info, shared_loop_depth
         )
+        moved = _moved_loop_term(
+            op,
+            restick_arg_info,
+            restick_buff,
+            len(enclosing_loops(op)),
+            shared_loop_depth,
+        )
+        if moved is not None:
+            if old_name in moved_terms:
+                # The handler drops a moved term from every load that resolves to
+                # this buffer, by name: two restickified reads of one buffer
+                # cannot be told apart, so a term would be taken from the wrong one.
+                raise Unsupported(
+                    f"insert_restickify: {old_name} is restickified more than once "
+                    f"for {op.get_name()} and its per-trip advance moves to the copy; "
+                    "the loop term cannot be assigned to one read"
+                )
+            moved_terms[old_name] = moved
+            _give_copy_the_loop_term(restick_buff, op, old_name, moved)
 
         # A saved direct-read form can sit on an identity whose committed
         # layout is incompatible with its consumer.  The deferred restickify
@@ -564,7 +744,9 @@ def insert_restickify_on_node_inputs(
     object.__setattr__(
         op.data,
         "inner_fn",
-        make_per_edge_inner_fn(op.data.inner_fn, edge_swaps, name_map, canonical_args),
+        make_per_edge_inner_fn(
+            op.data.inner_fn, edge_swaps, name_map, canonical_args, moved_terms
+        ),
     )
     # op now reads the restickify buffers: an extraction memoized before this
     # (e.g. by optimize_restickify_locations) names the old inputs.
@@ -653,8 +835,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
             # Tiled-reduction scratch: propagate the reduction op's device
             # layout to accum_full so fill, combine, and copy all agree on
             # the device coordinate system.
-            loop_info = getattr(op, "loop_info", None)
-            if loop_info is not None and isinstance(op.layout, FixedTiledLayout):
+            if is_looped(op) and isinstance(op.layout, FixedTiledLayout):
                 all_tiled_rdims_empty = not any(
                     level.tiled_reduction_dims for level in enclosing_loops(op)
                 )
@@ -736,7 +917,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 #  - the copy-back elision optimization (propagate_layouts.py),
                 #    which stamps ELIDED_COPY_BACK_ATTR on the producer; or
                 #  - coarse_tile.py's nested output-dim + reduction-dim tiling
-                #    (_insert_reduction_copy_op), which mutates directly into a
+                #    (_lower_reduction), which mutates directly into a
                 #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
                 #    in-group consumer (e.g. the next outer-tile iteration's
                 #    copy-in) reads that copy op's own output the same way an
@@ -744,7 +925,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE
                 #    op whose target is a locally-created graph-output buffer
                 #    (e.g. copy_forced(src, c) where c is returned directly) --
-                #    _insert_copy_op's inserted coarse_tile_copy_* op reads the
+                #    _insert_copy_out's inserted coarse_tile_copy_* op reads the
                 #    mutation op's own output the same way. The mutation target
                 #    there is an ordinary ComputedBuffer, not a SpyreEmptyFallback,
                 #    so this case is recognized by layout alone.
@@ -880,6 +1061,19 @@ def _retarget_internal_buf_mutation(
     )
 
 
+def _bracket_mutation(operations, mutation_op, buf_tmp, buf_copyback) -> None:
+    """Put ``buf_tmp`` right before ``mutation_op`` and ``buf_copyback`` right after.
+
+    ``_create_restickify_node`` appends both nodes at the end of ``operations``, so
+    they are moved from there. Each goes next to the mutation op in the list that
+    holds it: the copy-back is placed with ``move_after``, not at a flat index
+    ``index(mutation_op) + 2``, which puts it before whatever follows the mutation,
+    and that is outside the loop when the mutation is the last op of a loop body.
+    """
+    move_before(operations, mutation_op, buf_tmp)
+    move_after(operations, mutation_op, buf_copyback)
+
+
 def insert_post_mutation_restickify(graph: GraphLowering) -> None:
     """
     Move a slice mutation onto an alternate layout when the original layout
@@ -1002,15 +1196,7 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         mutation_op._emit_set_layout = (target_name, alt_stl)
 
         # Insert buf_tmp before mutation, copy-back after mutation.
-        # _create_restickify_node -> realize() appends buf_tmp/buf_copyback at
-        # the end of operations, so they sit after mutation_op; removing them
-        # first keeps the index arithmetic below correct.
-        mutation_op_index = operations.index(mutation_op)
-        operations.remove(buf_tmp)
-        operations.insert(mutation_op_index, buf_tmp)
-        # mutation_op is now at mutation_op_index + 1; insert copy-back after it.
-        operations.remove(buf_copyback)
-        operations.insert(mutation_op_index + 2, buf_copyback)
+        _bracket_mutation(operations, mutation_op, buf_tmp, buf_copyback)
 
         logger.info(
             "insert_post_mutation_restickify: %s (orig->alt) before %s; copy-back %s->%s after %s",

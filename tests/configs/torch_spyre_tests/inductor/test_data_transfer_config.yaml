@@ -1,5 +1,5 @@
 test_suite_config:
-  labels: [unit, regression, trunk]
+  labels: [unit, regression, integration, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
       unlisted_test_mode: skip
@@ -27,6 +27,8 @@ test_suite_config:
 
         - names:
             - TestUnsupportedGates::test_h2d_copy_fp64_raises_error
+            - TestUnsupportedGates::test_kernel_to_dtype_without_src_dtype_raises_unsupported
+            - TestUnsupportedGates::test_compiled_conversion_of_multi_output_op_does_not_crash
           mode: mandatory_success
 
   global:

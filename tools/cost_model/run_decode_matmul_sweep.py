@@ -96,7 +96,9 @@ def measure(case, output):
     K, N = shapes[case["shape"]]
     hint = {axis: case[axis.lower()] for axis in ("M", "N", "K")}
     # These are the captured Granite projection layouts used by the original sweep.
-    layout = SpyreTensorLayout([N // 64, K, 64], [64, N, 1], DataFormats.SEN169_FP16)
+    layout = SpyreTensorLayout(
+        [N // 64, K, 64], [64, N, 1], DataFormats.SEN169_FP16, {(0, 2): N, (1,): K}
+    )
     generator = torch.Generator().manual_seed(0)
     x = (torch.randn(rows, K, generator=generator) * 0.02).half().to("spyre")
     weight = (

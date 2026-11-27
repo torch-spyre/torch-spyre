@@ -104,7 +104,7 @@ A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, 
 The `SpyreTensorLayout` holds:
 
 - `device_size`: the tensor's shape on device, including the extra tiling and padding dims.
-- `stride_map`: the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
+- `stride_map`: the host stride for each device dim. A `0` here means the dim is synthetic, fully padded, or broadcast.
 - `device_dtype`: the on-device data format, for example `SEN169_FP16`.
 - `element_arrangement`: how elements are packed within a stick (defaults to `STANDARD`).
 
@@ -149,6 +149,38 @@ Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strateg
 | VF (Virtual Frame) | `FLEX_DEVICE=VF` | Virtualized hardware, used in multi-tenant deployments. |
 | MOCK | `FLEX_DEVICE=MOCK` | Software simulation with no hardware; device count comes from `AIU_WORLD_SIZE`. |
 
+### Pinned host memory
+
+The backend registers a host pinned-memory allocator through the PrivateUse1
+hooks interface (`getPinnedMemoryAllocator` and `isPinnedPtr` in
+`csrc/module.cpp`), backed by `SpyrePinnedAllocator` in
+`csrc/spyre_pinned_allocator.cpp`. This makes host pinned buffers available to
+PyTorch, so `pin_memory=True` host tensors and DataLoader pinning work with the
+Spyre backend, which speeds up host-to-LPDDR5 transfers.
+
+Pinning applies to host buffers only. A device tensor cannot be pinned: a
+`device="spyre"` allocation with `pin_memory=True` is rejected in
+`spyre_mem.cpp`.
+
+### Non-blocking host-to-device copies
+
+`copy_(src, non_blocking=True)` and `.to("spyre", non_blocking=True)`, also with
+`device_layout=` or `dynamic=`, return before the DMA completes. Work queued
+later on the same stream sees the copied data. As on CUDA, a pageable source
+may be modified or freed as soon as the call returns: a converting copy converts
+it on the calling thread, and a same-format copy first copies it into a pinned
+staging buffer. A pinned source is read by the DMA itself, so leave it unchanged
+until the stream is synchronized.
+
+Staging buffers come from the pinned pool, which keeps idle buffers for reuse.
+`torch.accelerator.empty_host_cache()` releases them, and
+`torch.accelerator.host_memory_stats()` does not report the pool yet
+([#5753](https://github.com/torch-spyre/torch-spyre/issues/5753)). If the pool
+cannot supply a staging buffer, the copy converts the source on the calling
+thread instead, as a converting copy does, and only the first such fallback in
+a process warns. The source is still safe to modify once the call returns, and
+the call still returns before the DMA completes, but it costs more host time.
+
 ## Eager Operations
 
 Eager kernels reach the Spyre dispatch key from two Python sources.
@@ -159,7 +191,7 @@ In-place variants are *derived* from that same list by `register_inplace_kernels
 
 The match requires the same overload name *and* an identical argument signature modulo the `(a!)` write-alias, so a same-named pair with different operand order is rejected rather than mis-paired: `pow_.Scalar(Tensor self, Scalar exponent)` versus `pow.Scalar(Scalar self, Tensor exponent)` would otherwise yield a kernel computing `other ** self`. The kernel also enforces PyTorch's in-place dtype contract, raising if the promoted result cannot be cast back to `self`.
 
-The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `cumsum`, `tril`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
+The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `tril`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
 
 Inductor decompositions registered through `register_spyre_decomposition` also dispatch eagerly when the underlying ATen op does not already have a PrivateUse1 kernel. See the [supported operations table](../user_guide/supported_operations.md) for the full list.
 
@@ -325,7 +357,10 @@ The following collectives are implemented:
 `async_op=True`; wait for completion with the returned work handle's `wait()`.
 The remaining process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
 `alltoall_base`, `_allgather_base`, `allreduce_coalesced`) raise
-`SpyreCCLNotSupportedException`. `recvAnysource` is intentionally
+`SpyreCCLNotSupportedException`. These entries describe the eager process
+group only: under `torch.compile`, `_c10d_functional.reduce_scatter_tensor`
+and the coalesced allreduce and all-gather ops lower directly to spyre-comms.
+`recvAnysource` is intentionally
 unsupported: the protocol overhead is high and call sites are rare.
 
 ### BF16 collective tensors

@@ -36,23 +36,56 @@
 
 namespace spyre {
 
-// A view over sharded storage must reproduce the base tensor exactly. The
-// storage's DataPtr context carries the sharding record of the base tensor,
-// and the sharded copy path maps view elements onto shards through that
-// record; any other view -- even a contiguous prefix slice from offset zero,
-// which passes the copy path's contiguity checks -- would read the wrong
-// elements (the first N elements of every shard instead of the shards that
-// back the view). Identity views (alias, detach, as_strided of the base
-// tensor itself) keep the mapping and are allowed.
+// Whether a view of sharded storage is a box view (see sharded_box_start).
+// Symbolic sizes, strides or offsets are never a box: sharded tensors are
+// static-shape only.
+template <typename SizeVec, typename StrideVec>
+static bool is_sharded_box(const at::Tensor& self, const SizeVec& sizes,
+                           const StrideVec& strides,
+                           const c10::SymInt& storage_offset) {
+  std::vector<int64_t> int_sizes, int_strides;
+  for (const auto& s : sizes) {
+    auto v = c10::SymInt(s).maybe_as_int();
+    if (!v) return false;
+    int_sizes.push_back(*v);
+  }
+  for (const auto& s : strides) {
+    auto v = c10::SymInt(s).maybe_as_int();
+    if (!v) return false;
+    int_strides.push_back(*v);
+  }
+  auto offset = storage_offset.maybe_as_int();
+  return offset.has_value() &&
+         sharded_box_start(self, int_sizes, int_strides, *offset).has_value();
+}
+
+// A view over sharded storage must keep a mapping from its elements onto the
+// shards. The storage's DataPtr context carries the sharding record of the
+// base tensor, and the sharded copy path maps view elements onto shards
+// through that record. Two kinds of view keep it:
+// - identity views (alias, detach, as_strided of the tensor itself);
+// - box views: a block of the base in the same dimension order (the base's
+//   rank, unit steps, the base's strides), such as x[8:16] or x[:, 64:128].
+//   See sharded_box_start. Only copies to the CPU accept a box view so far;
+//   kernels, fills and the other consumers still reject it.
+// Any other view (a transpose, a strided slice, a flattened slice, a
+// broadcast) is rejected here, before it can reach a consumer.
 //
 // Templated over both int64_t and SymInt element types so the symbolic
-// alias path is guarded too; comparisons stay symbolic and are guarded by
-// expect_true.
+// alias path is guarded too; the identity comparisons stay symbolic and are
+// guarded by expect_true, and only concrete views are checked for a box.
+//
+// In-place as_strided_ passes allow_box = false: it rewrites the tensor
+// itself, so a sharded tensor must keep its whole shape.
 template <typename SizeVec, typename StrideVec>
 static void check_sharded_view(const at::Tensor& self, const SizeVec& sizes,
                                const StrideVec& strides,
-                               const c10::SymInt& storage_offset) {
+                               const c10::SymInt& storage_offset,
+                               bool allow_box = true) {
   if (!spyre_is_sharded(self)) return;
+  if (allow_box && is_sharded_box(self, sizes, strides, storage_offset)) {
+    return;
+  }
   // Rank mismatch must fail before the comparison loop: SymBool's operator&
   // does not short-circuit, so folding the rank check into the chain below
   // would let a rank-increasing view (e.g. unsqueeze) index past the base
@@ -69,9 +102,10 @@ static void check_sharded_view(const at::Tensor& self, const SizeVec& sizes,
   }
   TORCH_CHECK(same_rank && identity.expect_true(__FILE__, __LINE__),
               "views of sharded Spyre tensors are not supported: only views "
-              "that reproduce the base tensor exactly (same sizes, strides "
-              "and storage offset) keep the element-to-shard mapping. Copy "
-              "the tensor to the CPU and take the view there instead.");
+              "that reproduce the base tensor exactly, or a block of it in "
+              "the same dimension order (unit-step slices such as x[8:16] or "
+              "x[:, 64:128]), keep the element-to-shard mapping. Copy the "
+              "tensor to the CPU and take the view there instead.");
 }
 
 //
@@ -98,6 +132,11 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
   spyre_tensor_impl_->spyre_layout = stl;
   spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
   spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
+  // Same as shallow_copy_and_detach_core. A view that changed the geometry
+  // carries the map too; has_intact_reservation() is what then rejects it:
+  // get_reserved_dims() returns nullopt and resize_ raises (spyre_resize_
+  // checks the raw map first, then has_intact_reservation()).
+  spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   return self_;
 }
 
@@ -125,6 +164,7 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
   spyre_tensor_impl_->spyre_layout = stl;
   spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
   spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
+  spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   return self_;
 }
 
@@ -170,7 +210,8 @@ const at::Tensor& spyre_as_strided_(
     const at::Tensor& self, c10::SymIntArrayRef size,
     c10::SymIntArrayRef stride, std::optional<c10::SymInt> storage_offset_) {
   check_sharded_view(self, size, stride,
-                     storage_offset_.value_or(self.sym_storage_offset()));
+                     storage_offset_.value_or(self.sym_storage_offset()),
+                     /*allow_box=*/false);
   return at::native::as_strided__symint(self, size, stride, storage_offset_);
 }
 
@@ -190,6 +231,10 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
   if (device_layout == orig_impl->spyre_layout) {
     spyre_impl->dma_sizes = orig_impl->dma_sizes;
     spyre_impl->dma_strides = orig_impl->dma_strides;
+    // Only here: dma_sizes/dma_strides still describe the original allocation,
+    // so has_intact_reservation() stays meaningful. In the else branch they
+    // are reset to this view's own shape and the check would pass trivially.
+    spyre_impl->reserved_dims = orig_impl->reserved_dims;
   } else {
     spyre_impl->dma_sizes = size.vec();
     spyre_impl->dma_strides = stride.vec();
@@ -242,6 +287,9 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
   if (stl == orig_stl) {
     spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
     spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
+    // As in as_strided_with_layout: only here do dma_sizes/dma_strides still
+    // describe the original allocation, so the intact check stays meaningful.
+    spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   } else {
     spyre_tensor_impl_->dma_sizes = size.vec();
     spyre_tensor_impl_->dma_strides = stride.vec();

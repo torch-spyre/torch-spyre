@@ -53,15 +53,15 @@ scratchpad memory. (`hbm_pool` was renamed from the older key name `pool`;
 if you see `'pool'` in older docs or history, it refers to the same thing.)
 Whether a buffer's address is pinned (no `affine.apply` needed) or needs
 per-iteration `affine.apply` addressing is determined by
-`loop_info.output_tiled_dims`/`tiled_dims_per_read` and
-`TensorArg.device_tile_advance_expr` — not a standalone flag. (An older
+the loop variable's coefficient in the access's index (read through
+`loop_facts.read_advance`) and `TensorArg.device_tile_advance_expr` — not a standalone flag. (An older
 `per_tile_fixed` boolean duplicated this decision and was removed; if you
 see it mentioned in older docs or history, it's the same "pinned vs.
-advancing" distinction now derived from `loop_info`/
-`device_tile_advance_expr` directly.) `lx` buffers are typically pinned;
+advancing" distinction now derived from the index (`loop_facts.read_advance`)
+and `device_tile_advance_expr` directly.) `lx` buffers are typically pinned;
 `hbm_pool` buffers are ordinary HBM addresses that usually still need
 per-iteration addressing like any other HBM operand — but check
-`loop_info`/`device_tile_advance_expr` for the specific buffer rather than
+`loop_facts.read_advance`/`device_tile_advance_expr` for the specific buffer rather than
 assuming from the allocation kind alone.
 
 ## `WrapperHandler` swaps must account for stride, not just name

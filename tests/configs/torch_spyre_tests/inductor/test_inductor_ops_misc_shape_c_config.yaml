@@ -8,7 +8,7 @@
 # shape group, assign it to whichever shard keeps the jobs balanced.
 
 test_suite_config:
-  labels: [unit, regression, trunk]
+  labels: [unit, regression, integration, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
       unlisted_test_mode: skip
@@ -18,6 +18,7 @@ test_suite_config:
             - TestOps::test_cat.*
             - TestOps::test_pad.*
             - TestOps::test_keep_by_index.*
+            - TestOps::test_mask_by_index.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

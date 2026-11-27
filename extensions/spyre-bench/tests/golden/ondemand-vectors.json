@@ -1,0 +1,2341 @@
+[
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "NONE",
+    "login": "rando",
+    "permission": "read"
+   },
+   "flags": {
+    "bench": "sanity"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "decoder+startup@sanity"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "decoder+startup@sanity"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "decoder+startup@sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "suites": [
+        "decoder",
+        "startup"
+       ],
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "decoder+startup"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "decoder+startup"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "decoder+startup",
+      "product": "spyre-inference",
+      "selection": {
+       "suites": [
+        "decoder",
+        "startup"
+       ],
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "spyre-inference:decoder@core;torch-spyre:ladder@core"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "spyre-inference:decoder@core;torch-spyre:ladder@core"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "decoder@core",
+      "product": "spyre-inference",
+      "selection": {
+       "suites": [
+        "decoder"
+       ],
+       "tier": "core"
+      }
+     },
+     {
+      "as_asked": "ladder@core",
+      "product": "torch-spyre",
+      "selection": {
+       "suites": [
+        "ladder"
+       ],
+       "tier": "core"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "spyre-inference:decoder@core;torch-spyre:ladder@core"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "spyre-inference:decoder@core;torch-spyre:ladder@core"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "decoder@core",
+      "product": "spyre-inference",
+      "selection": {
+       "suites": [
+        "decoder"
+       ],
+       "tier": "core"
+      }
+     },
+     {
+      "as_asked": "ladder@core",
+      "product": "torch-spyre",
+      "selection": {
+       "suites": [
+        "ladder"
+       ],
+       "tier": "core"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "tier 'core' for spyre-inference is not available here (internal requests only)",
+    "tier 'core' for torch-spyre is not available here (internal requests only)"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "a_1,b-2"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "a_1,b-2"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "a_1,b-2",
+      "product": "spyre-inference",
+      "selection": {
+       "cases": [
+        "a_1",
+        "b-2"
+       ]
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "#pr-sanity-with-reuse"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "#pr-sanity-with-reuse"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "#pr-sanity-with-reuse",
+      "product": "spyre-inference",
+      "selection": {
+       "cases": [
+        "pr-sanity-with-reuse"
+       ]
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "hf-adapters:hf-models@sanity",
+    "bench-reuse": "only"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "hf-adapters:hf-models@sanity",
+     "reuse": "only"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "only",
+    "selections": [
+     {
+      "as_asked": "hf-models@sanity",
+      "product": "hf-adapters",
+      "selection": {
+       "suites": [
+        "hf-models"
+       ],
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-reuse": "never"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "reuse": "never"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "never",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "reuse=never is not available here"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-reuse": "never"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "reuse": "never"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "never",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-reuse": "alwys"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "reuse='alwys': one of if_valid, never, prefer, only"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-force": "all"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "force": "all"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [
+     "all"
+    ],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "force=all is not available here: name the cases"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-force": "all"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "force": "all"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [
+     "all"
+    ],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-force": "x_1,y",
+    "bench-reuse": "prefer"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "force": "x_1,y",
+     "reuse": "prefer"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [
+     "x_1",
+     "y"
+    ],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "prefer",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-force": "x",
+    "bench-reuse": "never"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "force has no effect with reuse=never: everything runs already"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-force": "all,x"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "force=all cannot be combined with case names"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-profile": "light"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "profile": "light"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "light",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "profile=light is not available here"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-profile": "light"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "profile": "light"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "light",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-profile": "full"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "profile": "full"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "full",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "profile=full is not available here"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "main"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "main"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "main"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "build:orch#12"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "build:orch#12"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "build:orch#12"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "tomorrow"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='tomorrow': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "nightly"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "nightly"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "tag:release-1"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "tag:release-1"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "tag:release-1"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "tag:release-1"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "tag:release-1"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "tag:release-1"
+   },
+   "violations": [
+    "vs=tag is not available here"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "build:orch#12"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "build:orch#12"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "build:orch#12"
+   },
+   "violations": [
+    "vs=build is not available here"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10"
+   },
+   "violations": [
+    "vs=artifact is not available here"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "artifact:0B7F1C52-3D1E-4A39-9C21-5F6A8E2D4B10"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='artifact:0B7F1C52-3D1E-4A39-9C21-5F6A8E2D4B10': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "artifact:not-an-id"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='artifact:not-an-id': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "ref:ref-a"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "ref:ref-a"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "ref:ref-a"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "ref:ref-a"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "vs": "ref:ref-a"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "ref:ref-a"
+   },
+   "violations": [
+    "vs=ref is not available here"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "ref:"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='ref:': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "ref:a b"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='ref:a b': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "ref:$(id)"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='ref:$(id)': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "tag:x;rm"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='tag:x;rm': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "build:a/../b#1"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='build:a/../b#1': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "main:x"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "vs='main:x': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "tag:[x](http://e.co)"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "error": "vs='tag: x (http:\u200b//e.co)': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-clean": "true"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "clean": "true"
+    },
+    "budget": 0.0,
+    "clean": true,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "NONE",
+    "login": "rando",
+    "permission": "read"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-clean": "true"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "clean": "true"
+    },
+    "budget": 0.0,
+    "clean": true,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "clean=true needs write access to the repository"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-clean": "true",
+    "bench-max-wait": "45m"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "clean": "true",
+     "max-wait": "45m"
+    },
+    "budget": 0.0,
+    "clean": true,
+    "env": "",
+    "force": [],
+    "max_wait_s": 2700,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-clean": "true",
+    "bench-max-wait": "2h"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "clean": "true",
+     "max-wait": "2h"
+    },
+    "budget": 0.0,
+    "clean": true,
+    "env": "",
+    "force": [],
+    "max_wait_s": 7200,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "max-wait is capped at 60m"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-max-wait": "45m"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "max-wait only applies with clean=true"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-clean": "maybe"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "clean='maybe': use true or false"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-env": "env-a"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "env": "env-a"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "env-a",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "env= is not available here: the environment is fixed by the workflow"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-env": "env-a"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "env": "env-a"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "env-a",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-budget": "3"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "budget": "3"
+    },
+    "budget": 3.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-budget": "50"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "budget": "50"
+    },
+    "budget": 50.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "budget 50 exceeds the host cap 4"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-budget": "nan"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "budget must be a positive, finite number of device-hours"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-budget": "-1"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "budget must be a positive, finite number of device-hours"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "core"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "core"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "core",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "core"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "tier 'core' for spyre-inference is not available here (internal requests only)"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "core"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "core"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "core",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "core"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "extended"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "extended"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "extended",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "extended"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": [
+    "tier 'extended' for spyre-inference is not available here (ops requests only)"
+   ]
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "decoder@sanitty"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "tier 'sanitty' is not one of sanity, core, extended; did you mean 'sanity'"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "spyre-infernce:sanity"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "unknown product 'spyre-infernce'; did you mean 'spyre-inference'"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "torch-spyre:a;torch-spyre:b"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "product 'torch-spyre' appears twice: join its selections in one"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "bad name"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "case 'bad name': letters, digits, '.', '_' and '-' only"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "a$(id)"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "case 'a$(id)': letters, digits, '.', '_' and '-' only"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": ""
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "bench= needs a selection, for example bench=sanity"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "a,b@core"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "selection 'a,b@\u200bcore': use 'suite+suite@\u200btier' or a comma list of cases, not both"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "purpose": "pr"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "purpose": "pr"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "purpose": "nightly"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "purpose='nightly': a comment can only ask for purpose 'pr'"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench-reuse": "only"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "bench-* flags need a selection: bench= selection"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "sha": "abcdef1"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "sha": "abcdef1"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "abcdef1",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "sha": "ABC"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "error": "sha='ABC': 7 to 40 lower-case hex characters of the head commit"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "@org/team"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "suite '': letters, digits, '.', '_' and '-' only"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-vs": "build:[click](http://e.co)#1"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "error": "vs='build: click (http:\u200b//e.co)#1': main, tag:NAME, build:JOB#N, artifact:UUID or ref:KEY"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-sha": "https://evil.example/x"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "error": "sha='https:\u200b//evil.example/x': 7 to 40 lower-case hex characters of the head commit"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "www.evil.com"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "www.evil.com"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "www.evil.com",
+      "product": "spyre-inference",
+      "selection": {
+       "cases": [
+        "www.evil.com"
+       ]
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-reuse": "![i](http://e/p.png)"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "reuse='  i (http:\u200b//e/p.png)': one of if_valid, never, prefer, only"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-budget": "1\u202e2"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "budget='1 u202e2': a number of device-hours"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-budjet": "3"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "unknown flag 'bench-budjet'; did you mean 'budget'"
+  }
+ }
+]

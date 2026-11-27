@@ -55,16 +55,19 @@ import unittest
 import warnings
 from unittest.mock import patch
 
+import pytest
 import torch
+import torch.nn.functional as F
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.constants import RESTICKIFY_OP
+from torch_spyre._inductor.loop_facts import counted_loop_path
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
-from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+from torch_spyre._inductor.wsr.for_each_tile import Gather, for_each_tile
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     PrescribedRegion,
@@ -77,6 +80,8 @@ from for_each_tile_fixtures import (
     COLS,
     ROWS,
     D,
+    EMBED_TILE,
+    EMBED_TOKENS,
     K,
     LK,
     LQ,
@@ -92,11 +97,17 @@ from for_each_tile_fixtures import (
     abs_add_mul_tiled_reference,
     abs_tiled_fn,
     abs_tiled_reference,
+    upcast_add_tiled_fn,
+    upcast_add_tiled_reference,
     add_tiled_fn,
     add_tiled_reference,
+    gate_up_silu_tiled_fn,
+    gate_up_silu_tiled_reference,
     batched_online_softmax_fn,
     carried_expert_sum_fn,
     carried_reduction_fn,
+    embedding_restickify_inputs,
+    embedding_restickify_table_fn,
     fill_add_tiled_fn,
     matmul_x_yt_nested_fn,
     matmul_x_yt_tile_m_fn,
@@ -132,6 +143,10 @@ from for_each_tile_fixtures import (
     paged_gather_nested_fn,
     paged_gather_nested_reference,
     paged_gather_reference,
+    reshape_mul_sum_tiled_fn,
+    reshape_mul_sum_tiled_reference,
+    reshape_sum_tiled_fn,
+    reshape_sum_tiled_reference,
     scatter_carry_fn,
     scatter_carry_old_value_fn,
     softmax_row_tiled_fn,
@@ -322,6 +337,56 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             ):
                 compiled(values, indices, initial)
 
+    def test_scatter_carry_relayout_copies_are_in_the_loop(self):
+        """The mutation relayout of a scatter into a carry puts BOTH full-buffer
+        copies inside the scatter's loop ("so other carry readers observe the
+        preceding iteration's updates"), by node membership and not only by the
+        ``loop_group_id`` stamped on them.
+
+        ``reorder_nonstick_dims_mutation`` placed the copy-back by flat index after
+        the last body op, which the flat view puts at the top level; the copy then
+        claimed the loop without being in it. The pipeline's later ``expanded()``
+        round trip rebuilt nodes from ``loop_group_id`` and hid that, until
+        ``dedup_and_promote_constants`` stopped needing it. Without the fix the
+        compile fails in the scheduler ("Loop group (0,) is not contiguous"), which
+        is this test's regression signal; the assertions below say where each
+        member sits when it does not.
+
+        The loop's four members are the accumulate (``acc + value``), the copy-in,
+        the ``index_copy`` and the copy-back. The loop checker does not flag a
+        member outside its node: it checks that an op's index uses enclosing
+        variables, not that an op with a ``loop_group_id`` is inside the node."""
+        rows = 32  # a shape the runtime-index test compiles: the scatter is legal
+        generator = torch.Generator().manual_seed(930)
+        values = (torch.randn(4, rows, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        indices = torch.stack(
+            [torch.randperm(rows * 4, generator=generator)[:rows] for _ in range(4)]
+        ).to(torch.int32)
+        initial = (torch.randn(rows * 4, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        result: dict = {}
+        with (
+            config.patch(
+                backend_loop_unroll=False, lx_planning=True, hbm_pool_planning=True
+            ),
+            torch.inference_mode(),
+            # A cache hit would skip the pipeline this test inspects, leaving
+            # ``result`` empty.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                ts_passes, "CustomPreSchedulingPasses", _record_loop_membership(result)
+            ),
+        ):
+            torch.compile(scatter_carry_fn, fullgraph=True, dynamic=False)(
+                values.to(DEVICE_NAME), indices.to(DEVICE_NAME), initial.to(DEVICE_NAME)
+            )
+        self.assertIn("top_level", result, "the pipeline did not run")
+        self.assertEqual(result["top_level"], [])
+        self.assertEqual(len(result["in_body"]), 4, result["in_body"])
+
     def test_scatter_carry_preserves_old_value_read_after_update(self):
         from torch_spyre._C import SpyreTensorLayout, get_device_dtype
         from torch_spyre.ops.fallbacks import FallbackWarning
@@ -453,7 +518,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         to scatter elements from one stick to multiple sticks").
 
         Now passes: confirmed via isolated stash/pop bisection that this is
-        fixed by the splice-var/``loop_info`` symbol-consistency work in
+        fixed by the splice-var/``loop_member`` symbol-consistency work in
         ``spyre_kernel.py``/``for_each_tile_lowering.py`` (the same issue
         #4706 OS-5/``_synthesize_dim_hints_for_group`` fixes described in
         ``test_nested_for_each_tile_value_correct``'s docstring, which
@@ -472,6 +537,54 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         compiled = torch.compile(split_k_fn, backend="inductor", fullgraph=True)
         out = compiled(X_spyre, Y_spyre)
 
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_carry_mode_split_k_self_matmul(self):
+        """A coarse-tiled self-matmul: one input is both operands of a split-K
+        matmul in the loop (issue #4198).
+
+        ``insert_restickify`` once copied a consumer's stored per-read advance to
+        each restickify copy, finding the read by buffer name alone and zeroing it
+        after the first, so the second read of the same buffer got no advance. The
+        stored record is gone (#5863 stage 7); a copy's advance now comes from its
+        own read's index, resolved by name and index. The input is passed twice
+        because one tile read twice in a body is a separate gap (#6479).
+        """
+        from torch_spyre._inductor import insert_restickify as restickify
+
+        X = cached_xavier((M, K))
+        ref = dl16_round(X.float()) @ dl16_round(X.float()).T
+
+        def self_split_k(A, B):
+            def body(acc, ops):
+                a, b = ops
+                return acc + a @ b.T, None
+
+            final, _ = for_each_tile(
+                body,
+                (A, B),
+                dims=(-1, -1),
+                tile_size=64,
+                init=torch.zeros(M, M, device=A.device, dtype=A.dtype),
+            )
+            return final
+
+        X_spyre = X.to(DEVICE_NAME)
+        # Caches off: a cache hit skips the passes, and the call count with them
+        # (#6047).
+        with (
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                restickify, "_moved_loop_term", wraps=restickify._moved_loop_term
+            ) as moved_loop_term,
+        ):
+            compiled = torch.compile(self_split_k, backend="inductor", fullgraph=True)
+            out = compiled(X_spyre, X_spyre)
+
+        # The restickify of a looped consumer ran: the path #4198 was about.
+        self.assertGreaterEqual(moved_loop_term.call_count, 1)
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
@@ -623,11 +736,11 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         pool invariant, and let the body read its page index out of the tile.
         The index is a point read whose address advances with the spliced loop
         and has no iteration dim, so this drives
-        coarse_tile._point_splice_advance_for_dep (record the per-trip
-        advance), leave the read direct (never staged into scratch),
-        _rebase_point_splice_reads (pin the index to iteration 0 so the
-        advance is not applied twice), and insert_restickify's per-dep advance
-        handover. Numerics, not just compilation: every one of those can be
+        the advance read off the index, leave the read direct (never staged
+        into scratch),
+        keep the loop term in the index (per_trip_index pins it in the base
+        coordinates, so the advance is not applied twice), and
+        insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be
         got wrong in a way that compiles and re-reads the same page.
 
         Two matmuls per trip and a distinct page per trip, so an advance
@@ -760,6 +873,51 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
 
+    def test_gate_up_silu_chunk_tiled_multi_stick(self):
+        """#6329: silu(gate) * up, splitting the tile's last dim with `chunk`
+        inside the body. The upper half's load index is a loop symbol plus
+        the chunk-boundary offset within the same tile dimension, which used
+        to fail to delinearize back into per-dim marker coordinates.
+
+        Each half of the chunk is a full 64-element stick wide
+        (STICK_COLS=128 // 2): a chunk boundary narrower than one stick hits
+        a separate, unrelated restickify-padding limitation (not this bug;
+        `LoopStructureError`/`counted loop ... not all members of it`), so
+        this fixture is only exercised at the stick-aligned size.
+        """
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = gate_up_silu_tiled_reference(X.float())
+
+        compiled = torch.compile(
+            gate_up_silu_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 128)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def _check_upcast_add_tiled(self, downcast_in_body):
+        # Multiples of 1/64 below 5 are exact in fp16 and fp32, so a staggered
+        # stick read as standard cannot hide inside a tolerance.
+        A = (torch.arange(STICK_ROWS * STICK_COLS) % 257 / 64).to(torch.float16)
+        A = A.reshape(STICK_ROWS, STICK_COLS)
+        compiled = torch.compile(
+            upcast_add_tiled_fn, backend="inductor", fullgraph=True, dynamic=False
+        )
+        out = compiled(A.to(DEVICE_NAME), 64, downcast_in_body)
+
+        torch.testing.assert_close(
+            out.cpu(), upcast_add_tiled_reference(A), atol=0, rtol=0
+        )
+
+    def test_upcast_add_downcast_in_body(self):
+        self._check_upcast_add_tiled(downcast_in_body=True)
+
+    def test_upcast_add_in_body_downcast_after_loop(self):
+        self._check_upcast_add_tiled(downcast_in_body=False)
+
     def test_abs_add_mul_tiled_small(self):
         A = cached_randn((ROWS, COLS))
         B = cached_randn((ROWS, COLS), differentiation=1)
@@ -829,6 +987,73 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         # corrupt stick groups after the first with an error far exceeding
         # fp16 rounding noise on random inputs in [0, 1).
         torch.testing.assert_close(out.cpu().float(), ref, atol=0.02, rtol=0.1)
+
+    def test_reshape_sum_tiled_multi_stick(self):
+        """Issue #6407 shape class: the reduce axis only exists in a reshaped
+        view of the tile, entering the load with a stride that is a multiple
+        of the tile's row stride (here 16*128 vs 128)."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 128, 8)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 128, 8)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_column_tiled(self):
+        """#6407 on column tiles: the tile reads its input at row stride 128
+        but its own layout has row stride 64, so folding the reduce term into
+        any dim but the row dim reads the wrong elements."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 64, 8, dim=1)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 64, 8, 1)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_tiled_3d_inner_fold(self):
+        """A [2, 4, 64] row tile reshaped to (4, 2, 64): the reduce term 128*r
+        only divides the inner stride 64, so the fold leaves that coordinate
+        out of range -- harmless, since the tile reads at its own strides."""
+        X = cached_randn((4, 4, 64))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 2, 4)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 2, 4)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_mul_sum_tiled_whole_operand(self):
+        """Wrong-answer form of #6407: a whole operand keeps the reduce axis in
+        the kernel, so the bug compiled and read one tile window per step."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        W = cached_randn((128, STICK_COLS))
+        ref = reshape_mul_sum_tiled_reference(X.float(), W.float(), 128, 8)
+
+        compiled = torch.compile(
+            reshape_mul_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X.to(DEVICE_NAME), W.to(DEVICE_NAME), 128, 8)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
 
 
 class TestForEachTileNestedMapE2E(_DynamoResetTestCase):
@@ -1076,6 +1301,44 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
         )
 
 
+def _record_loop_membership(result: dict):
+    """A pre-scheduling pipeline that records, once it is done, where the ops that
+    claim a loop (``enclosing_loops``) sit in the node tree.
+
+    An extern constant is exempt: ``dedup_and_promote_constants`` hoists a body
+    constant to the head of the graph and it keeps its ``loop_member`` (see
+    ``counted_loop_path``), so it claims a loop from the top level by design.
+    ``result`` is filled in rather than kept on the class, so tests share no state.
+    """
+    from torch_spyre._inductor.ir import SpyreConstantFallback
+    from torch_spyre._inductor.loop_facts import enclosing_loops
+    from torch_spyre._inductor.loop_node import LoopNode
+
+    class _Record(CustomPreSchedulingPasses):
+        def __call__(self, graph) -> None:
+            super().__call__(graph)
+
+            def claims_a_loop(op):
+                return not isinstance(op, SpyreConstantFallback) and bool(
+                    enclosing_loops(op)
+                )
+
+            result["top_level"] = [
+                op.get_operation_name()
+                for op in graph.operations
+                if not isinstance(op, LoopNode) and claims_a_loop(op)
+            ]
+            result["in_body"] = [
+                op.get_operation_name()
+                for node in graph.operations
+                if isinstance(node, LoopNode)
+                for op in all_ops(node.body)
+                if claims_a_loop(op)
+            ]
+
+    return _Record
+
+
 class _CollectRegions(CustomPreSchedulingPasses):
     """Pre-scheduling pipeline that records the graph's regions once it is done."""
 
@@ -1123,7 +1386,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
             if name in region.unstamped:
                 continue
             self.assertEqual(
-                op.loop_info.loop_group_id[0],
+                counted_loop_path(op, include_extern=True)[0],
                 region.loop_group_id,
                 f"{name} is stamped by another loop than its region's",
             )
@@ -1131,8 +1394,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         strays = [
             op.get_operation_name()
             for op in outside
-            if getattr(op, "loop_info", None) is not None
-            and op.loop_info.loop_group_id[0] == region.loop_group_id
+            if counted_loop_path(op, include_extern=True)[:1] == (region.loop_group_id,)
         ]
         self.assertFalse(strays, f"{strays} belong to the loop but lie outside it")
 
@@ -1172,7 +1434,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         (region,) = regions
         self._assert_region_is_whole(operations, region)
         depths = {
-            len(op.loop_info.loop_count)
+            len(counted_loop_path(op, include_extern=True))
             for op in operations[region.start : region.stop]
             if op.get_operation_name() not in region.unstamped
         }
@@ -1344,7 +1606,6 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
     """
 
     def test_substick_indirect_advance_is_refused(self):
-        import pytest
         from torch._inductor.exc import InductorError
 
         ids = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32).to(DEVICE_NAME)
@@ -1358,6 +1619,61 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
         compiled = torch.compile(substick_gather_fn, backend="inductor", fullgraph=True)
         with pytest.raises(InductorError, match="cuts tensor.*physical stick"):
             compiled(pool, ids, init)
+
+
+# --- Slice(dim, extent) as the for_each_tile#5763 remedy --------------------
+
+SCALE_TRIPS, SCALE_WIDTH = 4, 256
+
+
+def slice_scale_row_fn(x, scale, init):
+    from torch_spyre._inductor.wsr import Slice, for_each_tile
+
+    def fn(x, scale, init):
+        def body(carry, tiles):
+            x_tile, scale_row = tiles
+            return (carry[0] + x_tile * scale_row,), None
+
+        (acc,), _ = for_each_tile(
+            body, (x, scale), dims=(0, Slice(0, extent=1)), tile_size=1, init=(init,)
+        )
+        return acc
+
+    return fn(x, scale, init)
+
+
+class TestForEachTileSliceScaleTableE2E(_DynamoResetTestCase):
+    """Slice(dim, extent) compiled on device at the exact shape issue #5763 reports.
+
+    #5763 ("for_each_tile with a short Gather index fails") gathers one row at a
+    time from a [4, 256] fp16 scale table with a 4-long index -- the same
+    sub-stick, one-element-per-trip advance ``TestForEachTileSubStickAdvanceE2E``
+    above still refuses; Gather itself is unchanged by this PR. ``Slice(0,
+    extent=1)`` is the issue's other accepted fix: a per-trip row that is really
+    just "the next row" needs no index table at all.
+    ``test_slice_extent_differs_from_tile_size`` in test_for_each_tile.py already
+    covers this through ``_assert_lowers`` -- the post-grad graph's shape only,
+    no device involved. This test compiles the issue's own [4, 256] shape through
+    the real Spyre backend, so the fix is exercised where #5763 originally
+    failed -- codegen -- and "downstream needs no change" is checked in CI, not
+    just asserted in the PR description.
+    """
+
+    def test_slice_scale_table_compiles_at_issue_shape(self):
+        x = cached_randn((SCALE_TRIPS, SCALE_WIDTH))
+        scale = cached_randn((SCALE_TRIPS, SCALE_WIDTH), differentiation=1)
+        init = torch.zeros(1, SCALE_WIDTH, dtype=torch.float16)
+
+        ref = torch.zeros(1, SCALE_WIDTH)
+        for i in range(SCALE_TRIPS):
+            ref = ref + dl16_round(x[i : i + 1].float()) * dl16_round(
+                scale[i : i + 1].float()
+            )
+
+        compiled = torch.compile(slice_scale_row_fn, backend="inductor", fullgraph=True)
+        out = compiled(x.to(DEVICE_NAME), scale.to(DEVICE_NAME), init.to(DEVICE_NAME))
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=1e-2, rtol=1e-2)
 
 
 class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
@@ -1418,6 +1734,73 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         x, y = shaped_randn(256, 128), shaped_randn(256, 128, seed=1)
         ref = x.float().t() @ y.float()
         self._check(restickify_matmul_xt_y_fn, (x, y), ref, trips=2, atol=0.5)
+
+    def test_embedding_restickify_table_no_span_overflow(self):
+        """Regression test for issue #6277.
+
+        F.embedding(ids, table) inside a for_each_tile loop, with `table` a
+        (49216, 4096) fp16 gather source (~403 MB) and only `ids` tiled. The
+        indirect-access layout the embedding needs forces insert_restickify
+        to build a full, untiled relayout copy of `table` inside the loop
+        body -- a copy whose per-core span (403 MB) only clears the 256 MB
+        hardware limit if the work-division planner is free to split its row
+        dim across cores. Before the fix, _transfer_loop_info left the
+        embedding consumer's own loop_tiled_dims on that copy's deep-copied
+        LoopMember, which coarse_tile_local_dim_split_domains misread as
+        "the copy's row dim is loop-tiled" and pinned its core split to 1,
+        making every split attempt fail with "per-core tensor span 384.500
+        MB ... exceeds hardware limit of 256.00 MB" -- reproduced by
+        temporarily reverting the two-line fix in insert_restickify.py's
+        `elif hasattr(op, "loop_member")` branch. The sibling non-looped case
+        (same bug class, no loop involved) is covered by
+        test_embedding_large_vocab_table_no_span_overflow in
+        test_indirect_access_gather.py.
+
+        atol/rtol are tighter than this class's matmul-oriented 0.1 default:
+        embedding is a pure index copy with no arithmetic, so device output
+        must match the CPU reference up to fp16 round-trip only, the same
+        tolerance indirect_access_common.run_e2e uses by default for the
+        gather-op family.
+
+        Written against run_and_get_code directly rather than this class's
+        shared ``_check`` helper: ``_check``'s ``ops=`` check looks for a
+        literal ``op='ReStickifyOpHBM'`` in the generated SDSC source, which
+        is how restickify shows up for the *other* tests in this class (a
+        per-trip relayout handled by ``_transfer_loop_info``'s first
+        branch). The copy this test exercises is the *loop-invariant*
+        full-table case handled by that function's ``elif hasattr(op,
+        "loop_member")`` branch -- the one the fix touches -- which SDSC
+        lowers to a plain ``op='identity'`` whose ``debug_handle.ir_chain``
+        names the restickify IR node (``'restickify_default'``) instead.
+        """
+        import regex as re
+        from torch._inductor.utils import run_and_get_code
+
+        table, ids = embedding_restickify_inputs()
+        ref = F.embedding(ids.flatten().long(), table)
+
+        compiled = torch.compile(
+            embedding_restickify_table_fn, backend="inductor", fullgraph=True
+        )
+        out, code = run_and_get_code(
+            compiled, table.to(DEVICE_NAME), ids.to(DEVICE_NAME)
+        )
+        src = "\n".join(code)
+
+        self.assertIn("LoopSpec(", src)
+        counts = [int(c) for c in re.findall(r"count=sympify\('(\d+)'\)", src)]
+        self.assertEqual(
+            counts,
+            [EMBED_TOKENS // EMBED_TILE],
+            f"unexpected loop trip counts in:\n{src}",
+        )
+        self.assertIn(
+            "restickify_default",
+            src,
+            f"expected the gather table's restickify copy in:\n{src}",
+        )
+
+        torch.testing.assert_close(out.cpu().float(), ref.float(), atol=0.01, rtol=0.01)
 
     def test_restickify_add_nested_tiles(self):
         a, x = shaped_randn(256, 128), shaped_randn(128, 256, seed=1)
@@ -1633,7 +2016,9 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         ]
         self.assertTrue(other_advances, "expected a fixed activation read")
         self.assertEqual(other_advances, [None] * len(other_advances))
-        weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
+        # The advance is written in the loop's own induction variable (u<n>), which
+        # is an integer, so floor(64*u0) simplifies to 64*u0.
+        weight_step = re.fullmatch(r"(\d+)\*u\d+", weight_reads[0])
         self.assertIsNotNone(weight_step)
         # TensorArg addresses are in df16 sticks.  64 sticks * 64 elements
         # per stick is one H*F = 4096-element expert slab.
@@ -2043,6 +2428,362 @@ class TestForEachTileCarriesInPlaceE2E(_DynamoResetTestCase):
 
         torch.testing.assert_close(a.cpu().float(), ref_a, atol=0, rtol=0)
         torch.testing.assert_close(b.cpu().float(), ref_b, atol=0, rtol=0)
+
+
+def _length_tiled_double_fn(x: torch.Tensor) -> torch.Tensor:
+    """for_each_tile over a varying length, so the trip count is symbolic."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 64)
+    torch._check(rows <= 512)
+    torch._check(rows % 32 == 0)
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile * 2
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=32, out_dim=0)
+    return out
+
+
+class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
+    """One compiled graph serves a declared range, at a second tile size.
+
+    A second body op (a plain scale) and a second granularity (32 rows) beside
+    ``tests/inductor/test_symbolic_loop_e2e.py``'s gelu at 64. The tensor is
+    declared with ``.to(DEVICE_NAME, dynamic=...)`` (#5179), so its buffer is
+    reserved at the maximum and the kernel's geometry is built there, and the
+    launch binds the logical size into the loop's dimension slot. 96 rows is
+    three trips of 32 and not a multiple of 64, so the granularity in use is
+    the declared one and not the other test's.
+    """
+
+    SPEC = {"min": 64, "max": 512, "granularity": 32}
+
+    def test_one_graph_right_at_every_size(self):
+        from torch._dynamo.utils import counters
+
+        counters.clear()
+        torch.manual_seed(0)  # a rare tolerance miss must be reproducible
+        x = torch.randn(512, 64, dtype=torch.float16)
+        y = x.to(DEVICE_NAME, dynamic={0: self.SPEC})
+        compiled = torch.compile(_length_tiled_double_fn, fullgraph=True)
+
+        for rows in (128, 64, 512, 96, 256):
+            y.resize_((rows, 64))
+            out = compiled(y).cpu().float()
+            # Not exact: the device rounds fp16 arithmetic its own way, and a
+            # plain eager ``y * 2`` on a Spyre tensor is already one fp16 ulp off
+            # the host on about half the elements (measured 6 Nov 2026). One
+            # ulp of a value below 4 is under 4e-3, so 1e-2 is a real check of
+            # the rows and not of the rounding.
+            torch.testing.assert_close(
+                out, x[:rows].float() * 2, atol=1e-2, rtol=1e-2, msg=f"at {rows} rows"
+            )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+
+# #6496: shapes for a loop whose first reduction is over rows of Q and whose
+# body also has ops of other sizes (the K page), with Q built before the loop.
+FS_E, FS_KV, FS_QG, FS_D, FS_N, FS_PAGES = 4, 2, 4, 128, 128, 2
+
+
+def rows_max_scores_fn(query, rows, k_pages):
+    """Running max of normalized-Q @ K_page^T scores over the K pages.
+
+    Q comes from an index_select before the loop, a [4, 8, 128] pointwise
+    node with as many elements as the loop's first reduction (32 rows x 128).
+    """
+    q = query.index_select(0, rows).reshape(FS_E, FS_KV, FS_QG, FS_D)
+
+    def body(carry, tiles):
+        k_page, q = tiles
+        qn = q / q.abs().amax(-1, keepdim=True)
+        k = k_page[0] * 0.5
+        sc = qn @ k.transpose(-2, -1)
+        return torch.maximum(carry, sc.amax(-1, keepdim=True)), None
+
+    init = torch.full(
+        (FS_E, FS_KV, FS_QG, 1),
+        float("-inf"),
+        dtype=torch.float16,
+        device=query.device,
+    )
+    return for_each_tile(body, (k_pages, q), dims=(0, None), tile_size=1, init=init)[0]
+
+
+def rows_max_scores_reference(query, rows, k_pages):
+    q = query.float().index_select(0, rows.long()).reshape(FS_E, FS_KV, FS_QG, FS_D)
+    qn = q / q.abs().amax(-1, keepdim=True)
+    sc = qn.unsqueeze(0) @ (k_pages.float() * 0.5).transpose(-2, -1)
+    return sc.amax(-1, keepdim=True).amax(0)
+
+
+def fp8_folded_rows_max_fn(q, k_pages):
+    """The prefill body of #6496: Q rows folded and FP8-quantized in the loop."""
+    rows = 4
+
+    def body(carry, tiles):
+        k_page, q = tiles
+        folded = q.reshape(FS_KV, FS_QG * rows, FS_D)
+        scale = torch.ops.spyre.quantscalepertokenfp8(folded, 1.0)
+        q8 = torch.ops.spyre.quantize_fp8_with_scale(folded, scale)
+        k8 = torch.ops.spyre.qfp8wt(k_page[0].transpose(-2, -1).contiguous())
+        sc = torch.ops.spyre.scaled_bmm(q8, k8, out_dtype=torch.float16) * scale
+        sc = sc.reshape(FS_KV, FS_QG, rows, FS_N)
+        return torch.maximum(carry, sc.amax(-1, keepdim=True)), None
+
+    init = torch.full(
+        (FS_KV, FS_QG, rows, 1), float("-inf"), dtype=torch.float16, device=q.device
+    )
+    return for_each_tile(body, (k_pages, q), dims=(0, None), tile_size=1, init=init)[0]
+
+
+class TestForEachTileFusionScoringE2E(_DynamoResetTestCase):
+    """A loop next to a node outside it that has the loop's first-reduction size.
+
+    The loop's scheduler node holds ops of several sizes and takes its group
+    from its first reduction. Inductor's fusion scoring
+    (``_try_reindex_pointwise_for_reduction``) runs before Spyre declines the
+    fusion and used to assert on such a loop ("expected pointwise sizes to
+    match pointwise_numel * red_numel", #6496). Spyre turns the reindex off.
+    """
+
+    def test_reduction_over_rows_of_a_tensor_built_before_the_loop(self):
+        torch.manual_seed(0)
+        query = torch.randn(2, FS_KV * FS_QG, FS_D, dtype=torch.float16)
+        rows = torch.arange(2, dtype=torch.int32).repeat(2)
+        k_pages = torch.randn(FS_PAGES, FS_E, FS_KV, FS_N, FS_D, dtype=torch.float16)
+
+        compiled = torch.compile(rows_max_scores_fn, dynamic=False, fullgraph=True)
+        out = compiled(*(t.to(DEVICE_NAME) for t in (query, rows, k_pages)))
+
+        torch.testing.assert_close(
+            out.cpu().float(),
+            rows_max_scores_reference(query, rows, k_pages),
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_fp8_quantize_of_rows_folded_in_the_loop(self):
+        """Compiles and runs; numerics of the FP8 block are covered elsewhere."""
+        torch.manual_seed(0)
+        q = torch.randn(FS_KV, FS_QG, 4, FS_D, dtype=torch.float16)
+        k_pages = (
+            (torch.randn(FS_PAGES, FS_KV, FS_N, FS_D) * 100)
+            .clamp(-448, 448)
+            .to(torch.float8_e4m3fn)
+            .to(torch.float16)
+        )
+
+        compiled = torch.compile(fp8_folded_rows_max_fn, dynamic=False, fullgraph=True)
+        out = compiled(q.to(DEVICE_NAME), k_pages.to(DEVICE_NAME)).cpu()
+
+        self.assertEqual(tuple(out.shape), (FS_KV, FS_QG, 4, 1))
+        self.assertTrue(torch.isfinite(out).all())
+
+
+class TestForEachTileCallerOwnedOutputE2E(_DynamoResetTestCase):
+    """for_each_tile(out=...) on device: each step writes its tile into the caller's tensor.
+
+    ``TestCallerOwnedOutput`` in test_for_each_tile.py checks the post-grad graph on
+    CPU. These compile through the Spyre backend, where the destination reaches the
+    loop as a MUTATED ADDITIONAL INPUT of the ``while_loop``, written by an
+    ``index_put`` in the body, which ``splice_while_loop`` rebinds to the caller's
+    buffer. Each test checks the caller's tensor after the call.
+    """
+
+    TRIPS, ROWS = 4, 32
+
+    def _run(self, fn, *args):
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        with (
+            torch.inference_mode(),
+            warnings.catch_warnings(),
+            config.patch(backend_loop_unroll=False),
+        ):
+            warnings.simplefilter("error", FallbackWarning)
+            return torch.compile(fn, fullgraph=True, dynamic=False)(*args)
+
+    @staticmethod
+    def _scatter_rows_fn(read_after=False):
+        """Trip ``i`` writes ``values[i] + 1`` into ``pool[index[i]]``."""
+
+        def fn(values, index, pool):
+            def body(_, tiles):
+                (v,) = tiles
+                return None, v[0] + 1
+
+            for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=1,
+                out_dim=Gather(0, index),
+                out=pool,
+            )
+            return pool * 2 if read_after else None
+
+        return fn
+
+    def _scatter_rows_inputs(self, width):
+        """Values, the index table on device, the initial pool and the expected pool.
+
+        The index table is ``[trips, rows]`` int32 with each trip's row starting at a
+        stick boundary (the layout #5157's scatter carry requires). All rows are
+        distinct, and the pool rows nothing writes must keep their initial value.
+        """
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        trips, rows = self.TRIPS, self.ROWS
+        generator = torch.Generator().manual_seed(931)
+        values = (
+            torch.randn(trips, rows, width, generator=generator, dtype=torch.float16)
+            * 0.125
+        )
+        index = torch.randperm(6 * rows, generator=generator)[: trips * rows]
+        index = index.reshape(trips, rows).contiguous()
+        initial = torch.full((6 * rows, width), 3.0, dtype=torch.float16)
+        expected = initial.float()
+        expected[index.reshape(-1)] = values.reshape(-1, width).float() + 1
+        index_layout = SpyreTensorLayout(
+            device_size=[trips, rows // 32, 32],
+            stride_map=[rows, 32, 1],
+            device_dtype=get_device_dtype(torch.int32),
+            valid_elements={(0,): trips, (1, 2): rows},
+        )
+        index = index.to(torch.int32).to(DEVICE_NAME, device_layout=index_layout)
+        return values.to(DEVICE_NAME), index, initial, expected
+
+    @expects_raise
+    def test_eager_out_of_range_index_is_rejected(self):
+        """An eager call checks the index on the host, which a Spyre kernel does not."""
+        values = torch.zeros(2, self.ROWS, 64, dtype=torch.float16).to(DEVICE_NAME)
+        index = torch.arange(2 * self.ROWS, dtype=torch.int32).reshape(2, self.ROWS)
+        index[1, -1] = 2 * self.ROWS
+        dest = torch.zeros(2 * self.ROWS, 64, dtype=torch.float16).to(DEVICE_NAME)
+
+        def body(_, tiles):
+            (v,) = tiles
+            return None, v[0] + 1
+
+        with (
+            torch.inference_mode(),
+            self.assertRaisesRegex(IndexError, "names row 64, outside the 64 rows"),
+        ):
+            for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=1,
+                out_dim=Gather(0, index.to(DEVICE_NAME)),
+                out=dest,
+            )
+
+    def test_gather_rows_into_caller_pool(self):
+        """KV-cache-style write into a pool uploaded with the default layout.
+
+        The scatter wants the indexed dim outermost, so the pool is copied in and
+        out around each trip's write; the next test avoids that.
+        """
+        values, index, initial, expected = self._scatter_rows_inputs(width=64)
+        pool = initial.to(DEVICE_NAME)
+        self._run(self._scatter_rows_fn(), values, index, pool)
+        torch.testing.assert_close(pool.cpu().float(), expected, atol=0.005, rtol=0.02)
+
+    def test_gather_rows_into_indirect_access_pool(self):
+        """A pool in the indirect-access layout (indexed dim outermost) is written in place.
+
+        The loop body holds only the tile's ``+ 1`` and the scatter, with no copy of
+        the pool around it, and a read of the pool later in the same graph sees every
+        trip's rows. Two sticks per row.
+        """
+        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
+
+        values, index, initial, expected = self._scatter_rows_inputs(width=128)
+        pool = _dma_to_spyre_indirect_access(initial)
+        result: dict = {}
+        with (
+            # A cache hit would skip the pipeline the recorder inspects.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                ts_passes, "CustomPreSchedulingPasses", _record_loop_membership(result)
+            ),
+        ):
+            doubled = self._run(
+                self._scatter_rows_fn(read_after=True), values, index, pool
+            )
+        self.assertEqual(result["top_level"], [])
+        self.assertEqual(len(result["in_body"]), 2, result["in_body"])
+        torch.testing.assert_close(pool.cpu().float(), expected, atol=0.005, rtol=0.02)
+        torch.testing.assert_close(
+            doubled.cpu().float(), expected * 2, atol=0.01, rtol=0.02
+        )
+
+    def test_gather_index_shared_with_an_operand_under_a_declared_dim(self):
+        """One row table feeds the body's gather and scatters its result, at every count.
+
+        The trip count is declared with ``dynamic=``. A second loop input on the same
+        table was cloned outside the loop, which a declared dim refuses.
+        """
+        from torch._dynamo.utils import counters
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
+
+        trips_max, rows, width, pool_rows = 16, 32, 64, 1024
+        spec = {"min": 8, "max": trips_max, "granularity": 1}
+
+        def fn(table, src, dest):
+            def body(_, tiles):
+                rows_t, src_whole = tiles
+                return None, src_whole.index_select(0, rows_t[0]) + 1
+
+            for_each_tile(
+                body,
+                (table, src),
+                dims=(0, None),
+                tile_size=1,
+                out_dim=Gather(0, table),
+                out=dest,
+            )
+
+        generator = torch.Generator().manual_seed(7)
+        table_cpu = torch.randperm(pool_rows, generator=generator)[: trips_max * rows]
+        table_cpu = table_cpu.reshape(trips_max, rows).to(torch.int32).contiguous()
+        src_cpu = (
+            torch.randn(pool_rows, width, generator=generator, dtype=torch.float16)
+            * 0.125
+        )
+        layout = SpyreTensorLayout(
+            device_size=[trips_max, rows // 32, 32],
+            stride_map=[rows, 32, 1],
+            device_dtype=get_device_dtype(torch.int32),
+            valid_elements={(0,): trips_max, (1, 2): rows},
+        )
+        table = table_cpu.to(DEVICE_NAME, device_layout=layout, dynamic={0: spec})
+        src = _dma_to_spyre_indirect_access(src_cpu)
+        compiled = torch.compile(fn, fullgraph=True)
+        counters.clear()
+        with torch.inference_mode(), config.patch(backend_loop_unroll=False):
+            for trips in (trips_max, 8, 11):
+                if table.size(0) != trips:
+                    table.resize_((trips, rows))
+                dest_cpu = torch.zeros(pool_rows, width, dtype=torch.float16)
+                dest = _dma_to_spyre_indirect_access(dest_cpu)
+                compiled(table, src, dest)
+                written = table_cpu[:trips].reshape(-1).long()
+                expected = dest_cpu.float()
+                expected[written] = src_cpu[written].float() + 1
+                torch.testing.assert_close(
+                    dest.cpu().float(),
+                    expected,
+                    atol=0.005,
+                    rtol=0.02,
+                    msg=f"at {trips} trips",
+                )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
 
 if __name__ == "__main__":

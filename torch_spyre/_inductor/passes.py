@@ -16,7 +16,7 @@ import contextlib
 import inspect
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Iterable
 from typing import Optional, Any, Callable
 
 import torch
@@ -33,21 +33,29 @@ except ImportError:
 
 
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation
+from torch._inductor.ir import MultiOutput, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
 from .logging_utils import get_inductor_logger
+from .parallel_precompile import report_output_layouts
+from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding, insert_restickify_padding
+from .padding import (
+    insert_bmm_padding,
+    insert_restickify_padding,
+    insert_staggered_ea_padding,
+)
+from .reserved_dims_contract import apply_reserved_dims_contract
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
     mm_to_bmm_pass,
+    strided_stick_slice_to_index_select,
 )
-from .wsr.coarse_tile import validate_coarse_tile_groups
+from .wsr.coarse_tile import reject_nested_loops, validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
 from .wsr.for_each_tile_lowering import clear_marker_maps, splice_while_loops
 from . import config
@@ -75,7 +83,6 @@ from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
 from .sharded_hbm import plan_sharded_hbm
 from .work_division import (
-    span_reduction,
     work_distribution,
     cost_model_matmul_division,
     defer_work_division,
@@ -88,26 +95,26 @@ from .scratchpad.allocator import (
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import sink_collective_waits, spyre_fuse_nodes
 from .scheduler import (
-    build_loop_scheduler_nodes,
     prepare_spyre_kernels,
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .loop_carries import apply_loop_carries
 from .loop_checker import check_loops
+from .loop_facts import counted_loop_path
 from .loop_node import (
     OpsView,
     all_ops,
+    build_pending_loop_nodes,
     expand,
-    expanded,
     has_loop_nodes,
-    peel_non_members,
+    request_loop_nodes,
 )
 from . import loop_scheduler
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
 from .materialize_hinted_views import materialize_hinted_views
-from .wsr.coarse_tile import coarse_tile_post_stickify
+from .wsr.loop_tiling_lowering import tile_groups
 from .dump_cost_model import dump_cost_model
 
 # The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
@@ -115,7 +122,11 @@ from .dump_cost_model import dump_cost_model
 # ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
 from . import cost_model_pass as cost_model_pass_module
 from .cost_model_pass import CostReport, cost_model_pass
-from .split_multi_ops import split_multi_ops, validate_ops
+from .split_multi_ops import split_multi_ops
+from .element_arrangement import (
+    insert_ea_shuffle,
+    validate_ops,
+)
 
 
 logger = get_inductor_logger("passes")
@@ -309,6 +320,8 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # pass) and the mm flow through the Spyre lowerings instead of
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
+                # x[..., k::s] on the stick dim has no device coordinate; gather it.
+                strided_stick_slice_to_index_select,
                 mm_to_bmm_pass.apply,
                 bmm_unflatten_pass.apply,
             ]
@@ -324,18 +337,11 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     The returned list of nodes must also be in topological order.
     """
 
-    # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-    # no ops carry loop_group_id attributes (i.e. no spyre_hint annotations).
-    # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
-    # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
-    # False), so loop groups survive Inductor fusion intact.
+    # A counted loop reaches the scheduler already as one LoopSchedulerNode (a
+    # CountedLoopSchedulerNode), which SuperDSCScheduling.can_fuse_vertical/horizontal
+    # refuse to fuse, so loops survive Inductor's fusion intact.
     def __init__(self):
-        super().__init__(
-            [
-                propagate_mutation_layouts,
-                build_loop_scheduler_nodes,
-            ]
-        )
+        super().__init__([propagate_mutation_layouts])
 
 
 class CustomPostFusionPasses(_SpyreNodePassPipeline):
@@ -383,7 +389,7 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
 @_runs(
     span_overflow_groups,
     validate_coarse_tile_groups,
-    coarse_tile_post_stickify,
+    tile_groups,
 )
 def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """Span-overflow coarse tiling only.  Runs POST-stickification.
@@ -392,7 +398,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     Loops built from for_each_tile (splice_while_loops) are intentionally
     absent: they have already run pre-stickification.
 
-    Uses coarse_tile_post_stickify: layout propagation has already
+    Uses tile_groups: layout propagation has already
     committed every op's device layout by this point, so a read-copy here
     would only produce an HBM-to-HBM copy with no layout-reconciliation
     benefit.
@@ -404,27 +410,30 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
         return
     # span_overflow_groups is a pure planning step: it decides each op's
     # dim_hints but does not set them.  Apply them now, before
-    # validate_coarse_tile_groups/coarse_tile_post_stickify run, since
-    # dim_hints is an input those consume (via plan_coarse_tile_groups's
-    # hint lookups), not something they produce.
+    # validate_coarse_tile_groups/tile_groups run, since dim_hints is an input
+    # those consume (the plan's hint lookups), not something they produce.
     for op, dim_hints in dim_hint_assignments:
         op.dim_hints = dim_hints  # type: ignore[attr-defined]
     # Compute offset to avoid loop_group_id collision with any groups already
     # stamped by splice_while_loops (for_each_tile).
     # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
     used_ids = [
-        op.loop_info.loop_group_id[0]
+        counted_loop_path(op, include_extern=True)[0]
         for op in graph.operations
-        if hasattr(op, "loop_info") and op.loop_info is not None
+        if counted_loop_path(op, include_extern=True)
     ]
     group_idx_offset = max(used_ids, default=-1) + 1
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
-    coarse_tile_post_stickify(
+    reject_nested_loops(groups, "span-overflow coarse tiling")
+    request_loop_nodes(
         graph,
-        groups=groups,
-        group_idx_offset=group_idx_offset,
+        tile_groups(
+            graph,
+            groups=groups,
+            group_idx_offset=group_idx_offset,
+        ),
     )
 
 
@@ -452,15 +461,14 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph, lx_relayout_plans=plans)
 
 
-# Passes the flat view cannot run as they run today, so they run on the
-# expanded list and the nodes are rebuilt after them.
-# ``dedup_and_promote_constants`` ends with ``operations[:] = constants +
-# non_constants``: it hoists every constant to the head of the WHOLE list. The
-# view keeps a constant that sits in a body inside that body (it cannot tell
-# whether a reorder means to cross a node boundary), and the node then sorts by
-# that constant, ahead of top-level ops it used to follow. On nested graphs that
-# changes the op order and the kernel (spec B.7, pass 18).
-_PASSES_RUN_EXPANDED = frozenset({"dedup_and_promote_constants"})
+def _log_after_pass(graph: GraphLowering, pass_name: str) -> None:
+    """The per-pass IR dump (``SPYRE_LOG_PASSES``), of the real nested list.
+
+    Called once the pass has returned and ``graph.operations`` is the real list
+    again, so a ``LoopNode`` prints its body indented under it.
+    """
+    if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+        logger.debug("AFTER %s\n%s", pass_name, format_operations(graph.operations))
 
 
 @contextlib.contextmanager
@@ -468,19 +476,15 @@ def _flat_operations(graph: GraphLowering, pass_name: str) -> Iterator[None]:
     """For one pre-scheduling pass: if the graph holds LoopNodes, show the pass
     (and the observer, timing and logging around it) a flat view of them.
 
-    No pass is node-aware yet. While the pass runs, ``graph.operations`` is a
-    ``loop_node.OpsView`` over the real nested list: it iterates the leaf ops
-    in program order and forwards each edit to the list that owns the op. The
-    real list is put back afterwards. A pass that rebinds ``graph.operations``
+    While the pass runs, ``graph.operations`` is a ``loop_node.OpsView`` over
+    the real nested list: it iterates the leaf ops in program order and refuses
+    edits (a pass edits with the ``loop_node`` helpers, which find the owning
+    list). The real list is put back afterwards. A pass that rebinds ``graph.operations``
     to a new list would silently drop the nodes, so that raises.
     """
     real = graph.operations
     if not has_loop_nodes(real):
         yield
-        return
-    if pass_name in _PASSES_RUN_EXPANDED:
-        with expanded(graph):
-            yield
         return
     view = OpsView(real)
     graph.operations = view
@@ -507,24 +511,15 @@ def _hand_off_loop_nodes(graph: GraphLowering) -> None:
 
     On any other release a graph that holds a ``LoopNode`` is refused here,
     with ``Unsupported`` naming the release: flattening it would compile the
-    loop through the old path without saying that the release is
-    unsupported (decided policy: fail loudly outside the supported set). A
-    graph with no loop is unaffected on every release.
-
-    ``loop_scheduler.SCHEDULE_LOOP_NODES`` off (the equivalence test only)
-    expands the nodes as before, whatever the release.
+    loop without saying that the release is unsupported (decided policy: fail
+    loudly outside the supported set). A graph with no loop is unaffected on
+    every release.
     """
     if not has_loop_nodes(graph.operations):
-        return
-    if not loop_scheduler.SCHEDULE_LOOP_NODES:
-        expand(graph)
         return
     if not loop_scheduler.loop_scheduler_supported():
         expand(graph)
         raise loop_scheduler.refuse_release()
-    # A pass may have put an op that belongs before (or after) a loop at the
-    # edge of its body; the scheduler runs a node's whole body every trip.
-    peel_non_members(graph)
 
 
 class CustomPreSchedulingPasses:
@@ -558,6 +553,11 @@ class CustomPreSchedulingPasses:
 
     def __init__(self):
         self.passes = [
+            #
+            # Read each graph input's reserved_dims (min, max, granularity)
+            # into this compile's ShapeEnv. Runs first so that every pass that
+            # reads size bounds sees the declared range.
+            apply_reserved_dims_contract,
             #
             # Convert for_each_tile WhileLoops bodies into inlined IR with loop_infos
             splice_while_loops,
@@ -618,23 +618,25 @@ class CustomPreSchedulingPasses:
             reorder_nonstick_dims,
             finalize_layouts,
             # insert_restickify's advance-transfer logic (see its own
-            # docstring) branches on whether old_name already has
-            # `loop_info` stamped, to decide whether the per-trip advance
-            # belongs on the restickify stage or stays on the consumer.
-            # splice_while_loops runs first in this list and stamps every
-            # for_each_tile level's CoarseTileInfo in one deferred final
-            # phase, so by the time insert_restickify runs, every tiled
-            # stage's loop_info is already in place. If this pass ever
-            # moved ahead of splice_while_loops' stamping, that check would
-            # silently take the "not yet tiled" branch and emit an empty
-            # tiled_dims_per_read for a stage that is actually tiled -- a
-            # wrong-answer, not a crash.
+            # docstring) branches on whether old_name is already in a loop
+            # (`is_looped`), to decide whether the per-trip advance belongs
+            # on the restickify stage or stays on the consumer.
+            # splice_while_loops runs first in this list and the pass loop
+            # builds its loops' nodes once it returns, so by the time
+            # insert_restickify runs, every tiled stage is in its loop. If
+            # this pass ever moved ahead of splice_while_loops, that check
+            # would silently take the "not yet tiled" branch and leave a
+            # stage that is actually tiled out of its loop -- a wrong
+            # answer, not a crash.
             insert_restickify,
+            # Insert shuffle nodes to apply or restore element arrangement.
+            insert_ea_shuffle,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             reorder_nonstick_dims_mutation,
             insert_post_mutation_restickify,
             insert_restickify_padding,
+            insert_staggered_ea_padding,
             #
             dedup_and_promote_constants,
             #
@@ -648,11 +650,13 @@ class CustomPreSchedulingPasses:
             # Invariant: this must run before any pass that could insert a
             # consumer of a sharded buffer (its rejection loops only see the
             # graph as of this point); compute_ops' all-sharded check is the
-            # second net.
+            # second net. Every division computes the op's span floors itself.
             plan_sharded_hbm,
-            span_reduction,
             _distribute_work,
             #
+            # The graph outputs' layouts are final here. A forked precompile child
+            # reports them to its parent before the planning below (parallel_precompile).
+            report_output_layouts,
             # LX Planning
             _maybe_scratchpad_planning,
             # Preserve copies through physical planning, then remove only
@@ -701,6 +705,17 @@ class CustomPreSchedulingPasses:
                     raise
                 _hand_off_loop_nodes(graph)
 
+            # Always on, once: a pass that breaks the order is caught here even
+            # with the per-pass check (config.validate_every_pass) off. Its own
+            # region, so the pass loop's time is the passes' alone. all_ops
+            # descends into any LoopNode the hand-off kept.
+            with timing_recorder.stage(f"stage:{pipeline}:validate"):
+                try:
+                    check_final_operation_order(all_ops(graph.operations), pipeline)
+                except BaseException:
+                    expand(graph)
+                    raise
+
             if logger.isEnabledFor(logging.INFO):
                 with timing_recorder.stage(f"stage:{pipeline}:log_after"):
                     logger.info(
@@ -738,6 +753,12 @@ class CustomPreSchedulingPasses:
             pass_name = _get_pass_name(pass_fn)
             with _flat_operations(graph, pass_name):
                 self._run_one_pass(graph, pipeline, pass_fn, pass_name)
+            # Loops a pass lowered (span-overflow tiling) become nodes here, once
+            # the view is back and the pass has stopped iterating the list.
+            build_pending_loop_nodes(graph)
+            # The nested list, so a loop's body prints indented under its node.
+            # Before the checker, so a violation still comes with the dump.
+            _log_after_pass(graph, pass_name)
             # After the view is put back: the checker reads the real tree, and a
             # violation then names the pass that left it.
             check_loops(graph, where=pass_name)
@@ -766,18 +787,129 @@ class CustomPreSchedulingPasses:
             event.meta["output_operations"] = _count_ops(graph.operations)
             event.meta.update(COUNTERS.since(pass_counts))
 
+        # Opt-in, to name the pass that broke the order once the check after the
+        # last pass has said that one did. Outside the pass's region and its
+        # counter deltas, so neither is charged for the check.
+        if config.validate_every_pass:
+            with timing_recorder.stage(f"validate:{pipeline}:{pass_name}"):
+                check_operation_order(all_ops(graph.operations), pass_name)
+
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "elapsed %5dms  %s",
                 elapsed_ms,
                 pass_name,
             )
-        if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
-            logger.debug(
-                "AFTER %s\n%s",
-                pass_name,
-                format_operations(list(all_ops(graph.operations))),
-            )
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
+
+
+class InvalidGraphError(AssertionError):
+    """A pre-scheduling pass left ``graph.operations`` ill formed."""
+
+
+def _output_names(op: Operation) -> list[str]:
+    names = [op.get_name()]
+    try:
+        names.extend(buf.get_name() for buf in op.get_outputs())
+    except NotImplementedError:
+        pass
+    return names
+
+
+def _read_names(op: Operation) -> set[str]:
+    """Names of the buffers ``op`` reads.
+
+    Uses ``get_read_writes()``, which the Scheduler builds its dependencies
+    from and which nothing caches on the node. ``get_read_names()`` caches the
+    traced body (``inner_fn_opcount``), which could leave a stale answer for a
+    later reader once a pass rewrites the body, and ``get_reads()`` raises
+    ``NotImplementedError`` on a ``Reduction`` body.
+
+    An operation whose ``get_read_writes()`` raises ``NotImplementedError``
+    (some extern kernels) falls back to ``get_read_names()``, the cached path
+    above, so for those operations a pass that changes their inputs could
+    leave a stale answer. Only extern kernels that do not describe their reads
+    take this path.
+    """
+    try:
+        names = {dep.name for dep in op.get_read_writes().reads}
+    except NotImplementedError:
+        # An operation that does not describe its reads (some extern kernels).
+        names = set(op.get_read_names())
+    # A MultiOutput reads its parent; say so even if get_read_writes() stops
+    # reporting it, since the order of the two is what codegen relies on.
+    if isinstance(op, MultiOutput):
+        names.update(inp.get_name() for inp in op.inputs if hasattr(inp, "get_name"))
+    return names
+
+
+def _order_violation(operations: Iterable[Operation]) -> Optional[str]:
+    """Describe the first read of a buffer produced later, or None if none.
+
+    Each operation must come after the producer of every buffer it reads. A name
+    that no operation in the list produces (a graph input, a constant, a buffer
+    of an enclosing graph) is outside the check. A read of an operation's own
+    output is allowed: a mutation reads the buffer it updates in place.
+
+    The read sets are extracted afresh (see :func:`_read_names`), which is not
+    the work the pass counters describe, so counting is paused meanwhile:
+    otherwise the check would be charged to the enclosing pass or pipeline and
+    move the bounds in ``test_frontend_work_bounds.py``.
+    """
+    with pass_counters.paused():
+        ops = list(operations)
+        producer: dict[str, int] = {}
+        for i, op in enumerate(ops):
+            for name in _output_names(op):
+                producer.setdefault(name, i)
+
+        for i, op in enumerate(ops):
+            for name in sorted(_read_names(op)):
+                j = producer.get(name)
+                if j is not None and j > i:
+                    return (
+                        f"operation {op.get_name()} ({type(op).__name__}) at "
+                        f"position {i} reads {name}, which {ops[j].get_name()} "
+                        f"({type(ops[j]).__name__}) produces later, at position {j}"
+                    )
+    return None
+
+
+def check_operation_order(operations: Iterable[Operation], pass_name: str) -> None:
+    """Raise :class:`InvalidGraphError` unless ``operations`` is topologically
+    ordered after the pass ``pass_name``.
+
+    Runs after every pre-scheduling pass when ``config.validate_every_pass`` is
+    on. See :func:`_order_violation` for what is checked.
+
+    Args:
+        operations: The flat list of leaf operations, in program order.
+        pass_name: The pass that just ran, named in the error.
+    """
+    violation = _order_violation(operations)
+    if violation is not None:
+        raise InvalidGraphError(f"after pre-scheduling pass {pass_name}: {violation}")
+
+
+def check_final_operation_order(operations: Iterable[Operation], pipeline: str) -> None:
+    """Raise :class:`InvalidGraphError` unless ``operations`` is topologically
+    ordered at the end of the pipeline ``pipeline``.
+
+    Always runs, once per compile. It cannot say which pass broke the order, so
+    the error tells the developer how to find out.
+
+    Args:
+        operations: The flat list of leaf operations, in program order.
+        pipeline: The pipeline that just ran, named in the error.
+    """
+    violation = _order_violation(operations)
+    if violation is not None:
+        raise InvalidGraphError(
+            f"after the {pipeline} pre-scheduling passes: {violation}. A pass "
+            "left graph.operations out of topological order. To find which, "
+            "rerun with SPYRE_VALIDATE_EVERY_PASS=1 (or "
+            "torch_spyre._inductor.config.validate_every_pass = True), which "
+            "checks the order after every pass and names the one that broke it."
+        )

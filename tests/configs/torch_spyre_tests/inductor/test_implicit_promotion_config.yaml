@@ -1,5 +1,5 @@
 test_suite_config:
-  labels: [unit, regression, trunk]
+  labels: [unit, regression, integration, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
       unlisted_test_mode: skip
@@ -37,6 +37,7 @@ test_suite_config:
             - TestImplicitPromotion::test_implicit_add_fp16_2d_unaligned
             - TestImplicitPromotion::test_implicit_add_fp16_3d_unaligned
             - TestImplicitPromotion::test_implicit_add_fp16_4d_unaligned
+            - TestImplicitPromotion::test_fp16_with_0dim_fp32_tensor_keeps_fp16
           mode: mandatory_success
 
         # SKIP #2205 — DL16_TO_FP32 arrangement on reduction output; D2H reads garbled values
