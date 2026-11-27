@@ -3790,7 +3790,9 @@ def compute_restickify_needed(
         and bool(stick_syms)
         and len(outer_axes_with_stick_var) > 1
     )
-    layouts_differ = in_stl != out_stl
+    # Geometry only: valid_elements does not change where the stick variable
+    # lands, so a pair differing only in valid extents is not a mismatch.
+    layouts_differ = not in_stl.equals_ignoring_valid_elements(out_stl)
     factorized_layout_mismatch = is_factorized and layouts_differ
     if (
         not factorized_layout_mismatch
