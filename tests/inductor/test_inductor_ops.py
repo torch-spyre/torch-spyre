@@ -7278,8 +7278,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # result (#4014).
                 "bool_1d_unaligned": (cached_randint((100,), high=2) > 0,),
                 "bool_2d_unaligned": (cached_randint((1, 855), high=2) > 0,),
-                # Full sum() of a 2-D tensor has two reduction variables, so
-                # this checks the guard considers all of them, not one.
+                # Full sum() of a 2-D tensor has two reduction variables. The
+                # stick on the size-100 dim is unsafe, but the stick on the size-4
+                # dim is not, so the layout search picks it and the sum is exact.
                 "bool_2d_unaligned_multi": (cached_randint((4, 100), high=2) > 0,),
                 # Same problem from an fp16 compare intermediate (not a host
                 # bool, but still fp16-backed → DL16_TO_FP32 after upcast).
@@ -7291,13 +7292,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int64_1d": (cached_randint((64,), dtype=torch.int64),),
                 "int64_2d": (cached_randint((67, 256), dtype=torch.int64),),
             },
-            # TODO(#4014): unaligned staggered inputs raise Unsupported until the
-            # backend masking bug is fixed; then these become positive tests.
+            # TODO(#4014): unaligned staggered inputs with no safe layout raise
+            # Unsupported until the backend masking bug is fixed; then these
+            # become positive tests.
             "expect_raise": {
                 "sum_bool_1d_unaligned": "issue #4014",
                 "sum_bool_2d_unaligned": "issue #4014",
                 "sum_bool_2d_unaligned_cmp": "issue #4014",
-                "sum_bool_2d_unaligned_multi": "issue #4014",
             },
         },
         # Float sums use default tolerance (fp16/fp32 results are not exact).

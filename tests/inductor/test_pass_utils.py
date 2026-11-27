@@ -927,3 +927,70 @@ def test_unaligned_staggered_guard_allows_tail_run_sizes(ea, dtype, n, rejected)
     else:
         _prune_unaligned_staggered_inputs(op, arg, scalar_out)
         assert arg.layouts == [stl]
+
+
+def test_unaligned_staggered_guard_returns_removed_candidates():
+    """The guard reports what it removed, so the layout search can forbid it.
+
+    A (64, 100) bool sum has two candidates. The stick on the 100 dim is unsafe
+    and is returned; the stick on the 64 dim is kept (#4014).
+    """
+    dtype = torch.float32
+    ea = ElementArrangement.DL16_TO_FP32
+    dev = get_device_dtype(dtype)
+    on_100 = SpyreTensorLayout(
+        [4, 64, 32], [32, 100, 1], dev, {(0, 2): 100, (1,): 64}, ea
+    )
+    on_64 = SpyreTensorLayout(
+        [2, 100, 32], [3200, 1, 100], dev, {(0, 2): 64, (1,): 100}, ea
+    )
+    i = sympy_index_symbol("c0")
+    j = sympy_index_symbol("c1")
+    host = FixedLayout(torch.device("cpu"), dtype, [64, 100], [100, 1])
+    dep = MemoryDep("x", 100 * i + j, (i, j), (64, 100))
+    scalar_out = MemoryDep("y", sympy.S.Zero, (), ())
+    op = mock.MagicMock()
+    op.get_name.return_value = "buf1"
+    op.data.reduction_type = "sum"
+    arg = PropArg(dep, host, [on_100, on_64])
+
+    removed = _prune_unaligned_staggered_inputs(op, arg, scalar_out)
+
+    assert removed == [on_100]
+    assert arg.layouts == [on_64]
+
+
+def test_edge_cost_map_forbidden_in_stls_cost_inf():
+    """An input layout listed as forbidden costs INF against any target, so the
+    layout search never commits the producer to it."""
+    from torch_spyre._inductor.optimize_restickify import INF, EdgeCostMap
+
+    dtype = torch.float32
+    stl = SpyreTensorLayout(
+        [4, 64, 32],
+        [32, 100, 1],
+        get_device_dtype(dtype),
+        {(0, 2): 100, (1,): 64},
+        ElementArrangement.DL16_TO_FP32,
+    )
+    other = SpyreTensorLayout(
+        [2, 100, 32],
+        [3200, 1, 100],
+        get_device_dtype(dtype),
+        {(0, 2): 64, (1,): 100},
+        ElementArrangement.DL16_TO_FP32,
+    )
+    i = sympy_index_symbol("c0")
+    j = sympy_index_symbol("c1")
+    dep = MemoryDep("x", 100 * i + j, (i, j), (64, 100))
+    buf = mock.MagicMock()
+    buf.get_layout.return_value = FixedLayout(
+        torch.device("cpu"), dtype, [64, 100], [100, 1]
+    )
+    with mock.patch("torch_spyre._inductor.optimize_restickify.V") as v:
+        v.graph.get_buffer.return_value = buf
+        ec = EdgeCostMap(
+            dep, [stl, other], dep, mock.MagicMock(), None, frozenset([stl])
+        )
+        assert ec.cost(stl, other) == INF
+        assert ec.layout(stl, other) is EdgeCostMap.INFEASIBLE

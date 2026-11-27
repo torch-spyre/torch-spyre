@@ -63,6 +63,7 @@ class EdgeCostMap:
         target_dep: "MemoryDep",
         op,
         forbidden_stick_sym: "sympy.Symbol | None" = None,
+        forbidden_in_stls: "frozenset[SpyreTensorLayout]" = frozenset(),
     ):
         self.dep = dep
         self._op = op
@@ -70,6 +71,7 @@ class EdgeCostMap:
         self._target_dep = target_dep
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._forbidden_stick_sym = forbidden_stick_sym
+        self._forbidden_in_stls = forbidden_in_stls
 
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
@@ -99,6 +101,12 @@ class EdgeCostMap:
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
+        if in_stl in self._forbidden_in_stls:
+            # The op cannot read this input layout at all, so the layout search
+            # must not commit the producer to it.
+            self._cost[in_stl][target_stl] = INF
+            self._layout[in_stl][target_stl] = EdgeCostMap.INFEASIBLE
+            return
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
@@ -223,6 +231,7 @@ class AllSameNode(RestickNodeCost):
         out_deps,
         op,
         forbidden_stick_sym: "sympy.Symbol | None" = None,
+        forbidden_in_stls: "list[SpyreTensorLayout] | None" = None,
     ):
         """Build an AllSameNode from input PropArgs and output dep(s).
 
@@ -234,6 +243,10 @@ class AllSameNode(RestickNodeCost):
         forbidden_stick_sym: if set, any input whose stick expression contains this
         symbol is treated as incompatible regardless of stick_compatible() — the
         optimizer is forced to restickify or pick a different layout.
+
+        forbidden_in_stls: input layouts the op cannot read. The first input's
+        edge costs INF for them, so the layout search never commits that input's
+        producer to one, whatever the input's candidate list holds.
         """
         assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
         if not isinstance(out_deps, list):
@@ -241,8 +254,15 @@ class AllSameNode(RestickNodeCost):
         out_dep = out_deps[0]  # reference output dep for stick-compatibility checks
         co_output_deps = out_deps[1:]
         input_edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, out_dep, op, forbidden_stick_sym)
-            for arg in args
+            EdgeCostMap(
+                arg.dep,
+                arg.layouts,
+                out_dep,
+                op,
+                forbidden_stick_sym,
+                frozenset(forbidden_in_stls or ()) if i == 0 else frozenset(),
+            )
+            for i, arg in enumerate(args)
         ]
         output_edge_costs = [
             EdgeCostMap(

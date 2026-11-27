@@ -2578,9 +2578,13 @@ _STAGGER_GROUP = 4
 
 def _prune_unaligned_staggered_inputs(
     op: Operation, arg: "PropArg", output_dep: MemoryDep
-) -> None:
+) -> list[SpyreTensorLayout]:
     """Remove staggered STL candidates where the reduction is over the stick
     and the stick dimension's padding is not one tail run (see below).
+
+    Returns the removed candidates. ``arg.layouts`` is this reduction's own copy
+    of its producer's candidates, so removing from it does not constrain the
+    producer; the caller forbids the returned layouts in the layout search.
 
     Issue #4014: for a staggered (``DL16_TO_FP32`` or ``FP32_TO_DL16``) input,
     when a reduction variable lives on the stick dimension and that dimension's
@@ -2588,7 +2592,7 @@ def _prune_unaligned_staggered_inputs(
     masking emits a single tail-interval which covers the wrong lanes and
     silently returns an incorrect result.
 
-    The tail interval is still right when the last stagger unit holds at most
+    The tail interval is correct when the last stagger unit holds at most
     one group of four live elements (``n % 64 <= 4``) or lacks at most one group
     of four (``n % 64 >= 60``): the padding lanes are then one run at the end of
     the dimension, as in a standard arrangement. Both arrangements have this
@@ -2607,7 +2611,7 @@ def _prune_unaligned_staggered_inputs(
     # Identify the reduction variables: present in input dep, absent in output.
     reduction_vars = arg.dep.index.free_symbols - output_dep.index.free_symbols
     if not reduction_vars:
-        return
+        return []
 
     in_coords = host_coordinates(arg.layout, arg.dep, None)
     # The stagger unit is 64 elements for both staggered arrangements, whatever
@@ -2638,9 +2642,10 @@ def _prune_unaligned_staggered_inputs(
             bad[id(stl)] = n
 
     if not bad:
-        return
+        return []
 
     kept = [stl for stl in arg.layouts if id(stl) not in bad]
+    removed = [stl for stl in arg.layouts if id(stl) in bad]
     if not kept:
         stl = arg.layouts[0]
         n = bad[id(stl)]
@@ -2650,6 +2655,7 @@ def _prune_unaligned_staggered_inputs(
             f"within {_STAGGER_GROUP} of a multiple of {stagger_unit} (issue #4014)"
         )
     arg.layouts[:] = kept
+    return removed
 
 
 def _reduction_layouts(
@@ -2676,7 +2682,7 @@ def _reduction_layouts(
     (one element per stick), as in ``_topk_layouts``.
     """
     arg = args[0]
-    _prune_unaligned_staggered_inputs(op, arg, output_dep)
+    unsafe_in_stls = _prune_unaligned_staggered_inputs(op, arg, output_dep)
     layouts = []
     for stl in arg.layouts:
         layouts.extend(
@@ -2708,6 +2714,7 @@ def _reduction_layouts(
         forbidden_stick_sym=(
             find_reduction_var((arg.dep,), output_dep) if non_stick_only else None
         ),
+        forbidden_in_stls=unsafe_in_stls,
     )
     return layouts
 
