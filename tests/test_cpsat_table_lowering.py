@@ -1183,6 +1183,26 @@ def test_a_quotient_is_divided_as_lambdify_prints_it():
     case.assert_exact(sympy.floor(x / y) + sympy.floor(x / y**2))
 
 
+def test_a_product_that_divides_is_divided_once_as_lambdify_prints_it():
+    """98*k/a is one table, divided once in the numpy core as lambdify prints it, so
+    it is exact at every assignment where 98 * (1/49) would floor one low. b/49 is
+    (1/49)*b, as lambdify prints it too, and its list is lambdify's."""
+    case = Case()
+    case.add_input("a", a=[49.0, 7.0])
+    case.integer("k", 1, 2)
+    a, k = case.symbol("a"), case.symbol("k")
+    assert math.floor(98 * (1 / 49)) == 1
+    at_least_2 = sympy.Piecewise((1, 98 * k / a >= 2), (0, True))
+    case.assert_exact(sympy.floor(98 * k / a) + at_least_2)
+    case = Case()
+    menu = [49.0, 98.0, 147.0]
+    case.add_input("b", b=menu)
+    b = case.symbol("b")
+    quotient = TableLowering(case.inputs, cap=CAP).print(b / 49)
+    lambdified = sympy.lambdify(b, b / 49, modules="numpy")
+    assert list(quotient.table(CAP).values) == list(lambdified(np.asarray(menu)))
+
+
 # Expressions over a, b and c, each node's list compared with Stage 1's.
 STAGE_1_LISTS = [
     lambda a, b, c: a**2 * b + b**0.5 / a,
