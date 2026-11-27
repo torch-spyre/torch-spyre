@@ -16,6 +16,7 @@
 
 #include "job_plan.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <iostream>
@@ -238,8 +239,11 @@ bool JobPlanStepHostCompute::loopCorrectionPrefix(const LaunchContext& ctx,
   }
   // The loop dimension's slot and maximum live on the SymbolicArg, which
   // arrives with the launch, so this lookup is the part of the gate that stays
-  // on the launch path. Exactly one loop dimension: nested symbolic levels
-  // multiply the slots in an order this step does not know.
+  // on the launch path. Exactly one loop dimension argument. Loops nested over
+  // that one dimension share it, and their copies are laid out per outer
+  // iteration, so the first n copies hold every inner copy those iterations
+  // run. Two different dimensions multiply the slots in an order this step
+  // does not know, so they stay whole.
   int dimensions = 0;
   size_t slot = 0;
   int64_t count = 0;
@@ -259,10 +263,17 @@ bool JobPlanStepHostCompute::loopCorrectionPrefix(const LaunchContext& ctx,
     if (arg.dim_index < 0 || arg.dim_index >= tensor.dim()) {
       return false;
     }
-    count = tensor.size(arg.dim_index) / arg.granularity;
+    // The trip count the device derives, MIN(DIV_CEIL(dim, G), N).
+    // resolveSymbolicArgs has refused a size off the granularity for this
+    // launch, so this equals dim / G. Using the device's own formula keeps the
+    // two from drifting: an upload that rounded down while the device rounded
+    // up would leave the last trip reading a copy this launch did not send.
     max_count = arg.max_value / arg.granularity;
+    count = std::min(
+        (tensor.size(arg.dim_index) + arg.granularity - 1) / arg.granularity,
+        max_count);
   }
-  if (dimensions != 1 || count <= 0 || max_count <= 0 || count > max_count) {
+  if (dimensions != 1 || count <= 0 || max_count <= 0) {
     return false;
   }
   // This check carries the gate. The loop's own correction is the step whose
@@ -282,7 +293,8 @@ bool JobPlanStepHostCompute::loopCorrectionPrefix(const LaunchContext& ctx,
   // copy's own flits go to dummy addresses by construction, so the stale
   // bytes never reach the program. That is backend-internal: an explicit
   // marker on the Hcm (slot count and bytes per slot) would replace this
-  // inference, and is the follow-up asked of the DeepTools team.
+  // inference, and is the follow-up asked of the DeepTools team (DeepTools
+  // issue 5016).
   const size_t copies = static_cast<size_t>(max_count);
   if (copies_bytes_ % copies != 0) {
     return false;
@@ -298,9 +310,19 @@ bool JobPlanStepHostCompute::loopCorrectionPrefix(const LaunchContext& ctx,
 void JobPlanStepHostCompute::uploadPrefix(const SpyreStream& stream,
                                           const flex::HostComputeBuffer& buffer,
                                           size_t bytes) const {
-  TORCH_CHECK(device_address_.chunks().size() == 1,
-              "a correction region must be one chunk, got ",
-              device_address_.chunks().size());
+  // The gate admits a one-chunk destination only (the constructor), so this
+  // cannot fail for a step that passed it.
+  TORCH_INTERNAL_ASSERT(device_address_.chunks().size() == 1,
+                        "a prefix upload needs a one-chunk correction region, "
+                        "got ",
+                        device_address_.chunks().size());
+  // The prefix is sized from the step's correction size, the copy reads the
+  // host compute's buffer: both must hold it, in every build.
+  TORCH_CHECK(bytes <= buffer.size() && bytes <= device_address_.total_size(),
+              "correction prefix of ", bytes,
+              " bytes exceeds the host buffer (", buffer.size(),
+              " bytes) or the device region (", device_address_.total_size(),
+              " bytes)");
   auto* allocator =
       static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
   c10::DataPtr staging = allocator->allocate(bytes);
@@ -389,18 +411,20 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   CorrectionUploadCounters& counters = correction_upload_counters();
   counters.launches++;
   counters.bytes_full += host_buffer->size();
+  // A launch at the maximum runs every copy, so it takes the whole path below
+  // and keeps the correction batching where the stream offers it.
   size_t upload_bytes = host_buffer->size();
-  const bool loop_correction =
-      symbolic && loopCorrectionPrefix(ctx, &upload_bytes);
+  const bool cut = symbolic && loopCorrectionPrefix(ctx, &upload_bytes) &&
+                   upload_bytes < host_buffer->size();
+  if (!cut) {
+    upload_bytes = host_buffer->size();
+  }
   counters.bytes_sent += upload_bytes;
-  SPYRE_RUNTIME_DEBUG() << "correction upload "
-                        << (loop_correction ? "prefix " : "whole ")
+  SPYRE_RUNTIME_DEBUG() << "correction upload " << (cut ? "prefix " : "whole ")
                         << upload_bytes << " of " << host_buffer->size()
                         << " bytes";
-  if (loop_correction) {
-    if (upload_bytes < host_buffer->size()) {
-      counters.prefixed++;
-    }
+  if (cut) {
+    counters.prefixed++;
     uploadPrefix(stream, *host_buffer, upload_bytes);
     return;
   }

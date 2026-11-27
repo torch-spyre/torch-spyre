@@ -585,11 +585,16 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         address_table_bytes_(address_table_bytes),
         reads_input_(std::move(reads_input)) {
     // The launch-independent part of the loop-prefix gate: a known,
-    // stick-aligned table, definitions read off the metadata, and a blob with
-    // copies behind the table. The slot and the maximum come with the launch.
+    // stick-aligned table, definitions read off the metadata, a blob with
+    // copies behind the table, a destination of one chunk, which the prefix
+    // upload addresses as one region, and a correction of at most
+    // kMaxPrefixCorrectionBytes. Anything else uploads whole. The slot and the
+    // maximum come with the launch.
     if (address_table_bytes_ != 0 && !reads_input_.empty() &&
         correction_size_ > address_table_bytes_ &&
-        address_table_bytes_ % kStickBytes == 0) {
+        correction_size_ <= kMaxPrefixCorrectionBytes &&
+        address_table_bytes_ % kStickBytes == 0 &&
+        device_address_.chunks().size() == 1) {
       prefix_candidate_ = true;
       copies_bytes_ = correction_size_ - address_table_bytes_;
     }
@@ -656,6 +661,11 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   size_t copies_bytes_ = 0;         ///< the blob behind the table
   /// Device sticks, and so flex's pinned DMA sizes, are 128-byte aligned.
   static constexpr size_t kStickBytes = 128;
+  /// Above this size a partial upload of the correction region was measured
+  /// slower than the whole one from a few dozen iterations up (the serving
+  /// decode kernel, declared at 512 and 1024 pages, DeepTools master.515), and
+  /// at or below it faster at every count (declared at 256 pages, 852 KB).
+  static constexpr size_t kMaxPrefixCorrectionBytes = size_t{1} << 20;
   std::unique_ptr<flex::HostComputeHandle>
       handle_;  ///< handle to the host compute operation
 };

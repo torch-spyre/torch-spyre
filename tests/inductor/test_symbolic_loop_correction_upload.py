@@ -28,10 +28,13 @@ step (new buffers at new addresses, as a serving plugin allocates its page
 tables per step) and trip counts going up and down, the maximum included, gives
 exactly the values of the same body compiled as a static kernel at that size,
 and the CPU's values within fp16 tolerance, for a one-op body, a two-op body, a
-matmul body and a loop with a static kernel beside it. The counters confirm
-that the loop corrections below the maximum were cut and that a static
-correction stays whole. A host-only test feeds canned metadata to the gate's
-input.
+matmul body and a loop with a static kernel beside it. More sequences cover a
+fresh kernel whose first launch is below the maximum, so most of its correction
+region has never been written, and an attention whose query and key loops are
+nested over one declared size. The counters confirm that the loop corrections
+below the maximum were cut and that a static correction stays whole, as does a
+loop correction above 1 MiB. A host-only test feeds canned metadata to the
+gate's input.
 
 The body's ops share one correction step per loop (a pointwise kernel and an
 extern matmul inside one loop give one step), and a kernel beside the loop is
@@ -45,6 +48,7 @@ import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._C import _correction_reads_inputs, _correction_upload_stats
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre.constants import DEVICE_NAME
 
@@ -57,6 +61,9 @@ SPEC = {"min": TILE, "max": MAX_ROWS, "granularity": TILE}
 # follows one that filled every slot, and the minimum in between.
 TILES = [32, 4, 1, 9, 2, 32, 3, 1, 16, 5]
 BELOW_MAX = sum(1 for c in TILES if c < MAX_TILES)
+# A fresh kernel whose first launches run below the maximum, so the copies past
+# them have never been written when the program first reads its prefix.
+TILES_FIRST_BELOW_MAX = [1, 4, 2, MAX_TILES, 3]
 ATOL = 1e-2
 RTOL = 1e-2
 
@@ -105,6 +112,106 @@ def tiled_gelu_matmul(x, w):
 def tiled_gelu_with_static(x, w):
     """The loop plus a static kernel beside it, whose correction stays whole."""
     return tiled_gelu(x), torch.nn.functional.gelu(w) * 2.0
+
+
+def tiled_tanh(x):
+    """A body no other test compiles, so its kernel and correction region are
+    new when the first-launch test starts."""
+    _checks(x)
+
+    def body(_carry, tiles):
+        (tile,) = tiles
+        return None, torch.tanh(tile)
+
+    _carry, out = for_each_tile(body, (x,), dims=(0,), tile_size=TILE, out_dim=0)
+    return out
+
+
+# Above 1 MiB a loop correction uploads whole (kMaxPrefixCorrectionBytes in
+# csrc/job_plan.h): a partial upload of a larger region measured slower than
+# the whole one. The one-op body carries 640 bytes per copy, so 2048 tiles put
+# its correction above the bound.
+BIG_TILES = 2048
+BIG_SPEC = {"min": TILE, "max": BIG_TILES * TILE, "granularity": TILE}
+
+
+def tiled_tanh_big(x):
+    rows = x.shape[0]
+    torch._check(rows >= TILE)
+    torch._check(rows <= BIG_TILES * TILE)
+    torch._check(rows % TILE == 0)
+
+    def body(_carry, tiles):
+        (tile,) = tiles
+        return None, torch.tanh(tile)
+
+    _carry, out = for_each_tile(body, (x,), dims=(0,), tile_size=TILE, out_dim=0)
+    return out
+
+
+# The nested case: an online-softmax attention whose query loop and key loop
+# both walk one declared size. Its loop correction is laid out per query
+# iteration, each holding every key iteration.
+NESTED_MAX_TILES = 8
+NESTED_SPEC = {"min": TILE, "max": NESTED_MAX_TILES * TILE, "granularity": TILE}
+NESTED_TILES = [NESTED_MAX_TILES, 2, 1, 5, NESTED_MAX_TILES, 3]
+SCALE = 1.0 / 8.0
+
+
+def _online_step(carry, q_t, k_t, v_t):
+    m, s, acc = carry
+    scores = torch.matmul(q_t, k_t.transpose(0, 1)) * SCALE
+    s_max = torch.amax(scores, dim=-1, keepdim=True)
+    rescale = torch.exp(-torch.relu(s_max - m))
+    m_new = torch.maximum(m, s_max)
+    p = torch.exp(scores - m_new)
+    return (
+        m_new,
+        s * rescale + p.sum(dim=-1, keepdim=True),
+        acc * rescale + torch.matmul(p, v_t),
+    )
+
+
+def _nested_attention(q, k, v):
+    def query_body(_carry, tiles):
+        q_t, k_whole, v_whole = tiles
+
+        def key_body(carry, key_tiles):
+            k_t, v_t, q_tile = key_tiles
+            return _online_step(carry, q_tile, k_t, v_t), None
+
+        init = (
+            torch.full((TILE, 1), float("-inf"), dtype=q_t.dtype, device=q_t.device),
+            torch.zeros((TILE, 1), dtype=q_t.dtype, device=q_t.device),
+            torch.zeros((TILE, COLS), dtype=q_t.dtype, device=q_t.device),
+        )
+        (m, s, acc), _ = for_each_tile(
+            key_body,
+            (k_whole, v_whole, q_t),
+            dims=(0, 0, None),
+            tile_size=TILE,
+            init=init,
+        )
+        return None, acc / s
+
+    return for_each_tile(
+        query_body, (q, k, v), dims=(0, None, None), tile_size=TILE, out_dim=0
+    )[1]
+
+
+def tiled_nested_attention(q, k, v):
+    rows = q.shape[0]
+    torch._check(rows >= TILE)
+    torch._check(rows <= NESTED_MAX_TILES * TILE)
+    torch._check(rows % TILE == 0)
+    torch._check(k.shape[0] == rows)
+    torch._check(v.shape[0] == rows)
+    return _nested_attention(q, k, v)
+
+
+def ref_attention(q, k, v):
+    scores = torch.matmul(q.float(), k.float().transpose(0, 1)) * SCALE
+    return torch.matmul(torch.softmax(scores, dim=-1), v.float())
 
 
 def static_gelu(x):
@@ -161,12 +268,15 @@ class TestCorrectionUploadFollowsTheCount(unittest.TestCase):
             COLS, COLS, dtype=torch.float16, generator=torch.Generator().manual_seed(7)
         )
 
-    def _launch(self, fn, static_fn, ref, with_w, static_ref=None, atol=ATOL):
+    def _launch(
+        self, fn, static_fn, ref, with_w, static_ref=None, atol=ATOL, tiles=TILES
+    ):
         compiled = torch.compile(fn, backend="inductor", fullgraph=True)
         static = torch.compile(static_fn, backend="inductor", dynamic=False)
         w_dev = self.w.to(DEVICE_NAME) if with_w else None
+        below_max = sum(1 for c in tiles if c < MAX_TILES)
         before = _correction_upload_stats()
-        for step, count in enumerate(TILES):
+        for step, count in enumerate(tiles):
             rows = count * TILE
             host, on_device = _fresh_declared(rows, seed=1000 + step)
             out = compiled(on_device, w_dev) if with_w else compiled(on_device)
@@ -196,11 +306,99 @@ class TestCorrectionUploadFollowsTheCount(unittest.TestCase):
         delta = _delta(before, _correction_upload_stats())
         # Every launch below the maximum cuts each loop correction step once,
         # and a launch at the maximum cuts nothing.
-        self.assertGreaterEqual(delta["launches"], len(TILES))
-        self.assertGreaterEqual(delta["prefixed"], BELOW_MAX)
-        self.assertEqual(delta["prefixed"] % BELOW_MAX, 0)
+        self.assertGreaterEqual(delta["launches"], len(tiles))
+        self.assertGreaterEqual(delta["prefixed"], below_max)
+        self.assertEqual(delta["prefixed"] % below_max, 0)
         self.assertLess(delta["bytes_sent"], delta["bytes_full"])
         return delta
+
+    def test_a_fresh_kernel_launched_first_below_the_maximum(self):
+        # Review item: the other sequences start at the maximum, so a launch
+        # below it always follows one that wrote every copy. Here the first
+        # launches leave most of the region as the allocator gave it.
+        self._launch(
+            tiled_tanh,
+            torch.tanh,
+            lambda host, rows, _w: torch.tanh(host[:rows].float()),
+            with_w=False,
+            tiles=TILES_FIRST_BELOW_MAX,
+        )
+
+    def test_nested_loops_over_one_declared_size(self):
+        # Query and key loops share the one dimension argument, so the gate
+        # cuts the upload to the query iterations that run, each with every key
+        # iteration it holds.
+        compiled = torch.compile(
+            tiled_nested_attention, backend="inductor", fullgraph=True
+        )
+        # The same function compiled for each size. Without fullgraph a static
+        # compile of these nested loops fails with DataDependentOutputException.
+        static = torch.compile(
+            tiled_nested_attention, backend="inductor", fullgraph=True, dynamic=False
+        )
+        before = _correction_upload_stats()
+        for step, count in enumerate(NESTED_TILES):
+            rows = count * TILE
+            generator = torch.Generator().manual_seed(2000 + step)
+            hosts = [
+                torch.randn(
+                    NESTED_MAX_TILES * TILE,
+                    COLS,
+                    dtype=torch.float16,
+                    generator=generator,
+                )
+                for _ in range(3)
+            ]
+            declared = [h.to(DEVICE_NAME, dynamic={0: NESTED_SPEC}) for h in hosts]
+            for t in declared:
+                t.resize_((rows, COLS))
+            out = compiled(*declared)
+            expected = static(*[h[:rows].to(DEVICE_NAME) for h in hosts])
+            self.assertTrue(
+                torch.equal(out.cpu(), expected.cpu()),
+                f"step {step} at {count} tiles differs from the static kernel",
+            )
+            torch.testing.assert_close(
+                out.cpu().float(),
+                ref_attention(*[h[:rows] for h in hosts]),
+                atol=2e-2,
+                rtol=RTOL,
+                msg=f"step {step} at {count} tiles",
+            )
+        torch.spyre.synchronize()
+        delta = _delta(before, _correction_upload_stats())
+        nested_below_max = sum(1 for c in NESTED_TILES if c < NESTED_MAX_TILES)
+        self.assertGreaterEqual(delta["prefixed"], nested_below_max)
+        self.assertLess(delta["bytes_sent"], delta["bytes_full"])
+
+    def test_a_correction_above_the_bound_uploads_whole(self):
+        with spyre_config.patch({"max_buckets": BIG_TILES}):
+            compiled = torch.compile(tiled_tanh_big, backend="inductor", fullgraph=True)
+            before = _correction_upload_stats()
+            for step, count in enumerate((2, 5)):
+                rows = count * TILE
+                host = torch.randn(
+                    BIG_TILES * TILE,
+                    COLS,
+                    dtype=torch.float16,
+                    generator=torch.Generator().manual_seed(3000 + step),
+                )
+                on_device = host.to(DEVICE_NAME, dynamic={0: BIG_SPEC})
+                on_device.resize_((rows, COLS))
+                out = compiled(on_device)
+                torch.testing.assert_close(
+                    out.cpu().float(),
+                    torch.tanh(host[:rows].float()),
+                    atol=ATOL,
+                    rtol=RTOL,
+                    msg=f"step {step} at {count} tiles",
+                )
+            torch.spyre.synchronize()
+        delta = _delta(before, _correction_upload_stats())
+        # The correction really is above the bound, and nothing was cut.
+        self.assertGreater(delta["bytes_full"], delta["launches"] * (1 << 20))
+        self.assertEqual(delta["prefixed"], 0)
+        self.assertEqual(delta["bytes_sent"], delta["bytes_full"])
 
     def test_one_op_body(self):
         delta = self._launch(tiled_gelu, static_gelu, ref_gelu, with_w=False)
