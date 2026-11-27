@@ -15,6 +15,7 @@
 # Owner(s): ["module: cpp"]
 
 import functools
+import math
 import os
 import warnings
 from contextlib import contextmanager
@@ -1940,6 +1941,91 @@ class TestSpyre(TestCase):
         )
         x[3, 3, 3] = y
         self.assertEqual(x.cpu()[3, 3, 3], y, atol=1e-3, rtol=1e-3)
+
+    @parametrize(
+        "base_sizes, index",
+        [
+            # Issue 6326: q of a fused [N, 8192 + 1024 + 1024] qkv tensor.
+            subtest(([8, 10240], (slice(None), slice(0, 8192))), name="qkv_q"),
+            subtest(([8, 10240], (slice(None), slice(8192, 9216))), name="qkv_k"),
+            subtest(([8, 10240], (slice(None), slice(1024, 9216))), name="offset"),
+            subtest(([8, 160], (slice(None), slice(0, 100))), name="substick"),
+            subtest(([2, 35, 128], (slice(None), slice(0, 3))), name="middle_dim"),
+            subtest(([4, 3, 200], (Ellipsis, slice(0, 128))), name="rank3"),
+        ],
+    )
+    def test_h2d_strided_slice_non_multiple_row(self, base_sizes, index):
+        """H2D of a host slice whose row stride is not a whole multiple of
+        the slice width must read each row at its own host offset."""
+        numel = math.prod(base_sizes)
+        # Integers below 251 differ between rows and are exact in fp16.
+        base = (torch.arange(numel) % 251).to(torch.float16).reshape(base_sizes)
+        view = base[index]
+        self.assertFalse(view.is_contiguous())
+
+        torch.testing.assert_close(view.to("spyre").cpu(), view, rtol=0, atol=0)
+
+    @parametrize(
+        "dst_sizes, dst_index, src_fn",
+        [
+            # Host rows with gaps (stride 10240) into device rows 2..5.
+            subtest(
+                ([8, 8192], (slice(2, 6),), lambda b: b(8, 10240)[:4, 0:8192]),
+                name="gapped_rows",
+            ),
+            subtest(
+                (
+                    [8, 8192],
+                    (slice(None), slice(0, 4096)),
+                    lambda b: b(8, 10240)[:, :4096],
+                ),
+                name="gapped_cols",
+            ),
+            # Packed sources into column slices: correct before this fix too.
+            # Column slices start and end on a stick boundary (multiples of 64).
+            subtest(
+                ([8, 8192], (slice(None), slice(128, 4224)), lambda b: b(8, 4096)),
+                name="packed_cols",
+            ),
+            subtest(
+                ([4, 64, 8192], (Ellipsis, slice(128, 8064)), lambda b: b(4, 64, 7936)),
+                name="packed_cols_rank3",
+            ),
+            # Rank-3 host rows with gaps (stride 10240) into a column slice.
+            subtest(
+                (
+                    [4, 64, 8192],
+                    (Ellipsis, slice(128, 4224)),
+                    lambda b: b(4, 64, 10240)[..., :4096],
+                ),
+                name="gapped_cols_rank3",
+            ),
+            # Size-1 host dim whose stride differs from the row stride.
+            subtest(
+                (
+                    [2, 1, 8192],
+                    (Ellipsis, slice(1408, 5824)),
+                    lambda b: b(2, 3, 4480)[:, 1:2, 0:4416],
+                ),
+                name="size1_dim",
+            ),
+        ],
+    )
+    def test_h2d_strided_slice_into_device_slice(self, dst_sizes, dst_index, src_fn):
+        """H2D into a device slice must read each host row at its own offset."""
+
+        def make(*sizes):
+            # Integers below 251 differ between rows and are exact in fp16.
+            n = math.prod(sizes)
+            return (torch.arange(n) % 251).to(torch.float16).reshape(sizes)
+
+        src = src_fn(make)
+        dst = torch.zeros(dst_sizes, dtype=torch.float16, device="spyre")
+        dst[dst_index] = src
+
+        expected = torch.zeros(dst_sizes, dtype=torch.float16)
+        expected[dst_index] = src
+        torch.testing.assert_close(dst.cpu(), expected, rtol=0, atol=0)
 
     @parametrize(
         "sizes",
