@@ -179,6 +179,11 @@ def select_cases(plan, wanted):
     return [r for r in plan["cases"] if r["action"] == "run" and (not wanted or r["name"] in wanted)]
 
 
+def repeat_subdir(repeat):
+    """The one spelling of a repeat's directory name, shared by raw_repeat_dir and the repeat dir."""
+    return f"repeat-{int(repeat):03d}"
+
+
 def repeat_schedule(rec):
     """[(repeat, cache)]: engine-driven repeats, cold then warm for cache both; numbering is continuous from 1."""
     caches = ["cold", "warm"] if rec.get("cache") == "both" else [rec.get("cache") or "warm"]
@@ -195,6 +200,8 @@ def run_values(rec, ctx, repeat, cache, raw_dir, repeat_dir):
         "cache": cache,
         "profile_level": rec.get("profile_level") or "off",
         "raw_dir": raw_dir,
+        # Under raw_dir, so fixed output filenames stay per-repeat and still reach the ingest.
+        "raw_repeat_dir": str(Path(raw_dir) / repeat_subdir(repeat)),
         "repeat_dir": repeat_dir,
         "out_dir": ctx["out"],
         "python": sys.executable,
@@ -212,6 +219,7 @@ def command_env(rec, vals, quiet, pass_env=(), pass_prefixes=()):
         "BENCH_CACHE": vals["cache"],
         "BENCH_PROFILE_LEVEL": vals["profile_level"],
         "BENCH_RAW_DIR": vals["raw_dir"],
+        "BENCH_RAW_REPEAT_DIR": vals["raw_repeat_dir"],
         "BENCH_REPEAT_DIR": vals["repeat_dir"],
         "BENCH_SUBJECT_ID": vals["subject_id"],
         **({"BENCH_QUIET": "1"} if quiet else {}),
@@ -485,11 +493,15 @@ def run_case(rec, ctx, popen):
     outcome["_notes"] += pinned.notes
     pin = pinned.observer_request() if pinned.observes else None
     uses_wrapper = any("{" + pinning_run.WRAPPER_TOKEN + "}" in str(w) for w in rec["command"])
+    # Only for a command that asks for it: raw/ stays untouched for every other case.
+    uses_raw_repeat = any("{raw_repeat_dir}" in str(w) for w in rec["command"])
     sidecar_seen = False
     for repeat, cache in schedule:
-        rdir = case_dir / f"repeat-{repeat:03d}"
+        rdir = case_dir / repeat_subdir(repeat)
         planfile.fresh_dir(out, rdir)
         vals = run_values(rec, ctx, repeat, cache, str(raw_dir), str(rdir))
+        if uses_raw_repeat:
+            planfile.ensure_dirs(out, Path(vals["raw_repeat_dir"]))
         try:
             argv = planfile.render_tokens(rec["command"], vals, RUN_PHASE_TOKENS, f"case {rec['name']}")
         except ValueError as e:
@@ -552,7 +564,8 @@ def run_case(rec, ctx, popen):
     outcome["reason"] = "repeats_failed" if failed else ""
     planfile.write_file(out, case_dir / "case.json", case_record)  # a benchmark may have replaced it meanwhile
     planfile.ensure_dirs(out, raw_dir)
-    empty = not any(raw_dir.iterdir())
+    # Files, not entries: the per-repeat subdirs exist before the command runs, so an empty tree has entries.
+    empty = not any(f.is_file() for f in raw_dir.rglob("*"))
     if not failed and empty and (ctx["ingest"] or not (sidecar_seen or rec.get("allow_empty"))):
         outcome.update(status="failed", reason="no_output")  # exit 0 with nothing recorded is not a run
     size = sum(f.stat().st_size for f in raw_dir.rglob("*") if f.is_file())
