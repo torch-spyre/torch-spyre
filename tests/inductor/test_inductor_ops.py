@@ -10396,6 +10396,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         scale=128**-0.5,
                     ),
                     torch.tensor([30, 95, 95, 128], dtype=torch.int32),
+                    0.02,
                 ),
                 # Overflow cases: T=192, E=4 → capacity=128; offs gives expert 0
                 # exactly 129 tokens (one above capacity) in each ragged variant.
