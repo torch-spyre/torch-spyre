@@ -149,7 +149,7 @@ def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
     if ranges is None:
         return pos
     for host_idx, r in enumerate(ranges):
-        if int(r) != 1:
+        if r != 1:
             pos[host_idx] = it_idx
             it_idx += 1
     # Raw reduction-dim keys are stored offset by the RAW (un-squeezed)
@@ -164,7 +164,7 @@ def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
     reduction_ranges = getattr(ir_node.data, "reduction_ranges", None) or []
     red_it_idx = 0
     for host_idx, r in enumerate(reduction_ranges):
-        if int(r) != 1:
+        if r != 1:
             pos[raw_n_output_dims + host_idx] = squeezed_n_output_dims + red_it_idx
             red_it_idx += 1
     return pos
@@ -1288,7 +1288,7 @@ def _consumer_own_dim_symbol(
     it_idx = 0
     mapped = dim
     for host_idx, r in enumerate(consumer.data.ranges):
-        if int(r) != 1:
+        if r != 1:
             if host_idx == dim:
                 mapped = it_idx
             it_idx += 1

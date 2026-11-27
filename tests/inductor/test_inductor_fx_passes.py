@@ -241,6 +241,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             result = concretize_index(index, loop_vars)
             assert result == index, f"Expected {index}, got {result}"
 
+    def test_raw_to_squeezed_pos_with_symbolic_reduction(self):
+        """
+        A reduction over a declared dimension, e.g. x.amax(dim=0) on a
+        declared x inside a for_each_tile body, has the declared symbol as
+        its reduction size. Numbering its dims must not call int() on it.
+
+        Regression test for: "TypeError: Cannot convert symbols to int".
+        """
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.wsr.loop_tiling_common import (
+            _raw_to_squeezed_pos,
+        )
+
+        # The same shape as the reproducer's amax op:
+        # ranges=[1, 64], reduction_ranges=[s0].
+        s0 = sympy.Symbol("s0", positive=True, integer=True)
+        op = SimpleNamespace(
+            data=SimpleNamespace(ranges=[1, 64], reduction_ranges=[s0])
+        )
+
+        # The size-1 dim (raw 0) is dropped, the 64 dim (raw 1) is d0, and
+        # the reduction dim (raw 2) is d1.
+        assert _raw_to_squeezed_pos(op) == {1: 0, 2: 1}
+
 
 class TestPassUtils(unittest.TestCase):
     """Unit tests for helpers in ``torch_spyre._inductor.pass_utils``."""

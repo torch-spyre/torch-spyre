@@ -2006,7 +2006,7 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     raw_to_squeezed: dict[int, int] = {}
     it_idx = 0
     for host_idx, r in enumerate(ranges):
-        if int(r) != 1:
+        if r != 1:
             raw_to_squeezed[host_idx] = it_idx
             it_idx += 1
 
