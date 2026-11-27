@@ -38,7 +38,7 @@ from torch._inductor.ir import (
     _CollectiveKernel,
 )
 
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import ElementArrangement, get_device_size_in_bytes
 
 from . import config
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
@@ -47,6 +47,7 @@ from .ir import (
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
 )
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
@@ -66,12 +67,14 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     input_layout_for_operation,
     invert_per_core_view,
+    is_restickify_coords,
     iteration_space_from_op,
     commit_iteration_space_ownership,
     op_out_coords,
     op_read_writes,
     unrepresentable_splits_by_index_coeff,
     work_division_transport_indexes,
+    restickify_sweep_dim,
     _per_core_view_from_prep,
     _prepare_per_core_view,
     tile_ownership_view,
@@ -96,11 +99,20 @@ MAX_SPAN_BYTES = 256 * 1024 * 1024
 
 @dataclasses.dataclass
 class TensorDep:
-    """Bundles a MemoryDep with its FixedTiledLayout and pre-computes device coordinates."""
+    """Bundles a MemoryDep with its FixedTiledLayout and pre-computes device coordinates.
+
+    ``sweep_dim`` is the device dim a size-1 restickify sweeps on this operand
+    (``restickify_sweep_dim``), set by :func:`collect_tensor_deps`; ``None`` otherwise.
+    ``whole_stick_vars`` are the variables of a restickify's other-operand stick,
+    which the restickify walks over the full device extent of the dim they index
+    here, padding included.
+    """
 
     dep: MemoryDep
     layout: FixedTiledLayout
     device_coords: list[Expr] = dataclasses.field(init=False)
+    sweep_dim: int | None = None
+    whole_stick_vars: frozenset[Symbol] = frozenset()
 
     def __post_init__(self):
         self.device_coords = device_coordinates(
@@ -554,7 +566,40 @@ def get_per_core_span(
     For symbolic dims, the per-dim range ``R`` is the ``max_size`` from
     ``symbol_meta`` divided by the dim's split count — the worst-case runtime
     footprint that any compiled plan must remain legal against.
+
+    The intact operand of a size-1 restickify also sweeps its gap dim on every
+    core (``TensorDep.sweep_dim``), so its span is at least that sweep.  A
+    restickify walks the other operand's stick in whole sticks, so a dim that a
+    variable of that stick (``TensorDep.whole_stick_vars``) indexes counts with its
+    device extent: a dim padded from 20 to 64 spans 64 slices, not 20.
     """
+    return max(
+        _coordinate_span(td, splits, it_space_orig, symbol_meta),
+        _restickify_sweep_span(td),
+    )
+
+
+def _restickify_sweep_span(td: TensorDep) -> int:
+    """Bytes a size-1 restickify's sweep over ``td``'s gap dim covers on each core.
+
+    The gap dim has no loop variable when work division runs (codegen binds one
+    later), so no split can shorten the sweep: every core walks all its slices.
+    """
+    if td.sweep_dim is None:
+        return 0
+    stl = td.layout.device_layout
+    return get_device_size_in_bytes(
+        list(stl.device_size[td.sweep_dim :]), stl.device_dtype
+    )
+
+
+def _coordinate_span(
+    td: TensorDep,
+    splits: dict[Symbol, int],
+    it_space_orig: dict[Symbol, Expr],
+    symbol_meta: SymbolMeta,
+) -> int:
+    """Per-core span of the dims ``td``'s coordinates index (see get_per_core_span)."""
     device_size = td.layout.device_layout.device_size
     itemsize = td.layout.dtype.itemsize
     for d, coord in enumerate(td.device_coords[:-1]):
@@ -567,7 +612,10 @@ def get_per_core_span(
             # Per-core span is a hardware-bound quantity that must be checked
             # against MAX_SPAN_BYTES. For symbolic dims we use ``max_size``
             # (the worst-case footprint, also the HBM allocation footprint).
-            R = _effective_size(v, it_space_orig, symbol_meta) // splits.get(v, 1)
+            R = _effective_size(v, it_space_orig, symbol_meta)
+            if v in td.whole_stick_vars and coord == v:
+                R = max(R, int(device_size[d]))
+            R //= splits.get(v, 1)
             per_core_max += int(term.xreplace({v: R - 1}))
             per_core_min += int(term.xreplace({v: 0}))
         per_core_size = per_core_max - per_core_min + 1
@@ -591,11 +639,17 @@ def raise_if_per_core_overflow(
         per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
         if per_core_span > MAX_SPAN_BYTES:
             dl = td.layout.device_layout
+            gap_note = (
+                f", including the sweep over gap dim {td.sweep_dim}, which no split "
+                f"shortens"
+                if _restickify_sweep_span(td) == per_core_span
+                else ""
+            )
             raise Unsupported(
                 f"{op_name}: per-core tensor span "
                 f"{per_core_span / (1024 * 1024):.3f} MB "
                 f"(shape={list(td.layout.size)}, dtype={td.layout.dtype}, "
-                f"device_size={list(dl.device_size)}, splits={splits}) "
+                f"device_size={list(dl.device_size)}, splits={splits}{gap_note}) "
                 f"exceeds hardware limit of {MAX_SPAN_BYTES / (1024 * 1024):.2f} MB"
             )
 
@@ -857,7 +911,38 @@ def collect_tensor_deps(
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op_read_writes(op)
     output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
+    _mark_restickify_sweep_dim(op, input_tds, output_td)
     return input_tds, output_td
+
+
+def _mark_restickify_sweep_dim(
+    op: ComputedBuffer, input_tds: list[TensorDep], output_td: TensorDep
+) -> None:
+    """Mark what a restickify walks beyond its operands' coordinates.
+
+    Each operand gets the other's stick variables as ``whole_stick_vars``.  A
+    size-1 restickify's intact operand also gets ``sweep_dim``: the elided
+    operand is the one whose within-stick coordinate is a constant, and the gap
+    dim is on the other (``_restickify_restore_elided_dim`` binds it).
+    """
+    if not isinstance(op.data, Pointwise) or len(input_tds) != 1:
+        return
+    in_td = input_tds[0]
+    if not is_restickify_coords(in_td.device_coords, output_td.device_coords):
+        return
+    in_td.whole_stick_vars = frozenset(output_td.device_coords[-1].free_symbols)
+    output_td.whole_stick_vars = frozenset(in_td.device_coords[-1].free_symbols)
+    in_elided = not in_td.device_coords[-1].free_symbols
+    out_elided = not output_td.device_coords[-1].free_symbols
+    if in_elided == out_elided:
+        return
+    intact = output_td if in_elided else in_td
+    intact.sweep_dim = restickify_sweep_dim(
+        intact.layout.device_layout.device_size,
+        intact.layout.device_layout.stride_map,
+        intact.device_coords,
+        intact.layout.device_layout.elems_per_stick(),
+    )
 
 
 def apply_splits(op: ComputedBuffer, splits: dict) -> None:
@@ -1499,7 +1584,7 @@ def build_op_split_space(
     return OpSplitSpace(
         op=op,
         context=context,
-        output_axes=frozenset(a for a in axes if write.index.coeff(a) != 0),
+        output_axes=frozenset(a for a in axes if a in write.index.free_symbols),
         factor_domains={axis: context.factor_domain(axis) for axis in axes},
         tiling=tiling,
     )
@@ -2324,12 +2409,26 @@ def log2(arg):
 def piecewise(*args):
     """``piecewise``, symbolic-aware, mirroring the :func:`sympy.Piecewise`
     API: each argument is an ``(expr, cond)`` pair, evaluated in order.
-    Dispatches to ``sympy.Piecewise`` when a condition is symbolic, otherwise
-    returns the evaluated value. The last ``cond`` must be a catch-all (e.g.
-    ``True``) so the non-symbolic loop always returns."""
-    if any(isinstance(cond, sympy.Basic) for _expr, cond in args):
-        return sympy.Piecewise(*args)
-    for expr, cond in args:
+    Arms whose condition is already false are dropped, and a condition that is
+    already true ends the list, so a decided condition selects its value
+    without building a sympy node. Dispatches to ``sympy.Piecewise`` when a
+    remaining condition is symbolic, otherwise returns the evaluated value. The
+    last ``cond`` must be a catch-all (e.g. ``True``) so the non-symbolic loop
+    always returns."""
+    kept = []
+    for value, cond in args:
+        if cond is False or cond is sympy.false:
+            continue
+        if cond is True or cond is sympy.true:
+            if not kept:
+                return value
+            kept.append((value, True))
+            break
+        kept.append((value, cond))
+
+    if any(isinstance(cond, sympy.Basic) for _expr, cond in kept):
+        return sympy.Piecewise(*kept)
+    for expr, cond in kept:
         if cond:
             return expr
     raise ValueError("piecewise(...) requires a catch-all True branch")
@@ -2939,9 +3038,18 @@ def _iter_computed_buffers(operations: list[Operation]):
         elif isinstance(op, MultiOutput):
             pass
         elif isinstance(op, ExternKernel):
-            if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback, DeviceCopy)):
+            if isinstance(
+                op,
+                (
+                    SpyreConstantFallback,
+                    SpyreEmptyFallback,
+                    SpyreArangeFallback,
+                    DeviceCopy,
+                ),
+            ):
                 # Work division not supported on allocation/constant kernels, nor
-                # on DeviceCopy.
+                # on DeviceCopy.  A coordinate is materialized by the runtime
+                # rather than by a kernel, so it has no iteration space to divide.
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")

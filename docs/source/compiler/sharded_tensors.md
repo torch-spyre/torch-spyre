@@ -31,24 +31,42 @@ allocation. Sharded tensors are the smallest faithful implementation of that mod
   intermediate is rejected. Everything else that would touch sharded
   storage is rejected at compile time with a message saying why.
 * **Host copies and fills.** Sharded tensors copy to and from the CPU
-  (whole-tensor, no dtype change), and eager `fill_`/`zero_` fill each
-  shard's own allocation. Device-to-device copies are rejected because they
-  take a single device address.
+  (whole-tensor; copies to the CPU may change the dtype, copies to the
+  device may not), and eager `fill_`/`zero_` fill each shard's own
+  allocation. Device-to-device copies are rejected because they take a
+  single device address.
 
 Beyond the op set, the compiled path admits only a narrow shape regime;
 everything outside it fails at compile time with a specific message:
 
 * Every sharded operand must share one placement and have the op's exact
-  shape — no views, slices, reshapes, broadcasts or reindexing (views of
-  sharded storage are additionally rejected at construction; see
-  [Runtime](#runtime-storage-and-addressing-c)).
-* Shard-local strides must equal the global ones (DeepTools strides each
-  core's tiles from the global shape): the shard boundary must fall on
-  whole sticks for a last-dim shard, exactly one (the shard) dim may be
-  divided, and for a shard on a non-last dim rows may not span multiple
-  sticks — a 32×128 fp16 `Shard(0)` tensor fails because the second stick
-  of every row would go unwritten (`_check_local_strides` in
-  `sharded_hbm.py`).
+  shape — no views, slices, reshapes, broadcasts or reindexing (most views
+  of sharded storage are additionally rejected at construction; box views
+  are allowed there but only for copies to the CPU; see
+  [Runtime](#runtime-storage-and-addressing-c)). Operands sharded
+  differently (`Shard(0)` with `Shard(1)`) are rejected with both placements
+  named: combining them needs data movement between shards.
+* **Unsharded operands are read-only replicas.** A pointwise op on a sharded
+  tensor may also read a scalar (a replicated constant) or a plain unified
+  graph input of the op's shape or broadcast to it, such as a bias along the
+  non-shard dims. Every core reads it with ordinary unified addressing;
+  the result takes the sharded operand's placement. An unsharded operand
+  computed inside the graph, or read by a reduction, is rejected. The
+  one-dtype rule below applies to replicas too, so an fp16 sharded tensor
+  times an fp32 scale (including a 0-d one) is rejected: cast the scale to
+  fp16 first. There is no `Replicate()` placement for `to_sharded` yet: a
+  plain `.to("spyre")` tensor is the replica.
+* Each shard must be a whole device dim of whole sticks: the shard keeps
+  the global device layout's dim structure, the shard boundary falls on
+  whole sticks for a last-dim shard (a stick cannot be split between
+  chunks — a 32×32 fp16 `Shard(1)` tensor fails for that reason), and
+  exactly one (the shard) dim may be divided. Shard-local strides may
+  differ from the global ones: the backend addresses each core's tile with
+  the shard-local layout. Two guards make this safe: `_check_shard_layout`
+  in `sharded_hbm.py` checks the sharding itself (whole device dims, whole
+  sticks), and `verify_non_unified_split` in `sharded_hbm.py` checks that
+  the committed work split lands on the shard dim, so core *c* works
+  exactly on shard *c*.
 * Static shapes only (`dynamic=False`), one dtype across operands and
   output, and `BUNDLE_SYMBOLIC_ARGS=1` (each core's start address is a
   bundle `input_arg`).
@@ -226,24 +244,32 @@ implements:
   shard-local `SpyreTensorLayout`, and contiguous global strides.
 * `copy_sharded` — host↔device copy, one shard at a time through
   `spyre_shard_view`, a single-chunk view of one shard's allocation that
-  keeps the parent storage alive. Copies are blocking by contract.
+  keeps the parent storage alive. Copies are blocking by contract. A box
+  view (below) is copied to the CPU from only the shards it overlaps: each
+  is copied whole into a CPU buffer and the part inside the box is taken
+  from there. Copies into a box view are rejected.
 * `fill_sharded` — eager `fill_`/`zero_`, one shard at a time through
-  `spyre_shard_view`, with the same whole-tensor checks as `copy_sharded`.
+  `spyre_shard_view`; it accepts only the whole tensor, so fills of box
+  views are rejected.
 * `shard_device_address` — the launch-time resolver: given a sharded
   tensor and a shard index, returns the device address of that shard's
   allocation. It cross-checks the tensor's actual shard count and
   per-shard bytes against what the kernel was compiled for, so a stale
-  kernel or a differently-sharded tensor fails at launch, not silently.
+  kernel or a differently-sharded tensor fails at launch, not silently. It
+  also requires the whole tensor: a box view starts elsewhere in the shards.
 * Fail-closed guards: `set_` and `resize_` reject sharded storage (they
   would reinterpret it); the view constructors and
-  in-place `as_strided_` reject any view of sharded storage that does not
-  reproduce the base tensor exactly — same sizes, strides, and storage
-  offset — because a view's shape no longer matches the shard mapping
-  (`check_sharded_view` in
-  [spyre_views.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_views.cpp);
-  identity views such as `detach` are allowed); and `copy_sharded` checks
-  the tensor's sizes against the recorded `global_shape` before mapping
-  elements onto shards;
+  in-place `as_strided_` reject any view of sharded storage that keeps no
+  mapping from its elements onto the shards (`check_sharded_view` in
+  [spyre_views.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_views.cpp)).
+  Two kinds of view are allowed: identity views such as `detach`, and
+  *box views* — a block of the base in the same dimension order (the
+  base's rank, unit steps and strides), such as `x[8:16]` or
+  `x[:, 64:128]` (`sharded_box_start` in spyre_mem.cpp works out where the
+  block starts from the recorded `global_shape`). Transposes, strided
+  slices, flattened slices, broadcasts and reshapes stay rejected. Box views
+  can only be copied to the CPU (and printed) so far: kernels, fills,
+  copies into them and `sharding_info` reject them (#5817);
   [spyre_composite_address.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_composite_address.cpp)
   rejects sharded storage anywhere a single `CompositeAddress` is
   consumed (kernels, fills, device copies).
@@ -271,6 +297,11 @@ whose `plan_sharded_hbm` admits a graph for sharded compilation or raises
 2. Every sharded input must agree with the others on placement (shard dim,
    count) — an operand-vs-operand check; each operand's own storage was
    already validated against its receipt when the tensor was created.
+   Unsharded operands of a pointwise op are admitted when they are a scalar
+   constant or a graph input (`_require_replica_source`) of the op's shape
+   or broadcast to it (`_require_replica_read`); they keep ordinary unified
+   addressing, and only the sharded arguments get per-core shard addresses
+   (`verify_mixed_args`).
 3. Only pinned ops may read sharded storage, including
    non-`ComputedBuffer` consumers (fallback kernels), which a separate
    loop catches.
@@ -323,8 +354,9 @@ load-bearing contracts, and where they are pinned:
 * **The neutral receipt contract holds for every backend**
   (`tests/sharding/test_sharding_spec.py`).
 * **The compiled path is correct and isolated**: one shard per core,
-  each core writes only its own shard, sharded and unsharded inputs never
-  share a kernel, and unsupported ops/shardings fail at compile with
+  each core writes only its own shard, a sharded and an unsharded tensor
+  of the same shape never share a cache entry, sharded operands mix with
+  unsharded read-only replicas, and unsupported ops/shardings fail at compile with
   stable messages (`tests/sharding/test_sharded_add.py`).
 
 `test_sharded_add.py` needs a device or the emulation shape (`SENCORES`

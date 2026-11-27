@@ -564,8 +564,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         _move_ops_before(operations, y_new_ops, op)
 
         # When coarse-tiling runs pre-stickification, the consuming matmul
-        # already carries loop_member.  The padding ops must inherit it so they
-        # remain contiguous in the loop group for build_loop_scheduler_nodes.
+        # already sits in a loop.  The padding ops must join it so they remain
+        # contiguous in the loop group.
         if is_looped(op):
             levels = enclosing_loops(op)
             for new_op in y_new_ops:
@@ -582,7 +582,6 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
                             (level.tiled_dims, level.tiled_reduction_dims)
                             for level in levels
                         ],
-                        like=op,
                     )
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---

@@ -95,7 +95,6 @@ from .scratchpad.allocator import (
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import sink_collective_waits, spyre_fuse_nodes
 from .scheduler import (
-    build_loop_scheduler_nodes,
     prepare_spyre_kernels,
 )
 from .constants import DEVICE_NAME
@@ -123,7 +122,11 @@ from .dump_cost_model import dump_cost_model
 # ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
 from . import cost_model_pass as cost_model_pass_module
 from .cost_model_pass import CostReport, cost_model_pass
-from .split_multi_ops import split_multi_ops, validate_ops
+from .split_multi_ops import split_multi_ops
+from .element_arrangement import (
+    insert_ea_shuffle,
+    validate_ops,
+)
 
 
 logger = get_inductor_logger("passes")
@@ -334,18 +337,11 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     The returned list of nodes must also be in topological order.
     """
 
-    # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-    # no ops carry loop_group_id attributes (i.e. no spyre_hint annotations).
-    # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
-    # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
-    # False), so loop groups survive Inductor fusion intact.
+    # A counted loop reaches the scheduler already as one LoopSchedulerNode (a
+    # CountedLoopSchedulerNode), which SuperDSCScheduling.can_fuse_vertical/horizontal
+    # refuse to fuse, so loops survive Inductor's fusion intact.
     def __init__(self):
-        super().__init__(
-            [
-                propagate_mutation_layouts,
-                build_loop_scheduler_nodes,
-            ]
-        )
+        super().__init__([propagate_mutation_layouts])
 
 
 class CustomPostFusionPasses(_SpyreNodePassPipeline):
@@ -465,6 +461,16 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph, lx_relayout_plans=plans)
 
 
+def _log_after_pass(graph: GraphLowering, pass_name: str) -> None:
+    """The per-pass IR dump (``SPYRE_LOG_PASSES``), of the real nested list.
+
+    Called once the pass has returned and ``graph.operations`` is the real list
+    again, so a ``LoopNode`` prints its body indented under it.
+    """
+    if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+        logger.debug("AFTER %s\n%s", pass_name, format_operations(graph.operations))
+
+
 @contextlib.contextmanager
 def _flat_operations(graph: GraphLowering, pass_name: str) -> Iterator[None]:
     """For one pre-scheduling pass: if the graph holds LoopNodes, show the pass
@@ -505,17 +511,11 @@ def _hand_off_loop_nodes(graph: GraphLowering) -> None:
 
     On any other release a graph that holds a ``LoopNode`` is refused here,
     with ``Unsupported`` naming the release: flattening it would compile the
-    loop through the old path without saying that the release is
-    unsupported (decided policy: fail loudly outside the supported set). A
-    graph with no loop is unaffected on every release.
-
-    ``loop_scheduler.SCHEDULE_LOOP_NODES`` off (the equivalence test only)
-    expands the nodes as before, whatever the release.
+    loop without saying that the release is unsupported (decided policy: fail
+    loudly outside the supported set). A graph with no loop is unaffected on
+    every release.
     """
     if not has_loop_nodes(graph.operations):
-        return
-    if not loop_scheduler.SCHEDULE_LOOP_NODES:
-        expand(graph)
         return
     if not loop_scheduler.loop_scheduler_supported():
         expand(graph)
@@ -618,18 +618,19 @@ class CustomPreSchedulingPasses:
             reorder_nonstick_dims,
             finalize_layouts,
             # insert_restickify's advance-transfer logic (see its own
-            # docstring) branches on whether old_name already has
-            # `loop_member` stamped, to decide whether the per-trip advance
-            # belongs on the restickify stage or stays on the consumer.
-            # splice_while_loops runs first in this list and stamps every
-            # for_each_tile level's LoopMember in one deferred final
-            # phase, so by the time insert_restickify runs, every tiled
-            # stage's loop_member is already in place. If this pass ever
-            # moved ahead of splice_while_loops' stamping, that check would
-            # silently take the "not yet tiled" branch and emit an empty
-            # loop_member for a stage that is actually tiled -- a
-            # wrong-answer, not a crash.
+            # docstring) branches on whether old_name is already in a loop
+            # (`is_looped`), to decide whether the per-trip advance belongs
+            # on the restickify stage or stays on the consumer.
+            # splice_while_loops runs first in this list and the pass loop
+            # builds its loops' nodes once it returns, so by the time
+            # insert_restickify runs, every tiled stage is in its loop. If
+            # this pass ever moved ahead of splice_while_loops, that check
+            # would silently take the "not yet tiled" branch and leave a
+            # stage that is actually tiled out of its loop -- a wrong
+            # answer, not a crash.
             insert_restickify,
+            # Insert shuffle nodes to apply or restore element arrangement.
+            insert_ea_shuffle,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             reorder_nonstick_dims_mutation,
@@ -755,6 +756,9 @@ class CustomPreSchedulingPasses:
             # Loops a pass lowered (span-overflow tiling) become nodes here, once
             # the view is back and the pass has stopped iterating the list.
             build_pending_loop_nodes(graph)
+            # The nested list, so a loop's body prints indented under its node.
+            # Before the checker, so a violation still comes with the dump.
+            _log_after_pass(graph, pass_name)
             # After the view is put back: the checker reads the real tree, and a
             # violation then names the pass that left it.
             check_loops(graph, where=pass_name)
@@ -795,12 +799,6 @@ class CustomPreSchedulingPasses:
                 "elapsed %5dms  %s",
                 elapsed_ms,
                 pass_name,
-            )
-        if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
-            logger.debug(
-                "AFTER %s\n%s",
-                pass_name,
-                format_operations(list(all_ops(graph.operations))),
             )
 
     def uuid(self) -> Any | None:

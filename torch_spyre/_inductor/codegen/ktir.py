@@ -556,7 +556,16 @@ def _trip(loop: LoopSpec):
     The only reader of ``LoopSpec.count``.  A symbolic count is returned as it
     is; whether one can be emitted is a question about the plan's
     ``symbolic_extent`` mode, so the plan decides it and this does the reading.
+
+    A count read from device memory (``count_from_buffer``) is refused: this
+    emitter has no bound that is read on the device.
     """
+    if loop.count_from_buffer is not None:
+        raise NotImplementedError(
+            "OpSpec->KTIR: loop trip count is read from device memory "
+            f"({loop.count_from_buffer}); a device-read trip count is not "
+            "supported yet"
+        )
     return _static(loop.count)
 
 

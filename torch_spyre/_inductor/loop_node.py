@@ -30,14 +30,13 @@ names the position with the helpers below (``insert_before``, ``move_after``,
 ``remove_op``, ...), each of which finds the list that owns the anchor.
 After the pass loop the nodes stay: each reaches Inductor's scheduler as one
 ``LoopSchedulerNode`` (``loop_scheduler.py``), and the readers in between
-descend into them.  :func:`expand` flattens them only on a pass error and in
-the equivalence tests that compare against the flat path.
+descend into them.  :func:`expand` flattens them only on a pass error and once the
+scheduler has built its own nodes.
 """
 
 from __future__ import annotations
 
 import contextlib
-import copy
 import contextvars
 from collections.abc import Iterable, Iterator, Mapping, MutableSequence
 from dataclasses import dataclass, field
@@ -128,12 +127,6 @@ class LoopMember:
     loop_tiled_dims: list[list[int]]
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
     strict_loop_vars: bool = False
-
-
-# Set to False only by the no-behaviour-change test, to compare the pipeline
-# with and without nodes.  With it off, ``collapse`` builds nothing, so no
-# pass sees a view and ``expand`` has nothing to do.
-BUILD_LOOP_NODES = True
 
 
 class LoopNode(ir.Operation):
@@ -513,28 +506,15 @@ def _set_chain(entry: ir.Operation, chain: tuple["LoopNode", ...]) -> None:
 def record_member(
     op: ir.Operation,
     tiling: Iterable[tuple[Iterable[int], Iterable[int]]],
-    *,
-    like: ir.Operation | None = None,
 ) -> None:
     """``op``, already placed in built nodes, is a member of their loops, and tiles
     ``tiling[level] = (tiled_dims, tiled_reduction_dims)`` at each level, outermost
     first. This is how a pass that puts a new op into a loop says what the op is
     to the loop; nothing is stamped on the op. Raises ``ValueError`` if the op is in
     no node or ``tiling`` does not have one entry per node around it.
-
-    A graph with no built nodes (``BUILD_LOOP_NODES`` off: the flat path the
-    equivalence tests compare against, deleted in stage 9.5) has nowhere to record
-    it. If ``like`` (the neighbour the op was placed beside) is given, the op gets
-    a copy of the neighbour's ``loop_member`` with this tiling instead.
     """
     chain = getattr(op, "_loop_chain", ())
     tiling = [(tuple(dims), tuple(reduction)) for dims, reduction in tiling]
-    if not chain and like is not None and not BUILD_LOOP_NODES:
-        info = copy.deepcopy(like.loop_member)  # type: ignore[attr-defined]
-        info.loop_tiled_dims = [list(dims) for dims, _ in tiling]
-        info.loop_tiled_reduction_dims = [list(red) for _, red in tiling]
-        op.loop_member = info  # type: ignore[attr-defined]
-        return
     if not chain or len(chain) != len(tiling):
         raise ValueError(
             f"{op.get_name()} is in {len(chain)} loop node(s), not {len(tiling)}"
@@ -890,8 +870,6 @@ def build_pending_loop_nodes(graph: Any) -> None:
     if not pending:
         return
     setattr(graph, _PENDING_ATTR, None)
-    if not BUILD_LOOP_NODES:
-        return
     operations = graph.operations
     assert not isinstance(operations, OpsView), "needs the real list"
     existing = sum(1 for _ in _nodes_in(operations))
@@ -955,8 +933,6 @@ def collapse(
     to its loop variable; a level missing from it gets ``induction=None``.
     The list is rewritten in place, so its identity is kept.
     """
-    if not BUILD_LOOP_NODES:
-        return
     operations = graph.operations
     assert not isinstance(operations, OpsView), "collapse needs the real list"
     if not any(_group_path(op) for op in operations):

@@ -181,8 +181,9 @@ class TestMembership(unittest.TestCase):
         self.assertIn("outside every loop node", problems[0])
 
     def test_a_flat_loop_no_node_covers_is_allowed(self):
-        # span-overflow still stamps flat loop ops (stage 7a replaces it); a node
-        # covers group 0 only, so the group-1 ops are a flat loop, not misplaced.
+        # A loop a lowering has recorded but whose nodes are not built yet (the pass
+        # loop builds them once the pass returns): a node covers group 0 only, so
+        # the group-1 ops are such a loop, not misplaced.
         tree = [
             _node("n0", [_LoopOp("a", (0,))]),
             _LoopOp("flat", (1,)),
