@@ -50,10 +50,12 @@ def run_ingest_step(tmp_path, hostile):
     hostile = {"clickhouse-v2-user": "writer", "clickhouse-v2-pass": "pw", **hostile}
     env = {
         k: INPUT.sub(
-            lambda m: hostile.get(m.group(1))
-            or hostile.get(m.group(2) or "")
-            or m.group(3)
-            or "",
+            lambda m: (
+                hostile.get(m.group(1))
+                or hostile.get(m.group(2) or "")
+                or m.group(3)
+                or ""
+            ),
             v,
         )
         for k, v in step["env"].items()
