@@ -251,6 +251,27 @@ the other compile's work, and a negative delta means another compile reset the
 store mid-pass. Profile with a single compiling thread to get per-compile
 figures.
 
+## Kernel cost sidecar
+
+`TORCH_SPYRE_KERNEL_COST_DIR=dir` appends one JSON line per compiled kernel to
+`dir/kernel_cost.<pid>.jsonl`, joining the kernel's `provenance_key` -- the key
+the device trace carries -- to the analytical cost model's prediction for it.
+Off by default, at the cost of one attribute read per kernel.
+
+Each line carries `kernel`, `aten_ops`, and under `cost`: `predicted_us`,
+`hbm_read_bytes`, `hbm_write_bytes`, `lx_bytes`, `macs`, `cores`, the `groups`
+it was priced from, and `floor_inputs` (`bw_peak_gbps`,
+`mac_peak_per_core_ns`, `fill_ns` -- the roofline constants).
+
+These are **model outputs, not measurements**: they say what the cost model
+predicted, which is the point of comparing them against a measured trace.
+`cost` is `null` for a kernel replayed from the FX graph cache, since there is
+no report to price it from.
+
+Setting the directory runs the cost model pass quietly; `SPYRE_DUMP_COST` still
+controls whether the report is printed. The setting is kept out of the FX graph
+cache key, so turning it on does not invalidate cached kernels.
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |

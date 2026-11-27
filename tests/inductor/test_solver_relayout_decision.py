@@ -412,6 +412,7 @@ _KEPT_OUT_OF_THE_CACHE_KEY = {
     "timing": lambda value: not value,
     "timing_out": lambda value: value + ".other",
     "dump_cost_expr_file": lambda value: value + ".other",
+    "kernel_cost_dir": lambda value: value + "/other",
     "spyre_kernel_cache": lambda value: not value,
 }
 
@@ -445,6 +446,7 @@ def test_each_cache_key_ignore_prefix_matches_only_known_settings():
         "backend_compile_timeout_seconds": ["backend_compile_timeout_seconds"],
         "timing": ["timing", "timing_out"],
         "dump_cost_expr_file": ["dump_cost_expr_file"],
+        "kernel_cost_dir": ["kernel_cost_dir"],
         "spyre_kernel_cache": ["spyre_kernel_cache"],
         "precomputed_kernel_key": ["precomputed_kernel_key"],
     }

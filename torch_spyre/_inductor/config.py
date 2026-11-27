@@ -347,6 +347,9 @@ read_copy_elision: bool = os.getenv("SPYRE_READ_COPY_ELISION", "1").lower() in (
 # after specific passes. Set via SPYRE_LOG_PASSES env var or programmatically.
 log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 
+# Destination for kernel_cost.<pid>.jsonl; empty is off, set also prices quietly.
+kernel_cost_dir: str = os.environ.get("TORCH_SPYRE_KERNEL_COST_DIR", "")
+
 # Structured per-compile timing records (timing_recorder.py).  Off by default;
 # when off, a timed region records nothing and allocates no event, but the call
 # site still builds its name and keyword arguments and this flag is still read,
@@ -621,6 +624,7 @@ _cache_config_ignore_prefix: list[str] = [
     # prefix matches.
     "timing",
     "dump_cost_expr_file",
+    "kernel_cost_dir",
     "spyre_kernel_cache",
     # Read at call time; the generated code is the same for every value.
     "precomputed_kernel_key",
