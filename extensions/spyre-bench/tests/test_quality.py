@@ -355,6 +355,64 @@ def make_plan(path, purpose="nightly"):
     return path
 
 
+class RequestType(unittest.TestCase):
+    """The `perf` default must not discard a quality case the request asked for by name."""
+
+    CASE = "eval_questions_demoa_fp16_l8"
+
+    def catalog_with_a_quality_selection(self):
+        d = TMP / "quality-selection"
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.copytree(DEMO, d)
+        (d / "selections.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "bench/v1alpha1",
+                    "kind": "Selection",
+                    "metadata": {"name": "scores"},
+                    "spec": {"selector": {"types": ["quality"], "suites": ["lm-eval"]}},
+                }
+            )
+        )
+        return d
+
+    def plan(self, catalog, *extra):
+        out = TMP / f"rt-{len(list(TMP.glob('rt-*')))}.json"
+        argv = [
+            "--catalog", str(catalog), "--central", str(CENTRAL), "--arch", "x86_64", "--reference-node",
+            "--now", NOW, "--purpose", "nightly", "--out", str(out), "--subject-id", SUBJECT, *extra,
+        ]  # fmt: skip
+        code, _, err = capture(plan_cmd.main, argv)
+        if code not in (0, 4):
+            return None, err
+        return json.loads(out.read_text()), err
+
+    def test_a_selection_that_declares_its_type_needs_no_type_flag(self):
+        plan, err = self.plan(self.catalog_with_a_quality_selection(), "--select", "scores")
+        self.assertIsNotNone(plan, err)
+        self.assertIn(self.CASE, [c["name"] for c in plan["cases"]])
+
+    def test_a_case_named_by_the_request_needs_no_type_flag(self):
+        plan, err = self.plan(DEMO, "--cases", self.CASE)
+        self.assertIsNotNone(plan, err)
+        self.assertEqual([c["name"] for c in plan["cases"]], [self.CASE])
+
+    def test_an_explicit_type_still_narrows(self):
+        plan, err = self.plan(DEMO, "--cases", self.CASE, "--type", "perf")
+        self.assertIsNone(plan)
+        self.assertIn("empty", err)
+
+    def test_a_selection_without_types_still_takes_the_default(self):
+        """A Selection that states no type is unchanged: the `perf` default applies to it."""
+        d = self.catalog_with_a_quality_selection()
+        doc = yaml.safe_load((d / "selections.yaml").read_text())
+        doc["spec"] = {"cases": [self.CASE]}
+        (d / "selections.yaml").write_text(yaml.safe_dump(doc))
+        plan, err = self.plan(d, "--select", "scores")
+        self.assertIsNone(plan)
+        self.assertIn("empty", err)
+
+
 class EndToEnd(unittest.TestCase):
     """plan then run the stub quality command: the Result carries the quality policy's verdict."""
 
