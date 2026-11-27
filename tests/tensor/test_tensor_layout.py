@@ -342,6 +342,24 @@ class TestSpyreTensorLayout(TestCase):
                 self.assertFalse(base.equals_ignoring_valid_elements(other))
                 self.assertFalse(other.equals_ignoring_valid_elements(base))
 
+    def test_equality_compares_valid_elements(self):
+        geometry = ([4, 512, 64], [64, 256, 1], get_device_dtype(torch.float16))
+        populated = SpyreTensorLayout(*geometry, {(0, 2): 256, (1,): 512})
+        same = SpyreTensorLayout(*geometry, {(0, 2): 256, (1,): 512})
+        padded = SpyreTensorLayout(*geometry, {(0, 2): 200, (1,): 7})
+        unknown = SpyreTensorLayout(*geometry, {})
+
+        self.assertEqual(populated, same)
+        self.assertEqual(hash(populated), hash(same))
+        for name, other in [("padded", padded), ("unknown", unknown)]:
+            with self.subTest(other=name):
+                # Same geometry, so only valid_elements tells them apart.
+                self.assertTrue(populated.equals_ignoring_valid_elements(other))
+                self.assertNotEqual(populated, other)
+                self.assertNotEqual(other, populated)
+                self.assertEqual(len({populated, same, other}), 2)
+                self.assertNotIn(other, {populated: None})
+
     def test_stl_pickleable(self):
         stl = SpyreTensorLayout(
             [512, 256],

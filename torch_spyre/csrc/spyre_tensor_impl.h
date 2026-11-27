@@ -295,17 +295,21 @@ class SpyreTensorLayout {
     return spyre::elems_per_stick(this->device_dtype);
   }
 
+  /**
+   * Full equality, valid_elements included, matching std::hash below. An
+   * unknown map ({}) does not equal a populated one: unknown extents are not
+   * known to match.
+   */
   bool operator==(const SpyreTensorLayout& other) const {
-    // TODO(#5905): also compare valid_elements, and update std::hash to match,
-    // once the deprecated constructor's call sites have migrated to the
-    // valid_elements overload. Comparisons that must keep ignoring the valid
-    // extents then call equals_ignoring_valid_elements directly.
-    return equals_ignoring_valid_elements(other);
+    return equals_ignoring_valid_elements(other) &&
+           this->valid_elements == other.valid_elements;
   }
 
   /**
-   * Equality ignoring `valid_elements`: what `operator==` compares today, and
-   * what it will no longer compare once the TODO above is resolved.
+   * Equality of device geometry alone: device_size, stride_map, device_dtype
+   * and element_arrangement, but not valid_elements. Use it where the
+   * question is where the elements are, not which of them are meaningful
+   * (for example, whether a view can reuse its parent's DMA description).
    */
   bool equals_ignoring_valid_elements(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&
@@ -428,6 +432,12 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
+    for (const auto& [dims, count] : layout.valid_elements) {
+      seed = c10::hash_combine(seed, std::hash<size_t>{}(dims.size()));
+      for (int64_t d : dims)
+        seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
+      seed = c10::hash_combine(seed, std::hash<int64_t>{}(count));
+    }
     return seed;
   }
 };
