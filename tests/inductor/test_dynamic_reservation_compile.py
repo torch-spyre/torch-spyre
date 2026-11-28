@@ -39,13 +39,18 @@ import torch
 import torch.nn.functional as F
 from torch._dynamo.utils import counters
 from torch._inductor.exc import InductorError
-from torch._inductor.utils import fresh_cache
+from torch._inductor.utils import fresh_cache, run_and_get_code
 
 from utils_inductor import expects_raise
 
 import torch_spyre  # noqa: F401
 import torch_spyre._inductor.config as spyre_config
-from torch_spyre._C import get_device_dtype, get_spyre_tensor_layout, SpyreTensorLayout
+from torch_spyre._C import (
+    get_device_dtype,
+    get_reserved_dims,
+    get_spyre_tensor_layout,
+    SpyreTensorLayout,
+)
 from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre.execution.kernel_cache import get_cache_root_dir
 
@@ -111,6 +116,51 @@ def test_a_plain_op_over_the_declared_dim_is_refused(case):
 
     with pytest.raises(InductorError, match="outside any for_each_tile loop"):
         torch.compile(fn)(y)
+
+
+def _write_mid_stick(x, y):
+    # A write that starts mid-stick: Inductor relayouts the mutated input x and
+    # emits set_spyre_tensor_layout(x, alt_stl) after the copy-back
+    # (emit_layout_restores), as in test_slice_stick_mutation_layout_update.
+    z = x[..., 32:96].copy_(y)
+    return y + z
+
+
+# The x and y shapes, and the refusal. In 2D the relayout moves the stick onto
+# dim 0, the declared dim. In 3D it moves onto dim 1, and the op is refused for
+# iterating over the declared dim outside a for_each_tile loop. The 2D guard is
+# on the route #5890 removes; the for_each_tile refusal then covers 2D as well.
+MUTATED_INPUT_CASES = {
+    "2d": ((560, 256), (560, 64), "symbolic stick dim"),
+    "3d": ((140, 192, 256), (140, 192, 64), "outside any for_each_tile loop"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(MUTATED_INPUT_CASES))
+@expects_raise
+def test_a_relayout_of_a_mutated_declared_input_is_refused(case):
+    """set_spyre_tensor_layout on a declared input is refused at runtime (#6684).
+
+    A graph that would emit it is refused at compile first, so the runtime check
+    is only a backstop. The same graph on an undeclared input does emit it.
+    """
+    x_shape, y_shape, refusal = MUTATED_INPUT_CASES[case]
+    spec = {"min": 70, "max": 630, "granularity": 70}
+
+    plain_x = torch.rand(x_shape, dtype=torch.float16).to(DEVICE)
+    plain_y = torch.rand(y_shape, dtype=torch.float16).to(DEVICE)
+    compiled = torch.compile(_write_mid_stick, dynamic=False, fullgraph=True)
+    _, codes = run_and_get_code(compiled, plain_x, plain_y)
+    assert any("set_spyre_tensor_layout(" in code for code in codes)
+
+    torch._dynamo.reset()
+    x = torch.rand(x_shape, dtype=torch.float16).to(DEVICE, dynamic={0: spec})
+    y = torch.rand(y_shape, dtype=torch.float16).to(DEVICE, dynamic={0: spec})
+    layout = str(get_spyre_tensor_layout(x))
+    with pytest.raises(InductorError, match=refusal):
+        torch.compile(_write_mid_stick, fullgraph=True)(x, y)
+    assert str(get_spyre_tensor_layout(x)) == layout
+    assert get_reserved_dims(x) == {0: spec}
 
 
 @pytest.mark.parametrize("case", sorted(PLAIN_CASES))
