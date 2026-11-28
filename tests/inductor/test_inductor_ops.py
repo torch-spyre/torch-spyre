@@ -11896,6 +11896,72 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_topk_reshaped_view_input(self):
+        # Issue #5850: A view/reshape feeding topk inside the compiled graph,
+        # 3D topk, 3D transposed topk, and single-row 2D topk must compile and
+        # produce correct values and indices.
+        x = unique_randn_along_dim((8, 768), dim=-1, dtype=torch.float16).view(
+            2, 4 * 768
+        )
+        self.compare_with_cpu(
+            lambda t: t.view(8, 768).topk(8, dim=-1)[0],
+            x,
+            run_eager=False,
+        )
+        self.compare_with_cpu(
+            lambda t: t.view(8, 768).contiguous().topk(8, dim=-1)[0],
+            x,
+            run_eager=False,
+        )
+
+        # 3D view feeding topk
+        x3d_view = unique_randn_along_dim(
+            (2, 4, 768), dim=-1, dtype=torch.float16
+        ).view(8, 768)
+        self.compare_with_cpu(
+            lambda t: t.view(2, 4, 768).topk(8, dim=-1)[0],
+            x3d_view,
+            run_eager=False,
+        )
+
+        # 3D topk(dim=-1) on [B, n, C]
+        x3d = unique_randn_along_dim((8, 4, 768), dim=-1, dtype=torch.float16)
+        self.compare_with_cpu(
+            lambda t: t.topk(8, dim=-1)[0],
+            x3d,
+            run_eager=False,
+        )
+
+        # 3D transposed topk(dim=1)
+        self.compare_with_cpu(
+            lambda t: t.transpose(1, 2).topk(8, dim=1)[0],
+            x3d,
+            run_eager=False,
+        )
+
+        # Single-row 2D input [1, 256] with k=3
+        x_single = unique_randn_along_dim((1, 256), dim=-1, dtype=torch.float16)
+        self.compare_with_cpu(
+            lambda t: t.topk(3, dim=-1)[0],
+            x_single,
+            run_eager=False,
+        )
+
+        # Check values and exact indices on float32 without ties
+        x32 = unique_randn_along_dim(
+            (8, 256), dim=-1, dtype=torch.float32, min_val=-50.0, max_val=50.0
+        ).view(2, 4 * 256)
+        self.compare_with_cpu(
+            lambda t: t.view(8, 256).topk(8, dim=-1)[0],
+            x32,
+            run_eager=False,
+        )
+        self.compare_with_cpu(
+            lambda t: t.view(8, 256).topk(8, dim=-1)[1].to(torch.int64),
+            x32,
+            run_eager=False,
+        )
+
     def test_topk_fused_softmax_router(self, width: int):
         # Fused softmax->topk: the producer's layout reaches topk through the
         # restickify graph, so the reduction dim must be pushed off the stick
