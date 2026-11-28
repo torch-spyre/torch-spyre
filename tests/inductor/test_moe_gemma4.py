@@ -204,11 +204,6 @@ def _cases(
 
 
 # Failures shared by every scenario that runs the full grouped MoE path.
-GROUPED_MOE_EAGER = _xfail(
-    InductorError,
-    "#3193: routing flatten raises no mechanism to resolve stick incompatibility",
-    "no mechanism to resolve stick incompatibility",
-)
 GROUPED_MOE_COMPILED = _xfail(
     InductorError,
     "#4531: routing flatten of the [T, 8] topk ids raises Unexpected stick expression",
@@ -1683,7 +1678,7 @@ def test_G4_AB_006_pad_activations_weights_token_ids(execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
+    _cases(eager=STABLE_SORT, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
 )
 def test_G4_AB_007_per_tile_static_loop_scatter_add(execution_mode, T):
     _seed()

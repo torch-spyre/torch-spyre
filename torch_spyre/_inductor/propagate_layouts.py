@@ -4018,9 +4018,25 @@ def propagate_spyre_tensor_layouts(
                     target_stl = qfp8wt_stl
 
                 op.layouts = [target_stl]
-                op.restick_cost_fn = AllSameNode.from_args(
-                    args, [target_stl], output_dep, op
-                )
+                split_stl = None
+                if alt_stl is None and len(args) == 1:
+                    src_stl = next(iter(args[0].layouts))
+                    coords = try_device_coordinates(src_stl, args[0].dep, None)
+                    if coords is not None and is_stick_expr_offset_free(
+                        coords[-1], src_stl.elems_per_stick()
+                    ):
+                        split_stl = _clone_absent_stick_input_target(
+                            args[0], coords[-1], target_stl, output_dep
+                        )
+                if split_stl is not None:
+                    # Broadcast into the target's stick: same split as a clone.
+                    op.restick_cost_fn = FixedInOutNode.from_args(
+                        args, target_stl, [split_stl], op, output_dep
+                    )
+                else:
+                    op.restick_cost_fn = AllSameNode.from_args(
+                        args, [target_stl], output_dep, op
+                    )
                 continue
             op.decide_layout()
             rw = op_read_writes(op)
