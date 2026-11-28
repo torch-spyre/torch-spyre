@@ -3361,66 +3361,80 @@ def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
 
 
 def test_compute_restickify_target_layout_factorized_new_sd():
-    """compute_restickify_target_layout must handle a factorized target_stick_expr.
+    """A new stick variable in several outer device dims splits only its lowest dim.
 
-    When ``target_stick_expr`` is a FloorDiv expression such as ``floor(k/128)``,
-    ``matching_dim`` returns None and the old code immediately returned None.
-    The new code must resolve the host size/stride via ``_factorized_chain`` and
-    return a valid STL moving the stick to the K variable.
-
-    Scenario: host ``[L=4, H=8, D=128]`` with the current stick on ``lq`` (the
-    sequence dim).  We want to move the stick to ``k`` (the contraction dim)
-    whose target coord is ``floor(k/128)`` — a FloorDiv that ``matching_dim``
-    cannot resolve.
+    Scenario: host ``[L=4, H=8, D=128]`` read as ``1024*lq + k`` with
+    ``k = 128*h + d``, current stick on ``lq``.  The target stick expression
+    ``floor(k/128)`` resolves through ``_factorized_chain``, and ``k`` sits in two
+    outer device dims (H and D).  Only D, the dim with the smallest host stride,
+    moves to the stick, sized by D alone; H keeps its part of ``k``.  Rewriting
+    one dim with the whole of ``k`` would count it twice and address 128 times
+    more slots than the tensor has.
     """
+    import itertools
+
     import sympy
     from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import FixedLayout
-    from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
+    from torch_spyre._C import SpyreTensorLayout as _CSTL
+    from torch_spyre._inductor import pass_utils
     from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
     from torch_spyre._inductor.propagate_layouts import PropArg
 
     lq, k = sympy.symbols("lq k", integer=True, nonnegative=True)
-    # Host layout: [L=4, H=8, D=128], row-major strides.
-    host = FixedLayout(DEVICE, torch.float16, [4, 8, 128], [1024, 128, 1])
-    # dep: index 1024*lq + k iterates L (range 4) and the collapsed H*D (range 1024).
+    size, stride = [4, 8, 128], [1024, 128, 1]
+    host = FixedLayout(DEVICE, torch.float16, size, stride)
     dep = MemoryDep("x", 1024 * lq + k, (lq, k), (4, 1024))
-    # STL with lq on the stick: H outer (stride 128), D-high outer (stride 64),
-    # L-sticks outer (stride 1024, 1 stick for L=4), stick (64 elements).
-    stl = _CSTL(
-        [8, 2, 1, 64],
-        [128, 64, 1024, 1],
-        DataFormats.SEN169_FP16,
-        {(0,): 8, (2,): 1, (1, 3): 128},
-    )
-    # host_coords (ic): L maps to lq, H to floor(k/128), D to Mod(k, 128).
-    ic = [lq, sympy.floor(k / 128), sympy.Mod(k, 128)]
-    # device_coords (idc): H outer, D-high outer, L-sticks (=0 since L<64), stick.
-    idc = [
-        sympy.floor(k / 128),
-        sympy.floor(sympy.Mod(k, 128) / 64),
-        sympy.S.Zero,
-        sympy.Mod(lq, 64),
-    ]
-    # PropArg so the slow path in _host_size_stride_for_expr can call
-    # _factorized_chain for the factorized floor(k/128) expression.
+    stl = _CSTL(size, stride, torch.float16, [2, 1, 0])
+    assert list(stl.device_size) == [8, 1, 128, 64]
+    ic = pass_utils.host_coordinates(host, dep, None)
+    idc = pass_utils.device_coordinates(stl, dep, None)
     arg = PropArg(dep, host, [stl])
-    # target_stick_expr = floor(k/128): matching_dim returns None for FloorDiv,
-    # so the old code returned None here.  The new code must succeed.
-    target_stick_expr = sympy.floor(k / 128)
     result = compute_restickify_target_layout(
-        stl, host, target_stick_expr, ic, idc, arg=arg, label="x"
+        stl, host, sympy.floor(k / 128), ic, idc, arg=arg, label="x"
     )
-    assert result is not None, (
-        "compute_restickify_target_layout returned None for factorized "
-        "target_stick_expr=floor(k/128); expected a valid STL"
+    assert result is not None
+    # H stays outer (8); D splits into 2 sticks of 64; L moves to an outer dim.
+    assert list(result.device_size) == [8, 2, 4, 64]
+    assert list(result.stride_map) == [128, 64, 1024, 1]
+    # Every host element is addressed exactly once (no padding in this layout).
+    sizes, strides = list(result.device_size), list(result.stride_map)
+    addresses = sorted(
+        sum(i * s for i, s in zip(index, strides))
+        for index in itertools.product(*(range(n) for n in sizes))
     )
-    # After the fix: K on the stick with 16 sticks of 64 = 1024 K elements.
-    # L (size 4) occupies the old L-outer dim; the old H-outer dim gets the
-    # number of K-sticks.
-    assert list(result.device_size) == [4, 2, 16, 64], (
-        f"Unexpected device_size: {list(result.device_size)}"
+    assert addresses == list(range(4 * 8 * 128))
+
+
+@pytest.mark.parametrize("part", ["high", "low"])
+def test_compute_restickify_target_layout_new_sd_sub_stick_part_refused(part):
+    """A new stick variable whose lowest dim is less than a stick is refused.
+
+    Scenario from Qwen3.5-2B: host ``[1, 64, 16, 128]`` read as ``128*d0 + d1``,
+    where ``d0 = 16*b + c`` merges the two adjacent host dims B and C.  ``d0``
+    sits in two outer device dims; its lowest one (C) holds only 16 values, so
+    putting C on the stick, even padded, would give the stick coordinate
+    ``Mod(d0, 16)`` rather than the ``Mod(d0, 64)`` the stick needs.  Either part
+    of ``d0`` as the target gives the same refusal.
+    """
+    import sympy
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import FixedLayout
+    from torch_spyre._C import SpyreTensorLayout as _CSTL
+    from torch_spyre._inductor import pass_utils
+    from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+    from torch_spyre._inductor.propagate_layouts import PropArg
+
+    d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+    size, stride = [1, 64, 16, 128], [131072, 2048, 128, 1]
+    host = FixedLayout(DEVICE, torch.float16, size, stride)
+    dep = MemoryDep("x", 128 * d0 + d1, (d0, d1), (1024, 128))
+    stl = _CSTL(size, stride, torch.float16, [0, 1, 2, 3])
+    assert list(stl.device_size) == [64, 16, 2, 1, 64]
+    ic = pass_utils.host_coordinates(host, dep, None)
+    idc = pass_utils.device_coordinates(stl, dep, None)
+    target = sympy.floor(d0 / 16) if part == "high" else sympy.Mod(d0, 16)
+    result = compute_restickify_target_layout(
+        stl, host, target, ic, idc, arg=PropArg(dep, host, [stl]), label="x"
     )
-    assert list(result.stride_map) == [1024, 64, 64, 1], (
-        f"Unexpected stride_map: {list(result.stride_map)}"
-    )
+    assert result is None
