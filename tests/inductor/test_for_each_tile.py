@@ -2459,6 +2459,176 @@ class TestCallerOwnedOutput(unittest.TestCase):
             acc, _ = fn(X, Y, torch.zeros(nK * M, N))
         torch.testing.assert_close(acc, ref)
 
+    def test_out_dim_0(self):
+        """Case A into a caller buffer: tile `i` lands at `out[2*i : 2*i + 2]`."""
+        (X, Y), ref = matmul_inputs()
+
+        def fn(X, Y, dest):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            return for_each_tile(
+                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dest
+            )
+
+        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
+
+    def test_out_dim_1_needs_no_fold_copy(self):
+        """Case B into a caller buffer: the fold copy case B pays is gone."""
+        (X, Y), ref = matmul_inputs()
+
+        def fn(X, Y, dest):
+            def body(_, ops):
+                x_whole, y_tile = ops
+                return None, x_whole @ y_tile
+
+            return for_each_tile(
+                body, (X, Y), dims=(None, 1), tile_size=2, out_dim=1, out=dest
+            )
+
+        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
+
+    def test_out_dim_int_into_a_view_of_a_larger_tensor(self):
+        """`out` is a column band of a wider tensor: the unflattened view is reinplaced."""
+        (X, Y), ref = matmul_inputs()
+        wide = torch.randn(M, N + 4)
+
+        def fn(X, Y, wide):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            dest = wide[:, 2 : 2 + N]
+            for_each_tile(
+                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dest
+            )
+            return None, wide
+
+        expected = wide.clone()
+        expected[:, 2 : 2 + N] = ref
+        torch._dynamo.reset()
+        with torch.no_grad():
+            eager_wide = wide.clone()
+            fn(X, Y, eager_wide)
+            torch.testing.assert_close(eager_wide, expected)
+            compiled_wide = wide.clone()
+            with post_grad_graphs() as graphs:
+                torch.compile(fn, backend="inductor", fullgraph=True)(
+                    X, Y, compiled_wide
+                )
+        torch.testing.assert_close(compiled_wide, expected)
+        nodes = live_nodes(graphs[-1])
+        copies = [(d, t) for d, t in nodes if any(m in t for m in MATERIALIZE)]
+        self.assertEqual(copies, [], f"materializations: {copies}")
+
+    def test_out_dim_int_on_a_reduction_level(self):
+        """Split-K whose carry accumulates while each step's partial product is kept.
+
+        Step `i`'s `(M, N)` partial product lands at rows `i*M : (i+1)*M` of `out`,
+        and the carry still returns the full product.
+        """
+        (X, Y), ref = matmul_inputs()
+        TK = 3
+        nK = K // TK
+        partials = torch.cat(
+            [X[:, i * TK : (i + 1) * TK] @ Y[i * TK : (i + 1) * TK] for i in range(nK)]
+        )
+
+        def fn(X, Y, dest):
+            def body(acc, ops):
+                x_tile, y_tile = ops
+                prod = x_tile @ y_tile
+                return acc + prod, prod
+
+            return for_each_tile(
+                body,
+                (X, Y),
+                dims=(-1, 0),
+                tile_size=TK,
+                init=torch.zeros(M, N),
+                out_dim=0,
+                out=dest,
+            )
+
+        self._assert_writes_in_place(
+            fn, lambda: (X, Y, torch.zeros(nK * M, N)), partials
+        )
+        with torch.no_grad():
+            acc, _ = fn(X, Y, torch.zeros(nK * M, N))
+        torch.testing.assert_close(acc, ref)
+
+    @staticmethod
+    def _split_m_into_start():
+        """Split-M into the start of `scratch`, which may hold more rows."""
+
+        def fn(X, Y, scratch):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            return for_each_tile(
+                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=scratch
+            )
+
+        return fn
+
+    def test_out_dim_int_writes_the_start_of_a_larger_destination(self):
+        """`out` longer than the tiles: they fill its start, the rest keeps its value."""
+        (X, Y), ref = matmul_inputs()
+        expected = torch.full((M + 4, N), 7.0)
+        expected[:M] = ref
+        self._assert_writes_in_place(
+            self._split_m_into_start(),
+            lambda: (X, Y, torch.full((M + 4, N), 7.0)),
+            expected,
+        )
+
+    def test_out_dim_int_with_a_varying_trip_count(self):
+        """One graph writes the start of a scratch sized for the largest trip count.
+
+        ``aot_eager``: Inductor's CPU codegen of a while_loop does not bind a
+        symbolic trip count, with or without ``out=``.
+        """
+        from torch._dynamo.testing import CompileCounterWithBackend
+
+        (_, Y), _ = matmul_inputs()
+        counter = CompileCounterWithBackend("aot_eager")
+        compiled = torch.compile(
+            self._split_m_into_start(), backend=counter, fullgraph=True
+        )
+        torch._dynamo.reset()
+        with torch.no_grad():
+            for rows in (4, 6, 10):
+                X = torch.randn(rows, K)
+                torch._dynamo.mark_dynamic(X, 0)
+                scratch = torch.full((2 * M, N), 7.0)
+                compiled(X, Y, scratch)
+                expected = torch.full((2 * M, N), 7.0)
+                expected[:rows] = X @ Y
+                torch.testing.assert_close(scratch, expected, msg=f"at {rows} rows")
+        self.assertEqual(counter.frame_count, 1)
+
+    def test_reverse_lands_in_natural_order(self):
+        (X, Y), ref = matmul_inputs()
+
+        def fn(X, Y, dest):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            return for_each_tile(
+                body,
+                (X, Y),
+                dims=(0, None),
+                tile_size=2,
+                out_dim=0,
+                out=dest,
+                reverse=True,
+            )
+
+        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
+
     def test_gather_scatters_one_row_per_step(self):
         """`out_dim=Gather(0, index)`: step `i` writes its row at `pool[index[i]]`.
 
@@ -2664,11 +2834,10 @@ class TestCallerOwnedOutput(unittest.TestCase):
                 ValueError,
                 "needs out_dim",
             ),
-            # TODO: becomes a positive test once out= takes an int out_dim.
-            "int out_dim": (
-                dict(out_dim=0),
-                NotImplementedError,
-                r"Gather\(axis, index\) only",
+            "shorter than the tiles": (
+                dict(out_dim=0, out=torch.zeros(M - 2, N)),
+                IndexError,
+                "out of bounds",
             ),
             "Gather without out": (
                 dict(out_dim=Gather(0, torch.arange(M // 2)), out=None),

@@ -1716,8 +1716,8 @@ class TestSpliceWhileLoops(unittest.TestCase):
             graph.run(*placeholders)
         return graph
 
-    def _rewrite_counter_constant(self, while_op, which, mapping):
-        """Rewrite constants in a real loop's counter init ('init') or step ('step')."""
+    def _rewrite_counter_constant(self, while_op, which, mapping, carry=0):
+        """Rewrite constants in a counter carry's init ('init') or step ('step')."""
         from torch._inductor.ops_handler import WrapperHandler
 
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
@@ -1729,9 +1729,9 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 return super().constant(mapping.get(value, value), dtype)
 
         buf = _unwrap_to_buffer(
-            while_op.carried_inputs[0]
+            while_op.carried_inputs[carry]
             if which == "init"
-            else while_op.body_subgraph.graph.graph_outputs[0]
+            else while_op.body_subgraph.graph.graph_outputs[carry]
         )
         data = buf.data
         original = data.inner_fn
@@ -1888,6 +1888,159 @@ class TestSpliceWhileLoops(unittest.TestCase):
             for op in tiled_ops:
                 info = loop_member_view(op)
                 self.assertEqual(info.loop_group_id, (0,))
+
+    # The tile extent ``_into_caller_tensor`` uses for each out_dim.
+    INTO_EXTENT = {0: 64, 1: 32}
+
+    def _into_caller_tensor(self, out_dim=0, reverse=False):
+        """``X @ Y`` tiled along ``out_dim`` with ``out=dest``, lowered to IR."""
+        from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+
+        def fn(X, Y, dest):
+            def body(_, ops):
+                x, y = ops
+                return None, x @ y
+
+            for_each_tile(
+                body,
+                (X, Y),
+                dims=(0, None) if out_dim == 0 else (None, 1),
+                tile_size=self.INTO_EXTENT[out_dim],
+                out_dim=out_dim,
+                out=dest,
+                reverse=reverse,
+            )
+
+        (X, Y), _ref = matmul_inputs()
+        with torch.no_grad():
+            return self._run_graph(fn, (X, Y, torch.zeros(X.shape[0], Y.shape[1])))
+
+    def test_out_dim_int_write_advances_one_tile_per_trip(self):
+        """``out_dim=int`` writes at the step counter, which equals the loop variable.
+
+        The counter starts at 0 and steps by 1, so the spliced write is no Scatter but
+        a Pointwise whose index moves by one 64-row tile of the destination per trip.
+        """
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        graph = self._into_caller_tensor()
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+            expand(graph)
+            writes = [
+                op
+                for op in graph.operations
+                if isinstance(
+                    getattr(op, "layout", None), ir.MutationLayoutSHOULDREMOVE
+                )
+            ]
+            self.assertEqual(len(writes), 1, writes)
+            (write,) = writes
+            self.assertIsInstance(write.data, ir.Pointwise)
+            self.assertIn(write.layout.get_buffer().get_name(), graph.graph_inputs)
+            (dep,) = write.get_read_writes().writes
+        (loop_var,) = [s for s in dep.index.free_symbols if s.name.startswith("u")]
+        columns = write.layout.real_layout().size[-1]
+        self.assertEqual(dep.index.coeff(loop_var), 64 * columns)
+
+    def test_out_dim_int_with_reverse_is_refused(self):
+        """Under ``reverse=True`` the position is computed from the counter: refused."""
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        graph = self._into_caller_tensor(reverse=True)
+        with (
+            V.set_graph_handler(graph),
+            self.assertRaisesRegex(
+                Unsupported, r"reverse=True, which is not supported"
+            ),
+        ):
+            splice_while_loops(graph)
+
+    @staticmethod
+    def _counter_write(graph):
+        """The loop, its ``out_dim=int`` write, and the carry that write reads."""
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _counter_indexed_writes,
+        )
+
+        (while_op,) = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        ((op, (carry,)),) = _counter_indexed_writes(while_op)
+        return while_op, op, carry
+
+    def test_out_dim_int_write_position_is_extent_times_counter(self):
+        """Tile ``i`` is written at ``extent * counter + row`` along ``out_dim``.
+
+        The frontend computes those rows in separate body buffers, which the
+        evaluation follows back to the counter. Every other dim is written in place.
+        """
+        import sympy
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _index_buffers,
+            _scatter_position,
+        )
+
+        for out_dim, extent in self.INTO_EXTENT.items():
+            with self.subTest(out_dim=out_dim):
+                graph = self._into_caller_tensor(out_dim=out_dim)
+                with V.set_graph_handler(graph):
+                    while_op, op, _ = self._counter_write(graph)
+                    buffers = _index_buffers(while_op.body_subgraph.graph)
+                    index, position, recorder = _scatter_position(op.data, buffers)
+                self.assertEqual(recorder.unexpected, [])
+                ((_, _, counter),) = recorder.loads
+                expected = list(index)
+                expected[out_dim] = extent * counter + index[out_dim]
+                self.assertEqual([sympy.expand(e) for e in position], expected)
+
+    def test_out_dim_int_write_that_may_not_fit_is_refused(self):
+        """A write the destination does not provably hold for every trip is refused.
+
+        Spyre does not bounds-check the write. Told it runs one trip more than the
+        destination has tiles for, the loop's write is no longer lowered.
+        """
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _counter_write_dim,
+            try_prove_for_each_tile,
+        )
+
+        graph = self._into_caller_tensor()
+        with V.set_graph_handler(graph):
+            while_op, op, carry = self._counter_write(graph)
+            trips = try_prove_for_each_tile(while_op).trip_count
+            self.assertEqual(_counter_write_dim(while_op, op, carry, trips), (0, None))
+            dim, why = _counter_write_dim(while_op, op, carry, trips + 1)
+        self.assertIsNone(dim)
+        self.assertIn("less than the", why)
+
+    def test_counter_proofs_cover_the_step_counter_carry(self):
+        """The init and step proofs hold for the frontend's own counter carry too.
+
+        The ``out_dim=int`` write reads that counter, not the loop's. Stepped by 2
+        it no longer equals the loop variable, and the step proof says so.
+        """
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _counter_init_failure,
+            _counter_step_failure,
+        )
+
+        graph = self._into_caller_tensor()
+        with V.set_graph_handler(graph):
+            while_op, _, carry = self._counter_write(graph)
+            self.assertNotEqual(carry, 0)
+            self.assertIsNone(_counter_init_failure(while_op, carry))
+            self.assertIsNone(_counter_step_failure(while_op, carry))
+            self._rewrite_counter_constant(while_op, "step", {1: 2}, carry=carry)
+            self.assertIn("by 2, not 1", _counter_step_failure(while_op, carry))
 
     def test_private_in_graph_fill_keeps_single_buffer(self):
         """A compiler-owned in-graph `torch.zeros` fill is not copied."""
