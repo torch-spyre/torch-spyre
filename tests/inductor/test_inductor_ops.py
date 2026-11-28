@@ -3819,12 +3819,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "torch.compile (#5190)"
                 ),
             },
-            "expect_raise": {
-                # 3798
-                "fp16_offset_view": "requires a stick-aligned storage_offset",
-                # 5383
-                "fp16_unaligned_slice_32": "requires a stick-aligned storage_offset",
-            },
             "param_sets": {
                 "fp16_int_scalar": (torch.arange(8, dtype=torch.float16), 3),
                 "fp16_float_scalar": (torch.arange(8, dtype=torch.float16), 3.0),

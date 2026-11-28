@@ -34,3 +34,8 @@ class DeclaredRangeNarrowedWarning(UserWarning):
 
 class RecompileWarning(UserWarning):
     """User code recompiled and broke a declared dynamic range."""
+
+
+class HostStagedCopyWarning(UserWarning):
+    """Warning issued when an eager device-to-device copy had to be staged
+    through the host because its source view starts inside a stick."""
