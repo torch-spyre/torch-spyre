@@ -594,9 +594,12 @@ about 15 ms with the derived layout.
   branches on a small row count, so lower it only for tensors that take no
   such branch, page tables for example. The cap is the number of candidate
   iterations of a loop over the declared dimension, one correction slot
-  each, and has no measured cost at the step up to 256. The compiled
-  program carries one slot per bucket, so compile work grows with the
-  count. Runs at 128 and 256 buckets compiled and ran (#6432).
+  each. The host fills every slot on each launch and, for a correction of
+  at most 1 MiB, the upload is cut to the slots the launch runs (see the
+  runtime guide on program correction), so a launch at a small count pays
+  the host fill of the cap and the upload of its own count. The compiled program carries one slot per bucket, so
+  compile work grows with the count. Runs at 128 and 256 buckets compiled
+  and ran (#6432).
 - The tensor's current size in the reserved dimension must itself be within
   `[min, max]` and a multiple of `granularity`.
 - A declared dimension reaches a compiled graph only as a `for_each_tile` loop
