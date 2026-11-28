@@ -17,6 +17,7 @@ test_suite_config:
         - names:
             - LxPlanning.*::test_split.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_split_multi_ops.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_stack_after.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_arange.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_full.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_new_ones.*_lx_planning_(pointwise|reduction)

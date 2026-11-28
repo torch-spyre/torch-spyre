@@ -347,6 +347,44 @@ def _make_output_stl(
     return None
 
 
+def _make_sparse_output_stl(
+    output_dep: MemoryDep,
+    c_size: list,
+    c_stride: list,
+    dtype,
+) -> SpyreTensorLayout | None:
+    """Build a candidate output STL with a synthetic size-1 stick dim.
+
+    The stick moves onto a dim that does not exist on the host (the ``-1``
+    sentinel of ``dim_order``, as in ``sparse_stl_from_host``), so each element
+    sits on a stick of its own.  The stick coordinate is then the constant 0,
+    which ``is_stick_expr_offset_free`` accepts: an access at any offset reads
+    and writes whole sticks.
+
+    That is the last resort for a target whose every real dim yields a stick
+    expression with an offset -- a 1-D ``torch.cat`` target, say, whose second
+    piece starts mid-stick and which has no other dim to move the stick to
+    (issue #3916).  It costs ``stick_size`` times the memory of a dense layout,
+    so it is offered only after every real dim has failed.
+
+    The dim order follows ``sparse_stl_from_host`` in pass_utils.py: dims sorted
+    by decreasing host stride, with the former stick dim outermost so the
+    padding the sparse sticks imply sits at the end of the buffer.
+
+    Returns None when the access cannot be coordinatized on the layout at all.
+    """
+    outer_first = sorted(range(len(c_size)), key=lambda d: -int(c_stride[d]))
+    if len(outer_first) > 2:
+        outer_first = [outer_first[0], outer_first[-1]] + outer_first[1:-1]
+    stl = SpyreTensorLayout(c_size, c_stride, dtype, outer_first + [-1])
+    coords = try_device_coordinates(stl, output_dep, None)
+    if coords is None:
+        return None
+    if is_stick_expr_offset_free(coords[-1], get_elem_in_stick(dtype)):
+        return stl
+    return None
+
+
 def _candidate_output_stls(
     out_coords,
     output_dep: MemoryDep,
@@ -354,10 +392,17 @@ def _candidate_output_stls(
     c_stride: list,
     skip_stick_expr: sympy.Expr,
     dtype,
+    *,
+    allow_sparse_stick: bool = True,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
-    Skip the dim that already produces an unsupported stick.
+    Skip the dim that already produces an unsupported stick.  A tensor with no
+    usable real dim (a 1-D target, say) falls back to a synthetic size-1 stick
+    dim: one element per stick, offset-free at any access offset (see
+    ``_make_sparse_output_stl`` and issue #3916).  ``allow_sparse_stick=False``
+    withholds that fallback, for a mutation target whose storage the caller
+    owns and sized for the original layout (see ``_find_alt_target_stl``).
     """
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
 
@@ -378,6 +423,13 @@ def _candidate_output_stls(
                 stls.append(stl)
         if stls:
             break
+    if not stls and allow_sparse_stick:
+        # Last resort: a synthetic size-1 stick dim.  Same memory cost as a
+        # real size-1 stick dim, but available even when the host shape has no
+        # size-1 dim at all.
+        sparse = _make_sparse_output_stl(output_dep, c_size, c_stride, dtype)
+        if sparse is not None:
+            stls.append(sparse)
     return stls
 
 
@@ -3168,7 +3220,15 @@ def _scan_mutation_layout_inputs(
             in_args = _get_prop_args([first_read], strict=False)
             in_arg = in_args[0] if in_args else None
             alt_stl = _find_alt_target_stl(
-                target_layout, target_stl, output_dep, in_arg
+                target_layout,
+                target_stl,
+                output_dep,
+                in_arg,
+                # A graph input's storage is caller-owned and sized for its
+                # current layout; a sparse alt (stick_size times larger) would
+                # overflow it in the copy-back.  An internal target is
+                # allocated in the alt layout, so it can take one.
+                allow_sparse_stick=not is_graph_input,
             )
             if alt_stl is None:
                 continue
@@ -3316,6 +3376,8 @@ def _find_alt_target_stl(
     target_stl: SpyreTensorLayout,
     output_dep: MemoryDep,
     in_arg: PropArg | None = None,
+    *,
+    allow_sparse_stick: bool = True,
 ) -> SpyreTensorLayout | None:
     """Alt SpyreTensorLayout with an offset-free stick expression for a mutation
     target, or None if the current layout already works; raises Unsupported if no
@@ -3326,8 +3388,17 @@ def _find_alt_target_stl(
     reachable from the write's input stick wins, meaning one an ordinary
     stick-permutation restickify can produce. Candidates on a size-1 dim are
     only generated when no other dim yields one (see _candidate_output_stls),
-    so a degenerate ``stick=0`` candidate cannot displace a real dim.
+    so a degenerate ``stick=0`` candidate cannot displace a real dim; a target
+    with no usable real dim at all (a 1-D ``torch.cat`` buffer, say) takes the
+    synthetic size-1 stick of ``_make_sparse_output_stl`` instead (issue #3916).
     Falls back to the first offset-free candidate.
+
+    The synthetic size-1 stick needs ``stick_size`` times the target's dense
+    memory, so it is offered only for an internal target: the compiler
+    allocates that buffer itself, in the alt layout.  A graph input keeps its
+    caller-owned storage, and the copy-back that restores it would write past
+    the allocation, so ``allow_sparse_stick=False`` leaves those targets with
+    today's Unsupported.
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
     stick_size = get_elem_in_stick(dtype_for_layout)
@@ -3341,7 +3412,13 @@ def _find_alt_target_stl(
     c_stride = [concretize_expr(s) for s in target_layout.stride]
     target_coords = host_coordinates(target_layout, output_dep, None)
     candidates = _candidate_output_stls(
-        target_coords, output_dep, c_size, c_stride, write_stick, dtype_for_layout
+        target_coords,
+        output_dep,
+        c_size,
+        c_stride,
+        write_stick,
+        dtype_for_layout,
+        allow_sparse_stick=allow_sparse_stick,
     )
     if not candidates:
         raise Unsupported(
