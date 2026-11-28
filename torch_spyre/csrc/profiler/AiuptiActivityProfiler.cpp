@@ -108,6 +108,10 @@ void AiuptiActivityProfilerSession::processTrace(
         deviceActivityIds_.insert(
             reinterpret_cast<const AIUpti_ActivityMemcpy*>(record)
                 ->correlation_id);
+      } else if (record->kind == AIUPTI_ACTIVITY_KIND_MEMCPY2) {
+        deviceActivityIds_.insert(
+            reinterpret_cast<const AIUpti_ActivityMemcpyPtoP*>(record)
+                ->correlation_id);
       }
     });
     api_.processActivities(

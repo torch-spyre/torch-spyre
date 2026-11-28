@@ -60,7 +60,7 @@ except ValueError:
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 ACTIVITY_CATEGORIES = {"kernel", "gpu_memcpy"}
-COLL_ARGS = ("coll_group", "coll_algo", "coll_bytes")
+COLL_ARGS = ("coll_group", "coll_algo", "coll_bytes", "collective_id")
 
 
 @pytest.mark.requires_spyre_profiler
@@ -140,6 +140,72 @@ class TestProfilerCollMetadata(TestCase):
                 else:
                     self.assertIsInstance(value, int, f"coll_bytes on {name!r}")
                     self.assertGreaterEqual(value, 0, f"coll_bytes on {name!r}")
+
+    def test_collective_id_matches_host_span(self):
+        """collective_id is an int and equals the aiuCommsColl* span's correlation.
+
+        Every device event of one all_reduce shares an External id with the
+        host span that issued it, so the IDs must agree within that group.
+        """
+        trace = self._profile_allreduce_trace()
+        events = self._coll_events(trace)
+        with_id = [e for e in events if "collective_id" in e["args"]]
+        if not with_id:
+            self.skipTest(
+                f"Rank {self.comm_rank}: no device event carries collective_id "
+                "(libaiupti/flex build without coll_id)"
+            )
+        span_ids = {
+            e["args"]["External id"]: e["args"]["correlation"]
+            for e in trace["traceEvents"]
+            if e.get("name", "").startswith("aiuCommsColl")
+            and not e.get("name", "").endswith("Setup")
+            and "External id" in e.get("args", {})
+        }
+        for e in with_id:
+            value = e["args"]["collective_id"]
+            name = e.get("name")
+            self.assertIsInstance(value, int, f"collective_id on {name!r}")
+            self.assertGreaterEqual(value, 0, f"collective_id on {name!r}")
+            ext = e["args"].get("External id")
+            if ext in span_ids:
+                self.assertEqual(
+                    value, span_ids[ext], f"collective_id vs host span on {name!r}"
+                )
+
+    def test_ptop_memcpy_events_are_well_formed(self):
+        """RDMA (MEMCPY2) copies reach the trace as "Memcpy (PtoP)" events.
+
+        Only the RDMA data path emits them; a host-DMA (staged DtoH/HtoD) run
+        has none and skips. Each must name its source rank as this rank, a
+        destination rank other than this one (or "" for a multicast), and a
+        valid cycles_ts array when present.
+        """
+        trace = self._profile_allreduce_trace()
+        ptop = [
+            e
+            for e in trace["traceEvents"]
+            if e.get("cat") == "gpu_memcpy" and e.get("name") == "Memcpy (PtoP)"
+        ]
+        if not ptop:
+            self.skipTest(
+                f"Rank {self.comm_rank}: no PtoP memcpy events "
+                "(collective ran on the host-DMA path, not RDMA)"
+            )
+        for e in ptop:
+            args = e["args"]
+            name = e.get("name")
+            self.assertEqual(args.get("call"), "PtoP", name)
+            self.assertEqual(args.get("src_device"), self.comm_rank, name)
+            dst = args.get("dst_device")
+            if dst != "":
+                self.assertIsInstance(dst, int, f"dst_device on {name!r}")
+                self.assertNotEqual(dst, self.comm_rank, f"dst_device on {name!r}")
+            cycles_ts = args.get("cycles_ts")
+            if cycles_ts is not None:
+                self.assertIsInstance(cycles_ts, list)
+                self.assertEqual(len(cycles_ts), 5)
+                self.assertTrue(any(cycles_ts), "cycles_ts emitted all zero")
 
     def test_coll_args_only_on_device_activities(self):
         """coll_* args appear only on kernel/memcpy events, never on CPU ops."""
