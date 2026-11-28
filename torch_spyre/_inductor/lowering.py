@@ -661,16 +661,25 @@ def lower_bmm(x, y):
 
 @register_spyre_lowering(torch.ops.spyre.conv2d.default)
 def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
-    x = V.graph.get_buffer(x.realize())
-    w = V.graph.get_buffer(w.realize())
+    # Read shapes and loaders from the TensorBox itself, not from the buffer
+    # V.graph.get_buffer(x.realize()) resolves to: realize() returns the
+    # underlying storage buffer's name, so get_buffer() hands back the base
+    # buffer and get_size() reports the base shape. When the conv input is a
+    # view (e.g. the output of reshape), that is the wrong shape: a valid
+    # depthwise conv with groups == C_in == C_out was rejected with "Input
+    # and output channels and groups should all be equal" because C_in came
+    # from the base buffer (#6649). TensorBox.get_size()/make_loader()
+    # delegate to the view, so they report the view's shape and index through
+    # the view's layout. This matches the other lowerings in this file, which
+    # call get_size()/make_loader() on the TensorBox directly.
+    x.realize()
+    w.realize()
     x_loader = x.make_loader()
     w_loader = w.make_loader()
 
     # Input / weight shapes. A depthwise conv1d arrives here at rank 3
     # ((N, C, L) activation, (C_out, G, K) weight) and is handled natively
     # rather than being reshaped to rank 4 by the decomposition.
-    # Reshape doesn't work as V.graph.get_buffer resolves to the underlying
-    # buffer with get_size() returning 3 entries only.
     #
     # Keeping the op at rank 3 enables using the input tensor's activation
     # and stick dim as pinned.

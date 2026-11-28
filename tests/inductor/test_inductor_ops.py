@@ -9230,6 +9230,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Regression test for #6649: the conv input is a view -- the output
+        # of reshape on a flat (2, 2, 32, 1024) tensor -- so the lowering
+        # must read N, C_in, H and W from the view (2, 64, 32, 32), not from
+        # the base buffer. groups == C_in == C_out == 64, padding 0,
+        # dilation 1: a valid depthwise conv that used to be rejected with
+        # "Input and output channels and groups should all be equal".
+        ("test_dwise_conv2d_view_input", "test_dwise_conv2d_view_input_cpu"): {
+            "param_sets": {
+                "2x64_ksize3_reshape": (
+                    cached_randn((2, 2, 32, 1024)),
+                    cached_randn((64, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    64,
+                    [[1024, 32, 1, 2, 64], [3, 3, 1, 1, 64]],
+                    [[1024, 1, 0, 65536, 32768], [1, 3, 0, 9, 9]],
+                ),
+            },
+        },
         ("test_conv1d", "test_conv1d_cpu"): {
             "param_sets": {
                 "1x6x128_patch16_bias": (
@@ -15135,6 +15155,73 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(x, weight, bias, padding, stride, groups):
             return torch.conv2d(
                 x, weight, bias, stride=stride, padding=padding, groups=groups
+            )
+
+        cpu_result = fn(x, weight, bias, padding, stride, groups)
+
+        spyre_compiled = torch.compile(fn)(
+            x_dev, weight_dev, bias_dev, padding, stride, groups
+        ).cpu()
+        spyre_eager = fn(x_dev, weight_dev, bias_dev, padding, stride, groups).cpu()
+        torch.testing.assert_close(
+            spyre_compiled,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+        torch.testing.assert_close(
+            spyre_eager,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+
+    def test_dwise_conv2d_view_input_cpu(
+        self, x, weight, bias, padding, stride, groups, dev_layout, dev_stride
+    ):
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        torch._dynamo.reset()
+        torch._inductor.codecache.FxGraphCache.clear()
+
+        device_dtype_fp16 = get_device_dtype(torch.float16)
+
+        x_layout = SpyreTensorLayout(
+            dev_layout[0],
+            dev_stride[0],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(x.shape), list(x.stride()), dev_layout[0], dev_stride[0]
+            ),
+        )
+        weight_layout = SpyreTensorLayout(
+            dev_layout[1],
+            dev_stride[1],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(weight.shape), list(weight.stride()), dev_layout[1], dev_stride[1]
+            ),
+        )
+
+        x_dev = x.to(device_layout=x_layout)
+        weight_dev = weight.to(device_layout=weight_layout)
+        bias_dev = None if bias is None else bias.to("spyre")
+
+        def fn(x, weight, bias, padding, stride, groups):
+            # Regression test for #6649: the conv input is a view (the
+            # output of reshape), not the base buffer. The lowering must
+            # read N, C_in, H and W from the view.
+            return torch.conv2d(
+                x.reshape(2, 64, 32, 32),
+                weight,
+                bias,
+                stride=stride,
+                padding=padding,
+                groups=groups,
             )
 
         cpu_result = fn(x, weight, bias, padding, stride, groups)
