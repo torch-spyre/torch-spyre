@@ -1,0 +1,7 @@
+test_suite_config:
+  # Not 'unit': this file needs a Spyre device and takes minutes.
+  # Not 'smoke': multi-process spawning is too heavy for a smoke run.
+  labels: [regression, integration, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_split_execution.py
+      unlisted_test_mode: mandatory_success
