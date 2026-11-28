@@ -25,7 +25,9 @@ Self-contained otherwise: no live Inductor graph, no compiler run.
 
 import unittest
 
+import sympy
 from test_ktir_validate import (
+    LX_SPACING,
     make_broadcast_op_spec,
     make_chained_op_specs,
     make_nested_op_spec,
@@ -205,6 +207,145 @@ module {
         [add] = [ln for ln in emitted.splitlines() if "linalg.add ins(" in ln]
         [mul] = [ln for ln in emitted.splitlines() if "linalg.mul ins(" in ln]
         self.assertNotIn(f"ins({add.split('=')[0].strip()},", mul)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestAnLxIntermediateIsACoreLocalView(unittest.TestCase):
+    """An ``allocation["lx"]`` intermediate is stored to and loaded from LX.
+
+    LX planning's address is honoured: the intermediate is a ``ct_local`` view at
+    that address, built in each stage that touches it, and it is not a func
+    parameter.  Against ``TestAChainRoundTripsItsIntermediate`` the only change is
+    that view: ``global`` at a passed-in base there, ``ct_local`` at a constant
+    here.
+    """
+
+    EXPECTED_LX_CHAIN_KTIR = """\
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+module {
+  func.func @ktir_fused_add_add_0(%arg0: index, %arg1: index, %arg2: index, %arg3: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %c0_0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %1 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %2 = ktdp.load %1 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %3 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %4 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %5 = ktdp.load %4 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %6 = tensor.empty() : tensor<16x512x64xf16>
+    %7 = linalg.add ins(%2, %5 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%6 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %8 = ktdp.construct_memory_view %c0_0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<ct_local>} : memref<16x512x64xf16>
+    %9 = ktdp.construct_access_tile %8[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %7, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %10 = ktdp.construct_memory_view %c0_0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<ct_local>} : memref<16x512x64xf16>
+    %11 = ktdp.construct_access_tile %10[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %12 = ktdp.load %11 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %13 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %14 = ktdp.construct_access_tile %13[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %15 = ktdp.load %14 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %16 = tensor.empty() : tensor<16x512x64xf16>
+    %17 = linalg.add ins(%12, %15 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%16 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %18 = ktdp.construct_memory_view %arg3, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %19 = ktdp.construct_access_tile %18[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %17, %19 : tensor<16x512x64xf16>, <16x512x64xindex>
+    return
+  }
+}
+"""
+
+    def test_lx_chain_golden(self):
+        """``(a + b) + c`` with ``a + b`` in LX at address 0."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_add_add_0", make_chained_op_specs(("add", "add"), owned=True)
+        )
+        self.assertEqual(emitted, self.EXPECTED_LX_CHAIN_KTIR)
+
+    def test_two_lx_intermediates_feed_one_op(self):
+        """``(a + b) * (c + d)``: both sums in LX at their own addresses."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        second = LX_SPACING
+        specs = [
+            make_op_spec(names=["a", "b", "t0"], allocations=[None, None, {"lx": 0}]),
+            make_op_spec(
+                names=["c", "d", "t1"],
+                allocations=[None, None, {"lx": second}],
+                first_arg_index=2,
+            ),
+            make_op_spec(
+                "mul",
+                names=["t0", "t1", "out"],
+                allocations=[{"lx": 0}, {"lx": second}, None],
+                first_arg_index=4,
+            ),
+        ]
+        emitted = generate_ktir("ktir_fused_add_add_mul_0", specs)
+        lx_views = [ln for ln in emitted.splitlines() if "ct_local" in ln]
+        # Each intermediate is viewed where it is stored and where it is read.
+        self.assertEqual(len(lx_views), 4)
+        self.assertEqual(emitted.count("ktdp.store"), 3)  # t0, t1 and out
+        self.assertEqual(emitted.count("ktdp.load"), 6)  # a, b, c, d, t0, t1
+        # Addresses in elements: fp16, so the byte address halves.
+        self.assertIn(f"arith.constant {second // 2} : index", emitted)
+        # Only the passed-in buffers are parameters.
+        self.assertIn(
+            "(%arg0: index, %arg1: index, %arg2: index, %arg3: index, %arg4: index)",
+            emitted,
+        )
+
+    def test_a_divided_broadcast_chain_views_one_cores_share(self):
+        """``a + b - c`` at 4 cores with ``b`` broadcast: the LX view is a share.
+
+        HBM buffers are the whole tensor, each core offset along ``d1``; the LX
+        intermediate is one core's share at the planned address, read with no
+        core offset.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        specs = [
+            make_op_spec(
+                names=["a", "b", "t0"],
+                sizes=[[16, 512, 64], [16, 1, 64], [16, 512, 64]],
+                coords_per_arg=[[d0, d1, d2], [d0, sympy.Integer(0), d2], [d0, d1, d2]],
+                allocations=[None, None, {"lx": 0}],
+                divisions={"d1": 4},
+            ),
+            make_op_spec(
+                "sub",
+                names=["t0", "c", "out"],
+                allocations=[{"lx": 0}, None, None],
+                first_arg_index=2,
+                divisions={"d1": 4},
+            ),
+        ]
+        emitted = generate_ktir("ktir_fused_add_sub_0", specs)
+        self.assertIn("attributes {grid = [4]}", emitted)
+        lx_views = [ln for ln in emitted.splitlines() if "ct_local" in ln]
+        self.assertEqual(len(lx_views), 2)
+        for view in lx_views:
+            self.assertIn("sizes: [16, 128, 64], strides: [8192, 64, 1]", view)
+        hbm_views = [ln for ln in emitted.splitlines() if "memory_space<global>" in ln]
+        self.assertTrue(any("sizes: [16, 512, 64]" in ln for ln in hbm_views))
+        # The broadcast operand is read at its own shape.
+        self.assertIn("-> tensor<16x1x64xf16>", emitted)
+        # The LX share is stored and loaded at the view's origin on every core.
+        lx_tiles = [
+            ln
+            for ln in emitted.splitlines()
+            if "ktdp.construct_access_tile" in ln
+            and ln.split("construct_access_tile ")[1].split("[")[0]
+            in {view.split(" = ")[0].strip() for view in lx_views}
+        ]
+        self.assertEqual(len(lx_tiles), 2)
+        for tile in lx_tiles:
+            self.assertIn("[%c0, %c0, %c0]", tile)
 
 
 @unittest.skipUnless(
