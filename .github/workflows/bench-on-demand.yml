@@ -308,6 +308,28 @@ jobs:
           make bench-run BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1 \
             BENCH_PLAN="${BENCH_PLAN_FILE}" BENCH_INGEST=0
 
+      # `repeats_failed` names no cause: the exit code and the command's own stderr sit in the run tree, which
+      # nothing else in this job prints, so a failure here otherwise has to be reproduced on a card to be read.
+      - name: Why the cases failed
+        if: ${{ steps.run.outcome == 'failure' }}
+        continue-on-error: true
+        run: |
+          python3 - "${BENCH_RESULTS_DIR}" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          for status in sorted((Path(sys.argv[1]) / "cases").glob("*/repeat-*/status.json")):
+              info = json.loads(status.read_text())
+              if info.get("status") == "ok":
+                  continue
+              print(f"::group::{info.get('case')} {status.parent.name}:"
+                    f" rc={info.get('returncode')} reason={info.get('reason') or '-'}")
+              err = status.parent / "stderr.log"
+              text = err.read_text(errors="replace").splitlines() if err.is_file() else []
+              print("\n".join(text[-40:]) if text else "(no stderr.log)")
+              print("::endgroup::")
+          PY
+
       # The per-case report.xml files, flat, for the XML ingest below.
       - name: Collect reports
         id: collect
