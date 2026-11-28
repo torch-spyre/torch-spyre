@@ -60,6 +60,7 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     FixedLayout,
+    FlexibleLayout,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
@@ -68,13 +69,14 @@ from torch._inductor.ir import (
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_facts import enclosing_loops, is_looped, read_advances_anywhere
-from .loop_node import move_before, record_member
+from .loop_node import move_after, move_before, record_member
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -84,6 +86,7 @@ from .pass_utils import (
     forward_valid_elements,
     host_coordinates,
     identify_matmul_inputs,
+    invalidate_op_read_writes,
     is_restickify_coords,
     loop_induction_symbols,
     lower_pad_sequence,
@@ -689,35 +692,43 @@ def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     return next(iter(syms))
 
 
-def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
-    """Raise ``Unsupported`` for a restickify written straight into a slice of
-    another buffer (the pieces of a ``torch.cat``).
+def _split_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
+    """Split a restickify written straight into a slice of another buffer (the
+    pieces of a ``torch.cat``) into a restickify into a fresh buffer, then a
+    plain copy of that buffer into the slice (#6163).
 
     ``is_restickify_op`` needs a ``FixedTiledLayout`` output, and a write into a
     slice has a ``MutationLayoutSHOULDREMOVE`` one, so the padding pass would skip
     it.  Codegen still sees a restickify (``is_restickify_coords``) and asserts in
     ``_restickify_restore_elided_dim`` that the padding pass added the gap dim,
-    which it never did.
+    which it never did.  Nor can the padding be added: the write covers part of a
+    buffer whose layout belongs to the other slices.
 
-    Two shapes of restickify reach the raise.  One operand elided (exactly one
+    Two shapes of restickify are split.  One operand elided (exactly one
     within-stick coordinate is symbol-free) is the case the codegen assert covers,
-    and it raises wherever it appears, as on main.  The two coordinates on
-    different dims is what a dense stick relocation produces, and it raises only
-    when the write really is into a sub-range of the target: a cat operand covers
+    and it is split wherever it appears.  The two coordinates on different dims is
+    what a dense stick relocation produces, and it is split only when the write
+    really is into a sub-range of the target: a cat operand covers
     ``[1, 80, 6400]`` of a ``[1, 80, 8400]`` buffer, where the old-stick dim
-    cannot be padded in place.
+    cannot be padded in place.  Left in place, codegen emits wrong addresses for
+    it rather than raising.
 
-    A write that covers the whole target is not a slice and compiles, even with
-    the two coordinates on different dims -- a copy-back into a mutated graph
-    input whose target layout is transposed covers ``[64, 64]`` of ``[64, 64]``.
-    Raising unconditionally instead broke exactly that
-    (``test_infeasible_target_layout_preserves_copy_back``), while narrowing it to
-    the elided case let a relocated write into a cat slice through, where codegen
-    emitted wrong addresses rather than raising.
+    A write that covers the whole target is not a slice and compiles as it is,
+    even with the two coordinates on different dims -- a copy-back into a mutated
+    graph input whose target layout is transposed covers ``[64, 64]`` of
+    ``[64, 64]`` (``test_infeasible_target_layout_preserves_copy_back``).
 
-    TODO(#6163): restickify into a fresh buffer sized to a stick multiple, then
-    copy it into the slice (see the TODO in ``_pad_restickify_output``); then
-    this check goes away.
+    The split keeps ``op``'s body and moves only its output: ``op`` now writes a
+    fresh buffer of its own iteration shape, laid out with its stick on the host
+    dim the slice's stick is on.  That is an ordinary restickify into a buffer
+    the pass owns, which the caller then pads like any other.  A new copy op reads
+    the fresh buffer and writes the slice with ``op``'s old mutation layout; both
+    sides of it have the stick on the same dim, so it is a plain copy, like a cat
+    of operands that need no restickify.
+
+    Raises ``Unsupported`` for what cannot be split this way: an indirect write
+    (a scatter whose index tensor is its only named read, so the "restickify" is
+    not a copy of one tensor into another), and an op inside a loop.
     """
     if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
         return
@@ -744,11 +755,143 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     elided = bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols)
     if not elided and _covers_whole_target(layout, real):
         return
-    raise Unsupported(
-        f"insert_restickify_padding: restickify written into a slice of "
-        f"another buffer on {op.get_name()} (for example torch.cat of "
-        f"tensors that need a restickify) cannot be padded in place"
+    stick = _new_stick_device_dims(in_coords, out_coords)
+    if stick is not None and not _is_one_dense_run(in_coords, *stick):
+        # TODO(#6558): a sliced restickify whose new stick spans two input dims
+        # that are not one dense run (a cat that mixes a sparse piece with a dense
+        # one on a non-stick dim); it needs a restickify that writes a stick
+        # coordinate spanning two host dims.
+        raise Unsupported(
+            f"insert_restickify_padding: {op.get_name()} writes a restickify into "
+            f"a slice of another buffer whose new stick comes from input device "
+            f"dims {stick[1]}, which are not one dense run; it needs a re-base "
+            f"copy (for example torch.cat of a reshaped tensor and a plain one)"
+        )
+    fresh_layout = _fresh_restickify_layout(op, write_dep, out_coords)
+    if fresh_layout is None or is_looped(op):
+        # TODO(#6730): an indirect write (scatter_ / index_fill_ copy-back) has no
+        # iteration shape of its own to restickify into.
+        raise Unsupported(
+            f"insert_restickify_padding: restickify written into a slice of "
+            f"another buffer on {op.get_name()} (for example torch.cat of "
+            f"tensors that need a restickify) cannot be padded in place"
+        )
+
+    copy = _copy_into_mutation_target(op, layout, graph)
+    op.layout = fresh_layout
+    # The write index comes from the layout's indexer, so both caches built from
+    # the slice's indexer (the memoized read/writes and the loop body) are stale:
+    # they would keep writing the fresh buffer at the slice's offset and strides.
+    invalidate_op_read_writes(op)
+    ComputedBuffer.get_default_sizes_body.clear_cache(op)
+    logger.debug(
+        "insert_restickify_padding: %s restickifies into fresh %s; %s copies it "
+        "into %s",
+        op.get_name(),
+        list(fresh_layout.size),
+        copy.get_name(),
+        layout.get_buffer().get_name(),
     )
+
+
+def _new_stick_device_dims(
+    in_coords: list[Expr], out_coords: list[Expr]
+) -> tuple[sympy.Symbol, list[int]] | None:
+    """The output's stick variable and the input device dims whose coordinate
+    holds it, or ``None`` when the output stick is not a single variable."""
+    syms = out_coords[-1].free_symbols
+    if len(syms) != 1:
+        return None
+    var = next(iter(syms))
+    return var, [d for d, c in enumerate(in_coords) if var in c.free_symbols]
+
+
+def _is_one_dense_run(
+    in_coords: list[Expr], var: sympy.Symbol, dims: list[int]
+) -> bool:
+    """Whether the new stick reaches the input through adjacent device dims, its
+    innermost digit innermost, so the restickify reads one dense run.
+
+    A cat on the stick dim of a reshape and a plain tensor (#6163):
+    ``floor(d0/4)`` on device dim 1 and ``Mod(d0, 4)`` on dim 2 is one run.  A
+    cat off the stick dim of a sparse reshape and a plain tensor: ``Mod(d1, 7)``
+    on dim 0 and ``floor(d1/7)`` on dim 3 is not; the backend has no dimension
+    mapping for it.  The innermost digit is the one that changes when the
+    variable goes from 0 to 1.
+    """
+    if len(dims) <= 1:
+        return True
+    if dims != list(range(dims[0], dims[-1] + 1)):
+        return False
+    moves = [
+        d
+        for d in dims
+        if in_coords[d].xreplace({var: sympy.Integer(1)})
+        != in_coords[d].xreplace({var: sympy.Integer(0)})
+    ]
+    return moves == [dims[-1]]
+
+
+def _fresh_restickify_layout(
+    op: ComputedBuffer, write_dep: MemoryDep, out_coords: list[Expr]
+) -> FixedTiledLayout | None:
+    """Layout of the fresh buffer a sliced restickify ``op`` is redirected to.
+
+    The host layout is contiguous over ``op``'s iteration ranges, so ``op``'s
+    write and the copy's read index it the same way.  The stick is on the
+    range whose variable is on the slice's stick (``out_coords[-1]``), so the
+    copy into the slice keeps its stick in place.  ``None`` when the write is
+    not over ``op``'s own loop variables (an indirect write).
+    """
+    stick_syms = out_coords[-1].free_symbols
+    loop_vars = list(write_dep.ranges.keys())
+    if len(stick_syms) != 1 or not write_dep.index.free_symbols <= set(loop_vars):
+        return None
+    stick_var = next(iter(stick_syms))
+    if stick_var not in loop_vars:
+        return None
+    # ``write_dep`` names one variable per range of size > 1, in order (the
+    # dependency extraction squeezes size-1 ranges out).
+    sizes = [concretize_expr(s) for s in op.data.get_size()]
+    kept = [d for d, s in enumerate(sizes) if s != 1]
+    if len(kept) != len(loop_vars):
+        return None
+    stick_dim = kept[loop_vars.index(stick_var)]
+    strides = FlexibleLayout.contiguous_strides(sizes)
+    dim_order = [d for d in range(len(sizes)) if d != stick_dim] + [stick_dim]
+    dtype = op.get_dtype()
+    stl = SpyreTensorLayout(sizes, [int(s) for s in strides], dtype, dim_order)
+    return FixedTiledLayout(op.get_device(), dtype, sizes, list(strides), stl)
+
+
+def _copy_into_mutation_target(
+    op: ComputedBuffer, layout: MutationLayoutSHOULDREMOVE, graph: GraphLowering
+) -> ComputedBuffer:
+    """Add, right after ``op``, a copy of ``op``'s output into ``layout``'s target.
+
+    The copy is built from a loader of ``op``'s buffer, as ``lower_restickify``
+    builds a restickify, so no existing body is rebuilt.  The loader indexes
+    ``op`` through the layout ``op`` has when the body runs, so it is made inside
+    ``inner_fn``: by then ``op`` writes the fresh buffer.  ``Buffer.make_loader``
+    always loads by name; ``ComputedBuffer``'s may inline a body instead.
+    """
+
+    def inner_fn(index):
+        return Buffer.make_loader(op)(index)
+
+    data = Pointwise(
+        device=op.get_device(),
+        dtype=op.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=list(op.data.get_size()),
+    )
+    copy = ComputedBuffer(name=None, layout=layout, data=data)
+    copy.name = graph.register_buffer(copy)
+    copy.operation_name = graph.register_operation(copy)
+    copy.origins = OrderedSet(op.origins)
+    copy.origin_node = op.origin_node
+    move_after(graph.operations, op, copy)
+    return copy
 
 
 def _covers_whole_target(
@@ -1379,9 +1522,13 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
     The restore asserts the prepended gap dim is present before binding the
     symbol, so swapping the pass order fails loudly rather than silently.
+
+    A restickify written into a slice of another buffer (a ``torch.cat`` piece)
+    is first split into a restickify into a fresh buffer, padded here, and a
+    plain copy into the slice (``_split_sliced_restickify``).
     """
     for op in list(graph.operations):
-        _raise_if_sliced_restickify(op, graph)
+        _split_sliced_restickify(op, graph)
         if is_restickify_op(op, graph):
             _pad_restickify_output(op, graph)
             _pad_restickify_input(op, graph)

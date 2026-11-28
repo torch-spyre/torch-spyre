@@ -673,11 +673,11 @@ class TestScatterValueStamp:
         """scatter_(0, idx, 1.0) onto fp16 dest [128], T=192 — leftover extra (#4436 Python).
 
         Eager is aten::scatter.value_out (#4473). Compiled fails in
-        insert_restickify_padding (#6163): the restickify is written into a
-        slice of another buffer, which cannot be padded in place.
+        insert_restickify_padding (#6730): the indirect write into the
+        destination is taken for a restickify into a slice of another buffer.
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4473
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6730
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -686,7 +686,7 @@ class TestScatterValueStamp:
                 r"Could not run 'aten::scatter.value_out'",
             ),
             compiled=rejection(
-                6163,
+                6730,
                 "compile scatter_(value=) on an fp16 dest [128]: insert_restickify_padding cannot pad a restickify written into a slice of another buffer.",
                 r"insert_restickify_padding: restickify written into a slice of another buffer",
             ),

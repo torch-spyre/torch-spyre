@@ -53,6 +53,8 @@ from torch_spyre._inductor.padding import (
     _compute_digits,
     _is_dense_flattened_coordinate,
     _is_nonoverlapping_aligned_stick_coordinate,
+    _is_one_dense_run,
+    _new_stick_device_dims,
     _restickify_input_required_extent,
 )
 from torch_spyre._inductor.scratchpad import allocator
@@ -164,6 +166,40 @@ class TestRestickifyInputCoordinate(unittest.TestCase):
             ),
             128,
         )
+
+
+class TestSlicedRestickifyNewStick(unittest.TestCase):
+    """The check that a restickify into a cat slice reads its new stick as one
+    dense run before it is split into a fresh buffer (#6163)."""
+
+    def test_new_stick_device_dims(self) -> None:
+        d0, d1 = sympy.symbols("d0 d1", integer=True)
+        in_coords = [d1, sympy.floor(d0 / 4), sympy.Mod(d0, 4)]
+
+        self.assertEqual(_new_stick_device_dims(in_coords, [d1, d0]), (d0, [1, 2]))
+        # An elided output stick (no variable) has no new stick dims.
+        self.assertIsNone(_new_stick_device_dims(in_coords, [d1, sympy.Integer(0)]))
+
+    def test_adjacent_dims_innermost_digit_last_are_one_run(self) -> None:
+        # A cat on the stick dim of a reshape and a plain tensor.
+        d0, d1 = sympy.symbols("d0 d1", integer=True)
+        in_coords = [d1, sympy.floor(d0 / 4), sympy.Mod(d0, 4)]
+
+        self.assertTrue(_is_one_dense_run(in_coords, d0, [1, 2]))
+        self.assertTrue(_is_one_dense_run([d1, d0], d0, [1]))
+
+    def test_non_adjacent_dims_are_not_one_run(self) -> None:
+        # A cat off the stick dim of a sparse reshape and a plain tensor.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True)
+        in_coords = [sympy.Mod(d1, 7), d0, d2, sympy.floor(d1 / 7), sympy.Integer(0)]
+
+        self.assertFalse(_is_one_dense_run(in_coords, d1, [0, 3]))
+
+    def test_innermost_digit_outermost_is_not_one_run(self) -> None:
+        d0, d1 = sympy.symbols("d0 d1", integer=True)
+        in_coords = [d1, sympy.Mod(d0, 4), sympy.floor(d0 / 4)]
+
+        self.assertFalse(_is_one_dense_run(in_coords, d0, [1, 2]))
 
 
 # ---------------------------------------------------------------------------

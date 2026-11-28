@@ -3200,9 +3200,20 @@ def _fresh_allocation_layout(
     ``constant_pad_nd`` writers are lowered before the allocation, so they are
     already laid out, and a staggered element arrangement among them is carried
     onto the allocation rather than written into a buffer tagged STANDARD.
+
+    When no writer's source layout can serve its read (every piece of a
+    ``torch.cat`` is a reshape that cuts the stick dim, #6163), the allocation
+    takes the sparse layout of its own host shape, one element per stick, as a
+    pointwise op does for such a read. The planner gives each such source a
+    sparse layout too (#5804), even where a dense relocation exists, so each
+    piece is copied in without a restickify. A restickify from a sparse source
+    into a dense layout would need a new stick dim built from two of its device
+    dims, which neither the padding pass nor the backend can do.
     """
-    stl = generic_layout(op)
     name = op.get_name()
+    if _every_source_read_unservable(writers, name):
+        return sparse_stl_from_host(op.get_layout())
+    stl = generic_layout(op)
     source_eas: set[ElementArrangement] = set()
     for writer in writers:
         reads = [
@@ -3229,6 +3240,30 @@ def _fresh_allocation_layout(
     for writer in writers:
         _check_whole_stagger_units(writer, op.get_layout(), stl)
     return stl
+
+
+def _every_source_read_unservable(writers: list[ComputedBuffer], name: str) -> bool:
+    """Whether every writer of allocation ``name`` copies one source whose
+    candidate layouts all fail to serve the read (``try_device_coordinates`` is
+    ``None``). ``False`` with no writers, or for a writer with any other reads.
+    """
+    if not writers:
+        return False
+    for writer in writers:
+        reads = [
+            r
+            for r in op_read_writes(writer).reads
+            if isinstance(r, MemoryDep) and r.name != name
+        ]
+        args = _get_prop_args(reads, strict=False)
+        if len(reads) != 1 or len(args) != 1 or not args[0].layouts:
+            return False
+        arg = args[0]
+        if any(
+            try_device_coordinates(s, arg.dep, None) is not None for s in arg.layouts
+        ):
+            return False
+    return True
 
 
 def _carries_element_arrangement(read, dtype: torch.dtype) -> bool:
@@ -3327,7 +3362,8 @@ def _find_alt_target_stl(
     stick-permutation restickify can produce. Candidates on a size-1 dim are
     only generated when no other dim yields one (see _candidate_output_stls),
     so a degenerate ``stick=0`` candidate cannot displace a real dim.
-    Falls back to the first offset-free candidate.
+    Falls back to the first offset-free candidate, also when the input's layout
+    cannot serve its read.
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
     stick_size = get_elem_in_stick(dtype_for_layout)
@@ -3352,12 +3388,20 @@ def _find_alt_target_stl(
     # Prefer a restickify-feasible candidate: a cost node holds one required STL,
     # so an infeasible pairing cannot be renegotiated once committed -- see the
     # FixedInOutNode TODO in _clone_layout.
+    #
+    # The preference needs the input's device coordinates. A read its layout
+    # cannot serve (a reshape that cuts the stick dim, #6163) has none: no
+    # restickify from that layout reaches any candidate, and the planner moves
+    # such an input to a relocated or sparse layout anyway (#5966, #5804). Take
+    # the first candidate then, as with no input.
+    in_device_coords = None
     if in_arg is not None:
         in_stl = next(iter(in_arg.layouts))
+        in_device_coords = try_device_coordinates(in_stl, in_arg.dep, None)
+    if in_arg is not None and in_device_coords is not None:
         in_dep = in_arg.dep
         in_layout = in_arg.layout
         in_host_coords = host_coordinates(in_layout, in_dep, None)
-        in_device_coords = device_coordinates(in_stl, in_dep, None)
         for candidate in candidates:
             target_stick = device_coordinates(candidate, output_dep, None)[-1]
             if (
