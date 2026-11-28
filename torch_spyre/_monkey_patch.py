@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from torch._dynamo.guards import GuardBuilder
 
+from torch_spyre._runtime import ensure_runtime_initialized
 from torch_spyre.constants import DEVICE_NAME
 
 if TYPE_CHECKING:
@@ -202,10 +203,8 @@ def _reserve_and_copy(
     # dispatcher path that ordinarily self-inits the runtime (via the H2D
     # stream pool inside spyre_copy_from -> getCurrentStream). On a fresh
     # process this can be the very first device op, so the runtime must be
-    # brought up explicitly here first -- same idiom as manual_seed/CCL-backend/
-    # profiler init elsewhere in this package.
-    if not torch.spyre.is_initialized():
-        torch.spyre._impl._lazy_init()
+    # brought up explicitly here first.
+    ensure_runtime_initialized()
 
     # Local import, same lazy-import convention as the rest of this file
     # (see _UNSET above): torch_spyre._C is a native extension module and
@@ -448,6 +447,12 @@ def _patch_tensor_for_spyre():
             if device is not None:
                 device = torch.device(device)
 
+            # spyre_empty_with_layout is a direct pybind11 call that bypasses
+            # the ATen dispatcher path (which self-inits the runtime via the
+            # stream pool). On a fresh process this can be the very first Spyre
+            # device op, so bring up the runtime explicitly first (issue #6129).
+            ensure_runtime_initialized()
+
             from torch_spyre._C import spyre_empty_with_layout
 
             dst = spyre_empty_with_layout(
@@ -520,6 +525,12 @@ def _patch_tensor_for_spyre():
             # layout_opt is omitted; c10::Layout has no pybind11 type caster,
             # so py_empty_with_layout drops that parameter and always uses
             # the default (Strided).
+            # empty_with_layout is a direct pybind11 call that bypasses the
+            # ATen dispatcher path (which self-inits the runtime via the
+            # stream pool). On a fresh process this can be the very first Spyre
+            # device op, so bring up the runtime explicitly first (issue #6129).
+            ensure_runtime_initialized()
+
             from torch_spyre._C import empty_with_layout
 
             return empty_with_layout(

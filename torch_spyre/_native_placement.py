@@ -34,6 +34,7 @@ import types
 from collections.abc import Mapping, Sequence
 from itertools import pairwise
 
+from torch_spyre._runtime import ensure_runtime_initialized
 from torch_spyre.sharding import (
     ShardedReceipt,
     ShardPlacementEntry,
@@ -69,12 +70,9 @@ def _require_logical_chunk_count(value: object) -> int:
 def _ensure_spyre_runtime_initialized() -> None:
     """Initialize the public torch.spyre runtime before native allocation."""
 
-    import torch
-
-    # torch.spyre is registered by this package's own autoload before any
-    # code here can run, so both attributes exist unconditionally.
-    if not torch.spyre.is_initialized():
-        torch.spyre._lazy_init()
+    # Kept as a module-level name because callers (and their tests) patch it;
+    # the actual work lives in the shared helper used by the allocation paths.
+    ensure_runtime_initialized()
 
 
 def sharded_receipt_from_native(

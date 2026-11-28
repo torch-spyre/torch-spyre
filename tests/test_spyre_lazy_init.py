@@ -14,13 +14,24 @@
 
 # Owner(s): ["module: cpp"]
 
-# NOTE: All tests here should run on their own subprocess
+# NOTE: All tests here should run on their own subprocess. Never initialize
+# the Spyre runtime in the parent process: opening the card takes exclusive
+# VFIO access, so a child subprocess that then tries to open it fails with
+# "Device or resource busy".
 import os
+from unittest import mock
 
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal import common_utils
+from torch.testing._internal.common_utils import TestCase, run_tests
 
 
 class TestSpyre(TestCase):
+    def setUp(self):
+        # TestCase.setUp seeds every device's RNG, and seeding Spyre starts its
+        # runtime in this process, which takes the card from the subprocesses.
+        with mock.patch.object(common_utils, "set_rng_seed"):
+            super().setUp()
+
     def test_device_layout_available_before_runtime_init(self):
         """The tensor monkey-patch (`.to(device_layout=)` etc.) must be applied
         at import time, before the device runtime is started.
@@ -136,6 +147,132 @@ class TestSpyre(TestCase):
                 "second profile() construction started the device runtime"
             )
 
+            print("OK")
+        """)
+
+        env = os.environ.copy()
+        env["DT_DEEPRT_VERBOSE"] = "-1"
+        env["DTLOG_LEVEL"] = "error"
+
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=130,
+            text=True,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        assert proc.returncode == 0, (
+            f"subprocess failed (rc={proc.returncode}).\nstdout:\n{out}\nstderr:\n{err}"
+        )
+        assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
+
+    def test_to_device_layout_first_op_initializes_runtime(self):
+        """``tensor.to("spyre", device_layout=...)`` must initialize the Spyre
+        runtime even when it is the first Spyre device operation in a fresh
+        process (issue #6129).
+
+        The ``device_layout`` branch of ``spyre_to`` calls
+        ``spyre_empty_with_layout()`` directly via pybind11, bypassing the ATen
+        dispatcher path that ordinarily self-inits the runtime. Without an
+        explicit ``_lazy_init()`` first, a fresh process raises
+        ``RuntimeError: RuntimeContext not created``.
+
+        Runs in a subprocess so an already-initialized runtime from another
+        test cannot mask the regression; a parent-process probe would itself
+        start the runtime (and take the VFIO device) before the child runs.
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        script = textwrap.dedent("""
+            import torch
+            import torch_spyre
+            from torch_spyre._C import SpyreTensorLayout
+
+            # This must be the first Spyre device operation: do not call
+            # anything that touches the runtime before this.
+            assert torch.spyre.is_initialized() is False, (
+                "runtime was initialized before the device_layout transfer"
+            )
+
+            x = torch.ones(4, 64, dtype=torch.float16)
+            stl = SpyreTensorLayout([4, 64], torch.float16)
+            y = x.to("spyre", device_layout=stl)
+
+            assert y.device.type == "spyre", f"expected spyre device, got {y.device}"
+            assert torch.equal(y.cpu(), x), "device_layout transfer corrupted data"
+            assert torch.spyre.is_initialized() is True, (
+                "device_layout transfer did not initialize the runtime"
+            )
+            print("OK")
+        """)
+
+        env = os.environ.copy()
+        env["DT_DEEPRT_VERBOSE"] = "-1"
+        env["DTLOG_LEVEL"] = "error"
+
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=130,
+            text=True,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        assert proc.returncode == 0, (
+            f"subprocess failed (rc={proc.returncode}).\nstdout:\n{out}\nstderr:\n{err}"
+        )
+        assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
+
+    def test_empty_device_layout_first_op_initializes_runtime(self):
+        """``torch.empty(..., device_layout=...)`` must initialize the Spyre
+        runtime even when it is the first Spyre device operation in a fresh
+        process (issue #6129).
+
+        ``spyre_empty`` calls ``empty_with_layout()`` directly via pybind11,
+        bypassing the ATen dispatcher path that ordinarily self-inits the
+        runtime. Without an explicit ``_lazy_init()`` first, a fresh process
+        raises ``RuntimeError: RuntimeContext not created``.
+
+        Runs in a subprocess so an already-initialized runtime from another
+        test cannot mask the regression; a parent-process probe would itself
+        start the runtime (and take the VFIO device) before the child runs.
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        script = textwrap.dedent("""
+            import torch
+            import torch_spyre
+            from torch_spyre._C import SpyreTensorLayout
+
+            # This must be the first Spyre device operation: do not call
+            # anything that touches the runtime before this.
+            assert torch.spyre.is_initialized() is False, (
+                "runtime was initialized before torch.empty(device_layout=)"
+            )
+
+            stl = SpyreTensorLayout([4, 64], torch.float16)
+            y = torch.empty(
+                (4, 64),
+                dtype=torch.float16,
+                device=torch.device("spyre"),
+                device_layout=stl,
+            )
+
+            assert y.device.type == "spyre", f"expected spyre device, got {y.device}"
+            assert tuple(y.shape) == (4, 64), f"unexpected shape {tuple(y.shape)}"
+            assert y.dtype == torch.float16, f"unexpected dtype {y.dtype}"
+            assert torch.spyre.is_initialized() is True, (
+                "torch.empty(device_layout=) did not initialize the runtime"
+            )
             print("OK")
         """)
 
