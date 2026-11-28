@@ -55,6 +55,8 @@ from indirect_access_common import (  # noqa: E402
     op_spec_has_indirect_output,
 )
 
+from utils_inductor import expects_raise  # noqa: E402
+
 from torch_spyre._C import DataFormats  # noqa: E402
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
@@ -846,6 +848,243 @@ class TestMaskedScatterRejectReason(IndirectAccessTestCase):
         reason = self._reason((1, 855, 5120), mask, (266, 5120))
         self.assertIsNotNone(reason)
         self.assertIn("rank", reason)
+
+
+class TestFoldSharedDimHandler(IndirectAccessTestCase):
+    """`_FoldSharedDimHandler`: the inner_fn rewrite of fold_shared_indirect_dims.
+
+    Device-free: drives the handler with a recording ops handler, using the #4840
+    load pattern (index `pos[d0]`, value `2048*d0 + 512*s + d1` on a [12, 4, 512]
+    source), and checks the exact rewrite it forwards.
+    """
+
+    class _RecordingOps:
+        def __init__(self):
+            self.loads = []
+            self.sizes = []
+
+        def load(self, name, index):
+            self.loads.append((name, index))
+            return f"v{len(self.loads)}"
+
+        def indirect_indexing(self, var, size, check=True, wrap_neg=True):
+            self.sizes.append(size)
+            return sympy.Symbol("s")
+
+    def _handler(self):
+        from torch_spyre._inductor.fold_shared_indirect_dims import (
+            _FoldPlan,
+            _FoldSharedDimHandler,
+        )
+
+        plan = _FoldPlan(
+            index_name="pos",
+            value_name="x",
+            index_coeff=1,
+            value_coeff=2048,
+            step=4,
+            extent=12,
+            index_dim=0,
+        )
+        inner = self._RecordingOps()
+        return inner, _FoldSharedDimHandler(inner, plan, "rows")
+
+    def test_reads_rows_and_drops_shared_term(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        inner, handler = self._handler()
+        s = handler.indirect_indexing(handler.load("pos", d0), 4)
+        handler.load("x", 2048 * d0 + 512 * s + d1)
+        self.assertEqual(inner.loads, [("rows", d0), ("x", 512 * s + d1)])
+        # The folded row index covers all 12 blocks of 4 rows.
+        self.assertEqual(inner.sizes, [48])
+
+    def test_other_loads_untouched(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        inner, handler = self._handler()
+        handler.load("y", d0 + d1)
+        # Without the index load first, the value address is left as is.
+        handler.load("x", 2048 * d0 + d1)
+        self.assertEqual(inner.loads, [("y", d0 + d1), ("x", 2048 * d0 + d1)])
+
+
+class TestFoldSharedDimDeclines(IndirectAccessTestCase):
+    """fold_shared_indirect_dims fails closed: cases it must leave unchanged.
+
+    Device-free. Each case is the #4840 gather (index ``pos[d0]``, value
+    ``2048*d0 + 512*s + d1`` on a [12, 4, 512] source) with one thing changed.
+    A real ``Pointwise`` and real ``MemoryDep``s drive ``_plan_fold``; the op and
+    graph are stand-ins exposing only what the pass reads.
+    """
+
+    class _Buf:
+        def __init__(self, size, stride=None, dtype=torch.int64):
+            self._size, self._dtype = list(size), dtype
+            self._stride = stride
+            if stride is None:
+                self._stride, running = [0] * len(size), 1
+                for d in range(len(size) - 1, -1, -1):
+                    self._stride[d] = running
+                    running *= size[d]
+
+        def get_size(self):
+            return self._size
+
+        def get_stride(self):
+            return self._stride
+
+        def get_dtype(self):
+            return self._dtype
+
+    class _Graph:
+        def __init__(self, bufs):
+            self._bufs = bufs
+            self.operations = []
+
+        def get_buffer(self, name):
+            return self._bufs[name]
+
+    class _Op:
+        def __init__(self, data, reads):
+            self.data = data
+            self._reads = reads
+
+        def get_read_writes(self):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(reads=self._reads)
+
+    D0, D1 = sympy.symbols("d0 d1")
+    S = sympy.Symbol("indirect0")
+
+    def _pointwise(self, gathers):
+        """Pointwise reading ``value[...]`` through ``index`` for each pair."""
+        from torch._inductor.ir import Pointwise
+        from torch._inductor.virtualized import ops
+
+        def inner_fn(index):
+            out = None
+            for value_name, index_name in gathers:
+                i = ops.indirect_indexing(ops.load(index_name, index[0]), 4)
+                out = ops.load(value_name, 512 * i + index[1])
+            return out
+
+        return Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=inner_fn,
+            ranges=[12, 512],
+        )
+
+    def _dep(self, name, index):
+        from torch._inductor.dependencies import MemoryDep
+
+        return MemoryDep(name, index, (self.D0, self.D1), (12, 512))
+
+    def _case(
+        self,
+        *,
+        value_index=None,
+        pos_buf=None,
+        gathers=(("x", "pos"),),
+        extra_reads=(),
+    ):
+        if value_index is None:
+            value_index = 2048 * self.D0 + 512 * self.S + self.D1
+        reads = [
+            self._dep("pos", self.D0),
+            self._dep("x", value_index),
+            *extra_reads,
+        ]
+        bufs = {
+            "pos": pos_buf or self._Buf([12]),
+            "x": self._Buf([12, 4, 512], dtype=torch.float16),
+            "pos2": self._Buf([12]),
+            "y": self._Buf([12, 4, 512], dtype=torch.float16),
+        }
+        op = self._Op(self._pointwise(gathers), reads)
+        return self._Graph(bufs), op
+
+    def test_baseline_folds(self):
+        """The unmodified pattern is planned, so the declines below are real."""
+        from torch_spyre._inductor.fold_shared_indirect_dims import _plan_fold
+
+        plan = _plan_fold(*self._case())
+        self.assertIsNotNone(plan)
+        self.assertEqual((plan.step, plan.extent, plan.index_dim), (4, 12, 0))
+
+    def test_declines_non_dense_index(self):
+        from torch_spyre._inductor.fold_shared_indirect_dims import _plan_fold
+
+        # pos is a stride-2 view: rows would be read at a dense index.
+        graph, op = self._case(pos_buf=self._Buf([12], stride=[2]))
+        self.assertIsNone(_plan_fold(graph, op))
+
+    def test_declines_two_indirect_loads(self):
+        from torch_spyre._inductor.fold_shared_indirect_dims import _plan_fold
+
+        s2 = sympy.Symbol("indirect1")
+        graph, op = self._case(
+            gathers=(("x", "pos"), ("y", "pos2")),
+            extra_reads=(
+                self._dep("pos2", self.D0),
+                self._dep("y", 2048 * self.D0 + 512 * s2 + self.D1),
+            ),
+        )
+        self.assertIsNone(_plan_fold(graph, op))
+
+    def test_declines_stick_interior_step(self):
+        from torch_spyre._inductor.fold_shared_indirect_dims import _plan_fold
+
+        # Each index step moves 64 elements, inside a 512-wide row (#4327).
+        graph, op = self._case(value_index=2048 * self.D0 + 64 * self.S + self.D1)
+        self.assertIsNone(_plan_fold(graph, op))
+
+    @expects_raise
+    def test_refuses_op_in_loop(self):
+        """A matched gather inside a loop raises Unsupported instead of folding.
+
+        Left alone it would still read the wrong rows (#4840). The stub carries
+        the loop lowering's ``loop_member`` record, which ``enclosing_loops``
+        reads for an op no LoopNode holds yet, so this goes through the same
+        check a real looped op does.
+        """
+        from unittest import mock
+
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor import fold_shared_indirect_dims as mod
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.loop_facts import enclosing_loops
+        from torch_spyre._inductor.loop_node import LoopMember
+
+        graph, fake = self._case()
+        # The pass only visits ComputedBuffers; give the stub that type.
+        op = object.__new__(ComputedBuffer)
+        object.__setattr__(op, "data", fake.data)
+        object.__setattr__(op, "get_read_writes", fake.get_read_writes)
+        object.__setattr__(op, "name", "buf0")
+        object.__setattr__(
+            op,
+            "loop_member",
+            LoopMember(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[0]]),
+        )
+        graph.operations = [op]
+        self.assertTrue(enclosing_loops(op))
+        self.assertIsNotNone(mod._plan_fold(graph, op))
+        with mock.patch.object(mod, "_lower_rows") as lower_rows:
+            with self.assertRaisesRegex(Unsupported, "inside a loop body"):
+                mod.fold_shared_indirect_dims(graph)
+        lower_rows.assert_not_called()
+
+    def test_not_in_loop_without_loop_member(self):
+        """The same op with no loop record is not treated as looped."""
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor import fold_shared_indirect_dims as mod
+
+        _, fake = self._case()
+        op = object.__new__(ComputedBuffer)
+        object.__setattr__(op, "data", fake.data)
+        object.__setattr__(op, "name", "buf0")
+        self.assertFalse(mod._in_loop(op))
 
 
 if __name__ == "__main__":
