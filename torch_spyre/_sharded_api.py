@@ -193,7 +193,7 @@ def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo:
     # TODO: report the block's own sharding (#5817).
     global_shape = _require_int_list("global_shape", native["global_shape"])
     if tensor.storage_offset() != 0 or list(tensor.shape) != global_shape:
-        raise TypeError(
+        raise NotImplementedError(
             "sharding_info does not support views of sharded Spyre tensors "
             f"yet (view of shape {list(tensor.shape)} at storage offset "
             f"{tensor.storage_offset()} of a sharded tensor of shape "

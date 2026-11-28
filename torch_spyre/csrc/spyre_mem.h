@@ -124,16 +124,25 @@ at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
 // Whether `tensor`'s storage is sharded storage.
 bool spyre_is_sharded(const at::Tensor& tensor);
 
+// A box view of a sharded tensor's base, in the base's (full) rank.
+struct ShardedBox {
+  std::vector<int64_t> start;  // first index in each dimension of the base
+  std::vector<int64_t> sizes;  // extent in each dimension (1 if dropped)
+  std::vector<int64_t> dims;   // the view dimension of each base dimension,
+                               // or -1 for one the view drops or has as size 1
+};
+
 // Where a view with `sizes`, `strides` and `storage_offset` sits in the base
 // tensor of `sharded`'s storage, if it is a box view: a non-empty block of
-// the base in the same dimension order (the base's rank, unit steps, the
-// base's strides). Returns the block's start index in each dimension of the
-// recorded global shape, or nullopt for any other view. The whole tensor is
-// the box that starts at zero. `sharded` must be a sharded tensor.
-std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
-                                                      c10::IntArrayRef sizes,
-                                                      c10::IntArrayRef strides,
-                                                      int64_t storage_offset);
+// the base in the same dimension order (unit steps, the base's strides). The
+// view may drop dimensions of the block that have extent 1, so rank-reducing
+// selects such as x[3] (the box x[3:4]) and x[:, -1] are box views too.
+// Returns nullopt for any other view. The whole tensor is the box that
+// starts at zero. `sharded` must be a sharded tensor.
+std::optional<ShardedBox> sharded_box(const at::Tensor& sharded,
+                                      c10::IntArrayRef sizes,
+                                      c10::IntArrayRef strides,
+                                      int64_t storage_offset);
 
 // Device address of shard `shard_index` of a sharded tensor: the start of
 // that shard's own allocation. Resolved per launch for

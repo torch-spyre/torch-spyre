@@ -1808,13 +1808,14 @@ bool spyre_is_sharded(const at::Tensor& tensor) {
   return ctx != nullptr && ctx->sharding.has_value();
 }
 
-std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
-                                                      c10::IntArrayRef sizes,
-                                                      c10::IntArrayRef strides,
-                                                      int64_t storage_offset) {
+std::optional<ShardedBox> sharded_box(const at::Tensor& sharded,
+                                      c10::IntArrayRef sizes,
+                                      c10::IntArrayRef strides,
+                                      int64_t storage_offset) {
   const auto& global = sharding_of(sharded)->sharding->global_shape;
   const size_t rank = global.size();
-  if (sizes.size() != rank || strides.size() != rank || storage_offset < 0) {
+  const size_t view_rank = sizes.size();
+  if (view_rank > rank || strides.size() != view_rank || storage_offset < 0) {
     return std::nullopt;
   }
   // The base of sharded storage is contiguous (spyre_empty_sharded makes it
@@ -1825,21 +1826,33 @@ std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
     base_strides[i] = stride;
     stride *= std::max<int64_t>(global[i], 1);
   }
+  // Each view dimension of size > 1 is the base dimension with the same
+  // stride (base dimensions of size > 1 have distinct strides), in the base's
+  // order. A size-1 dimension's stride addresses nothing and PyTorch does not
+  // normalize it, so it is not matched; it and every base dimension the view
+  // drops (a select such as x[3]) have extent 1 in the box.
+  ShardedBox box{std::vector<int64_t>(rank), std::vector<int64_t>(rank, 1),
+                 std::vector<int64_t>(rank, -1)};
+  size_t next = 0;  // the first base dimension the next view dim may match
+  for (size_t k = 0; k < view_rank; ++k) {
+    if (sizes[k] < 1) return std::nullopt;
+    if (sizes[k] == 1) continue;
+    size_t j = next;
+    while (j < rank && !(global[j] > 1 && base_strides[j] == strides[k])) ++j;
+    if (j == rank) return std::nullopt;
+    box.sizes[j] = sizes[k];
+    box.dims[j] = static_cast<int64_t>(k);
+    next = j + 1;
+  }
   // The storage offset of a box is sum(start[i] * base_strides[i]) with
   // 0 <= start[i] < global[i], so it decomposes uniquely.
-  std::vector<int64_t> start(rank);
   int64_t rest = storage_offset;
   for (size_t i = 0; i < rank; ++i) {
-    // A size-1 dimension's stride addresses nothing and PyTorch does not
-    // normalize it, so only the other strides must be the base's.
-    if (sizes[i] < 1 || (sizes[i] > 1 && strides[i] != base_strides[i])) {
-      return std::nullopt;
-    }
-    start[i] = rest / base_strides[i];
+    box.start[i] = rest / base_strides[i];
     rest %= base_strides[i];
-    if (start[i] + sizes[i] > global[i]) return std::nullopt;
+    if (box.start[i] + box.sizes[i] > global[i]) return std::nullopt;
   }
-  return start;
+  return box;
 }
 
 uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
@@ -2071,7 +2084,7 @@ at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
 // single-chunk view of its own chunk. Synchronous; the destination is valid
 // only after every shard copy has completed.
 //
-// A box view of a sharded tensor (see sharded_box_start) is copied to the
+// A box view of a sharded tensor (see sharded_box) is copied to the
 // CPU from the shards it overlaps: each of them is copied whole into a CPU
 // staging buffer, and the part inside the box is copied out of it on the
 // CPU. Copies into a box view are not supported yet.
@@ -2081,8 +2094,8 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
   const at::Tensor& host = host2device ? self : dst;
   TORCH_CHECK(host.is_cpu(),
               "sharded Spyre tensors can only be copied to or from the CPU");
-  const auto box = sharded_box_start(
-      sharded, sharded.sizes(), sharded.strides(), sharded.storage_offset());
+  const auto box = sharded_box(sharded, sharded.sizes(), sharded.strides(),
+                               sharded.storage_offset());
   TORCH_CHECK(box.has_value(),
               "sharded Spyre tensors only support copies of the whole tensor "
               "or of a block of it (view: ",
@@ -2114,8 +2127,17 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               sharded.sizes(), " of ", info.global_shape, ")");
   const int64_t dim = info.shard_dim;
   const int64_t extent = info.global_shape[dim] / info.num_shards;
-  const int64_t box_lo = (*box)[dim];
-  const int64_t box_hi = box_lo + sharded.size(dim);
+  const int64_t box_lo = box->start[dim];
+  const int64_t box_hi = box_lo + box->sizes[dim];
+  // The host tensor has the view's shape, which may drop dimensions of the
+  // box (a select). Alias it in the box's full rank, with extent 1 in each
+  // dropped dimension, so the narrows below index the base's dimensions.
+  const int64_t rank = static_cast<int64_t>(info.global_shape.size());
+  std::vector<int64_t> host_strides(rank, 1);
+  for (int64_t d = 0; d < rank; ++d) {
+    if (box->dims[d] >= 0) host_strides[d] = host.stride(box->dims[d]);
+  }
+  const at::Tensor host_box = host.as_strided(box->sizes, host_strides);
 
   SpyreStream stream = getCurrentStream(sharded.device());
   for (int64_t i = box_lo / extent; i * extent < box_hi; ++i) {
@@ -2123,7 +2145,7 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
     const int64_t lo = std::max(box_lo, i * extent);
     const int64_t hi = std::min(box_hi, (i + 1) * extent);
     at::Tensor shard = spyre_shard_view(sharded, i);
-    at::Tensor host_slice = host.narrow(dim, lo - box_lo, hi - lo);
+    at::Tensor host_slice = host_box.narrow(dim, lo - box_lo, hi - lo);
     if (host2device) {
       at::Tensor staging = host_slice.contiguous();
       stream.copyAsync(staging, shard);
@@ -2134,8 +2156,8 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
       stream.copyAsync(shard, staging);
       stream.synchronize();
       at::Tensor part = staging.narrow(dim, lo - i * extent, hi - lo);
-      for (int64_t d = 0; d < sharded.dim(); ++d) {
-        if (d != dim) part = part.narrow(d, (*box)[d], sharded.size(d));
+      for (int64_t d = 0; d < rank; ++d) {
+        if (d != dim) part = part.narrow(d, box->start[d], box->sizes[d]);
       }
       host_slice.copy_(part);
     }

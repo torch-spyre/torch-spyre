@@ -247,7 +247,9 @@ implements:
   keeps the parent storage alive. Copies are blocking by contract. A box
   view (below) is copied to the CPU from only the shards it overlaps: each
   is copied whole into a CPU buffer and the part inside the box is taken
-  from there. Copies into a box view are rejected.
+  from there (copying only the box's part of each shard is a planned
+  optimization; until then a column box under `Shard(0)` copies every shard
+  whole). Copies into a box view are rejected.
 * `fill_sharded` — eager `fill_`/`zero_`, one shard at a time through
   `spyre_shard_view`; it accepts only the whole tensor, so fills of box
   views are rejected.
@@ -263,10 +265,12 @@ implements:
   mapping from its elements onto the shards (`check_sharded_view` in
   [spyre_views.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_views.cpp)).
   Two kinds of view are allowed: identity views such as `detach`, and
-  *box views* — a block of the base in the same dimension order (the
-  base's rank, unit steps and strides), such as `x[8:16]` or
-  `x[:, 64:128]` (`sharded_box_start` in spyre_mem.cpp works out where the
-  block starts from the recorded `global_shape`). Transposes, strided
+  *box views* — a block of the base in the same dimension order (unit steps
+  and the base's strides), such as `x[8:16]` or `x[:, 64:128]`, which may
+  drop dimensions of extent 1: rank-reducing selects such as `x[3]` (the box
+  `x[3:4]`) or `logits[:, -1]` are box views too (`sharded_box` in
+  spyre_mem.cpp works out the block from the recorded `global_shape`).
+  Transposes, strided
   slices, flattened slices, broadcasts and reshapes stay rejected. Box views
   can only be copied to the CPU (and printed) so far: kernels, fills,
   copies into them and `sharding_info` reject them (#5817);

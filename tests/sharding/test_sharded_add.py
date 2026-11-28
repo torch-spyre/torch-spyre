@@ -1224,6 +1224,13 @@ _BOX_VIEWS = {
         ("columns", lambda t, e: t[:, 16:48]),
         ("block", lambda t, e: t[e - 1 : 2 * e + 1, 5:37]),
         ("slice_of_slice", lambda t, e: t[e // 2 :][1 : 2 * e, 8:]),
+        # Rank-reducing selects: the box with the selected dimension dropped.
+        ("select_row", lambda t, e: t[3 * e + 1]),
+        ("select_last_row", lambda t, e: t[-1]),
+        ("select_column", lambda t, e: t[:, 5]),
+        ("select_last_column", lambda t, e: t[:, -1]),
+        ("select_in_block", lambda t, e: t[e - 1 : 2 * e + 1, 7]),
+        ("select_row_part", lambda t, e: t[e + 2, 8:40]),
     ],
     1: [
         ("inside_one_shard", lambda t, e: t[:, 1 : e - 1]),
@@ -1232,6 +1239,10 @@ _BOX_VIEWS = {
         ("rows", lambda t, e: t[3:11]),
         ("block", lambda t, e: t[2:9, e - 3 : 2 * e + 3]),
         ("slice_of_slice", lambda t, e: t[:, e // 2 :][1:, 1 : 2 * e]),
+        ("select_row", lambda t, e: t[3]),
+        ("select_column", lambda t, e: t[:, e + 2]),  # on the shard dimension
+        ("select_last_column", lambda t, e: t[:, -1]),
+        ("select_column_part", lambda t, e: t[2:9, e]),
     ],
 }
 
@@ -1269,11 +1280,44 @@ def test_box_view_of_sharded_prints_its_values():
 
 
 @requires_emulation
+@pytest.mark.parametrize(
+    "name, view",
+    [
+        ("select_batch", lambda t, e: t[1]),
+        ("select_sequence", lambda t, e: t[:, e + 1]),
+        ("select_hidden", lambda t, e: t[:, :, 3]),
+        ("select_batch_box", lambda t, e: t[1, e - 2 : 2 * e + 2]),
+        ("box", lambda t, e: t[1:2, e : 3 * e, 8:40]),
+    ],
+)
+def test_box_view_of_rank3_sharded_copies_to_cpu(name, view):
+    # A [B, S, H] tensor sharded on S (a middle dimension).
+    n = num_shards()
+    cpu = _box_source((2, 4 * n, 64), torch.float16)
+    x = _sharded(cpu, 1, n)
+    extent = 4
+
+    v = view(x, extent)
+
+    assert torch.spyre.is_sharded(v)
+    assert torch.equal(v.cpu(), view(cpu, extent))
+    assert torch.equal(x.cpu(), cpu)
+
+
+@requires_emulation
+def test_box_view_of_sharded_on_dim1_prints_its_values():
+    n = num_shards()
+    cpu = _box_source((16, 64 * n), torch.float16)
+    x = _sharded(cpu, 1, n)
+    assert str(x[2:7, 60:70]).replace(", device='spyre:0'", "") == str(cpu[2:7, 60:70])
+    assert str(x[3]).replace(", device='spyre:0'", "") == str(cpu[3])
+
+
+@requires_emulation
 @expects_raise
 @pytest.mark.parametrize(
     "view",
     [
-        lambda t: t[1],  # rank-reducing select
         lambda t: t[:, ::2],  # strided slice of the stick dimension
         lambda t: t[1:5].t(),  # a box, then transposed
         lambda t: t.view(-1)[3:70],  # flattened slice
@@ -1308,8 +1352,16 @@ def test_box_views_of_sharded_fail_in_other_consumers():
         v.fill_(0)
     with pytest.raises(RuntimeError, match="only support whole-tensor fills"):
         v.zero_()
-    with pytest.raises(TypeError, match="does not support views of sharded"):
+    with pytest.raises(NotImplementedError, match="does not support views of sharded"):
         torch.spyre.sharding_info(v)
+    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
+        v + 1
+    # A rank-reducing select is a box view too, with the same limits.
+    s = x[3]
+    with pytest.raises(RuntimeError, match="only support whole-tensor fills"):
+        s.fill_(0)
+    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
+        s + 1
     with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
         torch.compile(lambda a, b: a + b, dynamic=False)(v, v)
     # A detached block view has no _base, so the compile check must look at
