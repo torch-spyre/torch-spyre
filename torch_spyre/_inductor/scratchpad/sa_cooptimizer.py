@@ -35,8 +35,15 @@ unlike a menu draw it depends on the state.
 Best-seen over ``(pi, W)`` from the seed state (every op at its seed config,
 ``pi`` from FirstFit) keeps every returned state no worse than that baseline.
 
+Multi-start: a solve runs ``config.sa_coopt_restarts`` anneals, restart k with
+seed ``_SEED + k``, each from a fresh copy of the same seed state, and keeps
+the lowest ``(score, seed)``. The per-buffer memo caches the restarts share
+return the same value whichever restart fills them, so restart k is exactly a
+one-restart solve with ``_SEED = _SEED + k``.
+
 Determinism: a seeded ``Random`` over index-ordered domains and the integer
-fixed-point score make a run bit-for-bit reproducible.
+fixed-point score make each anneal, and so the best of the fixed seed set,
+bit-for-bit reproducible.
 
 Design notes: ``docs/source/compiler/sa_co_optimization.md``.
 """
@@ -49,6 +56,7 @@ import keyword
 import math
 import random as rnd
 import statistics
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Sequence, Set as AbstractSet
 from dataclasses import dataclass, field, replace
@@ -78,6 +86,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._C import NativePermutationLayoutSolver
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import iteration_space_from_op
@@ -89,20 +98,48 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
 
-# RNG seed; fixes the (deterministic) search trajectory.
+# Base of the restart seeds: restart k runs from ``_SEED + k``, which fixes the
+# (deterministic) set of trajectories. See ``config.sa_coopt_restarts``.
 _SEED = 0
 
-# Step budget, see _step_budget. The ceiling sits above the layout-only
-# annealer's clamp (``SelfCalibratingReheatingSchedule.max_steps``, 5_000) since
-# this engine searches divisions too, and binds only well past the validated
-# corpus. It bounds *steps*, not wall-clock.
-_STEPS_PER_BUFFER = 200
+# Ceiling on the per-restart step budget, see _step_budget. It sits above the
+# layout-only annealer's clamp (``SelfCalibratingReheatingSchedule.max_steps``,
+# 5_000) since this engine searches divisions too, and binds only well past the
+# validated corpus. It bounds *steps*, not wall-clock.
 _MAX_STEPS = 50_000
 
 
+def _positive_config(name: str) -> int:
+    """``config.<name>``, which must be an integer of at least 1. Checked at
+    solve time rather than at import, so a ``config.patch`` value is checked
+    too."""
+    value = getattr(spyre_config, name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"config.{name} must be an integer >= 1, got {value!r}")
+    return value
+
+
+def _fixed_to_ns(score: int) -> float:
+    """A fixed-point score (see :meth:`SaCoOptimizingSolver._score`) in ns."""
+    return score * 1000.0 / utils.US_FIXED_POINT_SCALE
+
+
 def _step_budget(n: int) -> int:
-    """The anneal's step count for ``n`` buffers that carry a division decision."""
-    return min(_MAX_STEPS, _STEPS_PER_BUFFER * n)
+    """One restart's step count for ``n`` buffers that carry a division
+    decision: ``config.sa_coopt_steps_per_buffer`` each, capped at
+    ``_MAX_STEPS``. Logs when the cap binds."""
+    per_buffer = _positive_config("sa_coopt_steps_per_buffer")
+    if per_buffer * n > _MAX_STEPS:
+        logger.debug(
+            "SA co-optimizer step budget clamped to %d for %d buffers (%d "
+            "steps/buffer would ask for %d); layout quality is traded for "
+            "bounded compile time.",
+            _MAX_STEPS,
+            n,
+            per_buffer,
+            per_buffer * n,
+        )
+    return min(_MAX_STEPS, per_buffer * n)
 
 
 # Fixed proposal weights over the move types. Reorder's weight is effectively 0
@@ -703,7 +740,8 @@ class _ViewRelation(_EdgeRelation):
 
 # The joint state ``(pi, W)`` as :meth:`SaCoOptimizingSolver._snapshot` takes it:
 # the packer, the division vector, the eligible count and mask, the relayout copies
-# switched on, and the ones eligible.
+# switched on, and the ones eligible. Only ``_snapshot``, ``_copy_snapshot`` and
+# ``_adopt`` look inside.
 _Snapshot = tuple[
     NativePermutationLayoutSolver,
     list[DivisionConfig],
@@ -714,6 +752,16 @@ _Snapshot = tuple[
 ]
 
 
+@dataclass
+class _RestartResult:
+    """One anneal's outcome: its best-seen state and that state's score."""
+
+    seed: int
+    score: int  # fixed point, as :meth:`SaCoOptimizingSolver._score` returns it
+    steps: int  # steps run; below the budget when no move applied any more
+    snapshot: _Snapshot
+
+
 class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     """SA joint core-division + LX-placement engine.
 
@@ -721,8 +769,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     relayout group, the search switches each on or off, and a consumer reading
     a resident parent through a resident copy gets ``chosen_relayouts``.
 
-    The search is fully determined by the module constants above; there is
-    nothing to configure per call.
+    The search is fully determined by the module constants above and by
+    ``config.sa_coopt_restarts`` and ``config.sa_coopt_steps_per_buffer``: the
+    result is the best of a fixed seed set, so it is bit-for-bit reproducible.
+    There is nothing to configure per call.
 
     Args:
         buffers: the buffers to plan, in the allocator's order. Declared as
@@ -787,10 +837,18 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # The division vector ``W``: one config per buffer, positionally. Set at
         # the seed (see :meth:`_seed_configs`); declared here for the types.
         self.chosen: list[DivisionConfig]
-        # Best-seen over the anneal (set in _anneal, read in _step); declared for
-        # the types.
+        # Each restart's step budget, computed once per solve (set in _prepare).
+        self._steps: int
+        # The seed state every restart starts from (set in _prepare); never
+        # adopted itself, only copies of it.
+        self._seed_state: _Snapshot
+        # Best-seen over the current restart (set in _begin_restart, read in
+        # _step); declared for the types.
         self._best_score: int
         self._best_snap: _Snapshot
+        # Per-restart (seed, score, steps), the winner's seed, and timing; the
+        # allocator copies it into the cost-expression dump.
+        self.last_solve_stats: dict = {}
         # Number of buffers passing :meth:`_eligible` under the live ``W``,
         # carried by the two ripple sites as the change over the buffers a move
         # can change.
@@ -817,31 +875,113 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def plan_layout_and_core_divisions(
         self, cost_expr: Optional[sympy.Expr] = None
     ) -> list[CoreDivisionBuffer]:
-        """Anneal the joint ``(pi, W)`` state and write ``chosen_division`` /
-        ``address`` / ``spill_reason`` back to each buffer. Returns the
-        solver's own buffers. Single-use: construct a fresh solver per set.
+        """Anneal the joint ``(pi, W)`` state ``config.sa_coopt_restarts``
+        times from the same seed state, keep the lowest ``(score, seed)``, and
+        write its ``chosen_division`` / ``address`` / ``spill_reason`` back to
+        each buffer. Returns the solver's own buffers. Single-use: construct a
+        fresh solver per set.
         """
-        n = len(self._bufs)
-        if n == 0:
+        restarts = _positive_config("sa_coopt_restarts")
+        if not self._bufs:
             return list(self._bufs)
 
+        self._prepare(cost_expr)
+        start = time.perf_counter()
+        results = self._solve_restarts(range(_SEED, _SEED + restarts))
+        wall_s = time.perf_counter() - start
+        results.sort(key=lambda r: (r.score, r.seed))
+        self._install(results[0])
+        self._record_restarts(results, wall_s)
+
+        self._log_tilings()
+        self._write_back()
+        return list(self._bufs)
+
+    def _n_decisions(self) -> int:
+        """The buffers that carry a division decision, which the step budget
+        is per. Per decision, not per slot: a relayout copy carries no division
+        decision (which one an edge reads is the divisions' call), and a graph
+        can carry thousands."""
+        return sum(not isinstance(b, RelayoutCopyBuffer) for b in self._bufs)
+
+    # -- restarts ------------------------------------------------------------
+
+    def _prepare(self, cost_expr: Optional[sympy.Expr]) -> None:
+        """Everything up to the anneal, shared by every restart: the step
+        budget, the objective, the static topology, and the seed state (every
+        op at its committed division, ``pi`` from FirstFit), kept as
+        :attr:`_seed_state`."""
+        self._steps = _step_budget(self._n_decisions())
         self._score_fn = self._build_score_fn(cost_expr)
         if self._score_fn is None:
             logger.info(
                 "no usable cost expression; falling back to the memory-only objective"
             )
-
-        self._rng = rnd.Random(_SEED)
         self._precompute_topology()
-
-        # Seed: every op at its committed division; pi from FirstFit.
         self.chosen = self._seed_configs()
         self.packer = self._build_seed_packer()
+        self._flippable_ops = self._flippable()
+        self._seed_state = self._snapshot()
 
-        self._anneal()
-        self._log_tilings()
-        self._write_back()
-        return list(self._bufs)
+    def _solve_restarts(self, seeds: Iterable[int]) -> list[_RestartResult]:
+        """One restart per seed, in sequence, in seed order."""
+        return [self._run_restart(seed) for seed in seeds]
+
+    def _run_restart(self, seed: int) -> _RestartResult:
+        """One anneal from the seed state with ``seed``, returning its best-seen
+        state. Leaves the live state wherever the anneal ended."""
+        self._begin_restart(seed)
+        steps = self._anneal()
+        return _RestartResult(seed, self._best_score, steps, self._best_snap)
+
+    def _begin_restart(self, seed: int) -> None:
+        """Put the solver where an anneal starts: a fresh copy of the seed
+        state, a ``Random(seed)``, and best-seen at the seed state. Nothing
+        before the anneal draws from the RNG, so creating it here rather than
+        before :meth:`_prepare` changes no trajectory."""
+        self._adopt(self._copy_snapshot(self._seed_state))
+        self._rng = rnd.Random(seed)
+        self._best_score = self._score()
+        self._best_snap = self._snapshot()
+
+    def _install(self, result: _RestartResult) -> None:
+        """Make ``result`` the live state and publish its score. The engine
+        must not mutate the state after this: ``best_score`` describes it, and
+        the write-back reads it."""
+        self.best_score = result.score
+        self._adopt(result.snapshot)
+
+    def _record_restarts(self, results: list[_RestartResult], wall_s: float) -> None:
+        """Fill :attr:`last_solve_stats` from ``results`` (sorted, winner
+        first) and log the solve."""
+        ns = _fixed_to_ns
+        winner = results[0]
+        self.last_solve_stats = {
+            "restarts": [
+                {"seed": r.seed, "score_ns": ns(r.score), "steps": r.steps}
+                for r in results
+            ],
+            "winner_seed": winner.seed,
+            "steps_per_restart": self._steps,
+            "workers": 1,
+            "wall_s": wall_s,
+        }
+        for r in sorted(results, key=lambda r: r.seed):
+            logger.debug(
+                "SA co-optimizer restart seed %d: %.1f ns after %d steps",
+                r.seed,
+                ns(r.score),
+                r.steps,
+            )
+        logger.info(
+            "SA co-optimizer: best of %d restart(s) is seed %d at %.1f ns "
+            "(spread %.1f ns) in %.2f s",
+            len(results),
+            winner.seed,
+            ns(winner.score),
+            ns(results[-1].score - winner.score),
+            wall_s,
+        )
 
     def _build_score_fn(self, cost_expr: Optional[sympy.Expr]):
         """Compile ``cost_expr`` into a ``(chosen, resident) -> fixed-point ns``
@@ -1852,7 +1992,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def score_ns(self) -> Optional[float]:
         if not self._bufs:
             return None
-        return self._score() * 1000.0 / utils.US_FIXED_POINT_SCALE
+        return _fixed_to_ns(self._score())
 
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
@@ -2394,6 +2534,21 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             set(self._eligible_copies),
         )
 
+    @staticmethod
+    def _copy_snapshot(snap: _Snapshot) -> _Snapshot:
+        """An independent copy of ``snap``, as :meth:`_snapshot` copies the live
+        state, so ``snap`` survives adopting the copy. Every mutable part is
+        copied; ``DivisionConfig`` is frozen, so the list's entries are shared."""
+        packer, chosen, n_eligible, eligible_mask, relayout_on, eligible_copies = snap
+        return (
+            packer.copy(),
+            list(chosen),
+            n_eligible,
+            bytearray(eligible_mask),
+            set(relayout_on),
+            set(eligible_copies),
+        )
+
     def _adopt(self, snap: _Snapshot) -> None:
         """Install ``snap`` as the live state by *taking ownership* of it -- no
         copy, so the engine goes on mutating those objects and the caller must
@@ -2605,29 +2760,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._adopt(snap)  # this step's snapshot dies here
         return cur
 
-    def _anneal(self) -> None:
+    def _anneal(self) -> int:
         """One geometric cool over the clamped step budget, at fixed proposal
-        weights, publishing the best state seen."""
-        # Per decision, not per slot: a relayout copy carries no division
-        # decision (which one an edge reads is the divisions' call), and a graph
-        # can carry thousands.
-        n = sum(not isinstance(b, RelayoutCopyBuffer) for b in self._bufs)
-        steps = _step_budget(n)
-        if steps < _STEPS_PER_BUFFER * n:
-            logger.debug(
-                "SA co-optimizer step budget clamped to %d for %d buffers (%d "
-                "steps/buffer would ask for %d); layout quality is traded for "
-                "bounded compile time.",
-                _MAX_STEPS,
-                n,
-                _STEPS_PER_BUFFER,
-                _STEPS_PER_BUFFER * n,
-            )
-        self._flippable_ops = self._flippable()
-
-        cur = self._score()
-        self._best_score = cur
-        self._best_snap = self._snapshot()
+        weights, from the state :meth:`_begin_restart` set up; the best state
+        seen ends up in ``_best_score`` / ``_best_snap``. Returns the number of
+        steps run."""
+        steps = self._steps
+        cur = self._best_score
+        run = 0
 
         if self._applicable_moves():
             t0 = self._calibrate_temperature()
@@ -2641,11 +2781,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                     break
                 frac = step / (steps - 1) if steps > 1 else 1.0
                 cur = self._step(move, t0 * (t_end / t0) ** frac, cur)
-
-        self.best_score = self._best_score
-        # Adopting is safe only because nothing mutates the state after this: the
-        # engine must not go on rewriting the layout that ``best_score`` describes.
-        self._adopt(self._best_snap)
+                run += 1
+        return run
 
     # -- write-back ----------------------------------------------------------
 

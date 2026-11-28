@@ -459,7 +459,8 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 # joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
 # solvers, co-optimization instead requires wrapping them in
 # ExhaustiveSearchSolver -- see ``allow_exhaustive_search`` below, which gates
-# that wrapping.
+# that wrapping. The joint "simulated_annealing" solver's search effort is set
+# by ``sa_coopt_restarts`` and ``sa_coopt_steps_per_buffer`` below.
 
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
@@ -483,6 +484,19 @@ allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") =
 # the limit.
 cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
+)
+
+# Independent SA co-optimizer anneals per solve (layout_solver
+# "simulated_annealing" with co_optimizing_lx_planning). Each starts from the
+# same seed state with seed sa_cooptimizer._SEED + k; the lowest-energy plan
+# wins, ties to the lowest seed, so the result is still reproducible. Must be
+# at least 1. (#4857)
+sa_coopt_restarts: int = int(os.environ.get("SPYRE_SA_COOPT_RESTARTS", "1"))
+
+# Anneal steps per buffer that carries a division decision, per restart; capped
+# by sa_cooptimizer._MAX_STEPS. Must be at least 1.
+sa_coopt_steps_per_buffer: int = int(
+    os.environ.get("SPYRE_SA_COOPT_STEPS_PER_BUFFER", "200")
 )
 
 

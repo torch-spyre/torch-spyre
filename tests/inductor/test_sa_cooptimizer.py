@@ -145,17 +145,14 @@ def _all_cases_incl_synthetic():
 
 def _primed(buffers, capacity):
     """A solver primed to the seed state (seed configs, FirstFit ``pi``): the
-    prefix of ``plan_layout_and_core_divisions`` up to the anneal, so a unit test
-    can drive the move / snapshot machinery -- or read the seed score -- directly.
+    prefix of ``plan_layout_and_core_divisions`` up to the first restart's
+    anneal, through the solver's own ``_prepare`` and ``_begin_restart`` so it
+    cannot drift from them, so a unit test can drive the move / snapshot
+    machinery -- or read the seed score -- directly.
     """
     solver = SaCoOptimizingSolver(buffers, capacity, 128)
-    solver._rng = rnd.Random(0)
-    solver._precompute_topology()
-    solver.chosen = solver._seed_configs()
-    solver.packer = solver._build_seed_packer()
-    solver._flippable_ops = solver._flippable()
-    solver._best_score = solver._score()
-    solver._best_snap = solver._snapshot()
+    solver._prepare(None)
+    solver._begin_restart(0)
     return solver
 
 
@@ -366,6 +363,20 @@ class BaselineGuaranteeTest(TestCase):
                     solver._score(), solver.best_score, f"{case}[{gi}] cap={cap}"
                 )
 
+    @ts_config.patch(sa_coopt_restarts=3)
+    def test_never_worse_than_baseline_with_restarts(self):
+        """Every restart starts from the seed state, so the best of them is no
+        worse than it either -- and the winner installed is the state scored."""
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for cap in _capacities(buffers):
+                tag = f"{case}[{gi}] cap={cap}"
+                solver = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128)
+                solver.plan_layout_and_core_divisions()
+                self.assertLessEqual(
+                    solver.best_score, _baseline_score(buffers, cap), tag
+                )
+                self.assertEqual(solver._score(), solver.best_score, tag)
+
 
 class SeedPermutationTest(TestCase):
     """``pi`` is *ordered* over the buffers that can ever be resident.
@@ -544,6 +555,172 @@ class GoldenSolveTest(TestCase):
                 expected,
                 f"{case} cap=1/{fraction}",
             )
+
+
+def _synth_cost_expr(buffers):
+    """A deterministic cost expression over every buffer's residency symbol and
+    every split symbol, with distinct integer coefficients. Under it the seeds
+    disagree on far more graphs than under the memory-only objective, where
+    most graphs have one optimum that every seed reaches."""
+    expr = 0
+    for i, b in enumerate(buffers):
+        expr += (7 * i + 11) * 1000 * (1 - b.sym_is_lx)
+        for j, sym in enumerate(b.sym_core_divs.values()):
+            expr += (3 * j + 5) * 100 * sym
+    return expr
+
+
+def _solved_view(solver, out):
+    """Everything a solve writes back, plus its score."""
+    return (
+        solver.best_score,
+        [
+            (
+                b.name,
+                b.chosen_division,
+                b.address,
+                b.spill_reason,
+                len(b.core_divisions),
+            )
+            for b in out
+        ],
+    )
+
+
+def _solve_cost(buffers, cap):
+    """Solve a copy of ``buffers`` under :func:`_synth_cost_expr`; returns the
+    solver and :func:`_solved_view`."""
+    solver = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128)
+    out = solver.plan_layout_and_core_divisions(_synth_cost_expr(solver._bufs))
+    return solver, _solved_view(solver, out)
+
+
+class MultiStartDecompositionTest(TestCase):
+    """Restart k of a multi-start solve is exactly a one-restart solve with
+    ``_SEED = k``, and the solve keeps the lowest ``(score, seed)``.
+
+    This is the invariant the restarts rest on. It fails if restoring the seed
+    state leaks one restart's state into the next, if a memo cache the restarts
+    share returns a value that depends on which restart filled it, or if a
+    restart other than the winner writes anything back."""
+
+    _N = 3
+
+    def test_restarts_decompose_into_single_seed_solves(self):
+        compared = moved = 0
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for cap in _capacities(buffers):
+                tag = f"{case}[{gi}] cap={cap}"
+                singles = []
+                for seed in range(self._N):
+                    with mock.patch.object(sa_module, "_SEED", seed):
+                        singles.append((_solve_cost(buffers, cap)[1], seed))
+                expected, expected_seed = min(singles, key=lambda s: (s[0][0], s[1]))
+                with ts_config.patch(sa_coopt_restarts=self._N):
+                    solver, got = _solve_cost(buffers, cap)
+                self.assertEqual(got, expected, tag)
+                self.assertEqual(
+                    solver.last_solve_stats["winner_seed"], expected_seed, tag
+                )
+                self.assertEqual(
+                    sorted(
+                        (r["seed"], r["score_ns"])
+                        for r in solver.last_solve_stats["restarts"]
+                    ),
+                    [(seed, sa_module._fixed_to_ns(view[0])) for view, seed in singles],
+                    tag,
+                )
+                compared += 1
+                moved += expected_seed != 0
+        # Vacuous unless some graph's winner is not the base seed.
+        self.assertGreater(compared, 0)
+        self.assertGreater(moved, 0, "no graph where a later seed won")
+
+
+class MultiStartTieBreakTest(TestCase):
+    """Equal scores go to the lowest seed, whatever order the restarts come
+    back in."""
+
+    def test_ties_go_to_the_lowest_seed(self):
+        checked = 0
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            # Unbounded capacity under the memory-only objective: every
+            # eligible buffer is resident, so every restart scores the same.
+            single = SaCoOptimizingSolver(copy.deepcopy(buffers), 1 << 30, 128)
+            want = _solved_view(single, single.plan_layout_and_core_divisions())
+
+            solver = SaCoOptimizingSolver(copy.deepcopy(buffers), 1 << 30, 128)
+            in_order = solver._solve_restarts
+            with (
+                ts_config.patch(sa_coopt_restarts=3),
+                mock.patch.object(
+                    solver,
+                    "_solve_restarts",
+                    lambda seeds: in_order(seeds)[::-1],
+                ),
+            ):
+                got = _solved_view(solver, solver.plan_layout_and_core_divisions())
+            tag = f"{case}[{gi}]"
+            scores = {r["score_ns"] for r in solver.last_solve_stats["restarts"]}
+            self.assertEqual(len(scores), 1, f"{tag}: the restarts do not tie")
+            self.assertEqual(
+                solver.last_solve_stats["winner_seed"], sa_module._SEED, tag
+            )
+            self.assertEqual(got, want, tag)
+            checked += 1
+        self.assertGreater(checked, 0)
+
+
+class MultiStartStatsTest(TestCase):
+    """``last_solve_stats`` describes every restart, winner first."""
+
+    @ts_config.patch(sa_coopt_restarts=3)
+    def test_stats_rank_every_restart(self):
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for cap in _capacities(buffers):
+                tag = f"{case}[{gi}] cap={cap}"
+                solver, _ = _solve_cost(buffers, cap)
+                stats = solver.last_solve_stats
+                ranked = [(r["score_ns"], r["seed"]) for r in stats["restarts"]]
+                self.assertEqual(len(ranked), 3, tag)
+                self.assertEqual(ranked, sorted(ranked), tag)
+                self.assertEqual(
+                    sorted(seed for _, seed in ranked),
+                    [sa_module._SEED + k for k in range(3)],
+                    tag,
+                )
+                self.assertEqual(stats["restarts"][0]["score_ns"], solver.score_ns())
+                self.assertEqual(stats["winner_seed"], ranked[0][1], tag)
+                budget = _step_budget(solver._n_decisions())
+                self.assertEqual(stats["steps_per_restart"], budget, tag)
+                self.assertTrue(
+                    all(0 <= r["steps"] <= budget for r in stats["restarts"]), tag
+                )
+                self.assertEqual(stats["workers"], 1, tag)
+                self.assertGreaterEqual(stats["wall_s"], 0.0, tag)
+
+    def test_an_empty_solve_records_nothing(self):
+        solver = SaCoOptimizingSolver([], 1024, 128)
+        self.assertEqual(solver.plan_layout_and_core_divisions(), [])
+        self.assertEqual(solver.last_solve_stats, {})
+
+
+class SearchConfigValidationTest(TestCase):
+    """The two search knobs must be at least 1, and are checked when the
+    solver runs, so a ``config.patch`` value is checked too."""
+
+    def test_non_positive_knobs_are_rejected(self):
+        buffers = _chain()
+        for knob in ("sa_coopt_restarts", "sa_coopt_steps_per_buffer"):
+            for value in (0, -1):
+                with (
+                    self.subTest(knob=knob, value=value),
+                    ts_config.patch({knob: value}),
+                    self.assertRaisesRegex(ValueError, knob),
+                ):
+                    SaCoOptimizingSolver(
+                        copy.deepcopy(buffers), 1 << 30, 128
+                    ).plan_layout_and_core_divisions()
 
 
 class ImprovementSmokeTest(TestCase):
@@ -780,6 +957,17 @@ class StepBudgetTest(TestCase):
         self.assertEqual(_step_budget(250), 50_000)
         self.assertEqual(_step_budget(251), 50_000)
 
+    @ts_config.patch(sa_coopt_steps_per_buffer=300)
+    def test_rate_comes_from_config(self):
+        self.assertEqual(_step_budget(1), 300)
+        self.assertEqual(_step_budget(166), 49_800)
+        self.assertEqual(_step_budget(167), 50_000)
+
+    def test_clamp_is_logged(self):
+        with self.assertLogs(sa_module.logger, "DEBUG") as logs:
+            _step_budget(251)
+        self.assertIn("clamped to 50000", "\n".join(logs.output))
+
     def test_ceiling_is_higher_than_the_layout_only_annealer(self):
         """The joint engine searches divisions too, so it wants a larger budget
         at the same buffer count (and must not silently inherit the smaller one).
@@ -952,6 +1140,7 @@ print("RESULT " + json.dumps({{
     "chosen": [b.chosen_division for b in out],
     "addr": [b.address for b in out],
     "best": s.best_score,
+    "restarts": s.last_solve_stats["restarts"],
 }}))
 """
 
@@ -960,9 +1149,15 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 _HELPER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _solve_with_hashseed(hs, case="sdpa"):
-    """Solve ``case`` in a subprocess with ``PYTHONHASHSEED=hs``."""
-    env = dict(os.environ, PYTHONHASHSEED=str(hs), TORCH_DEVICE_BACKEND_AUTOLOAD="0")
+def _solve_with_hashseed(hs, case="sdpa", restarts=1):
+    """Solve ``case`` in a subprocess with ``PYTHONHASHSEED=hs`` and
+    ``restarts`` restarts, set through the environment variable."""
+    env = dict(
+        os.environ,
+        PYTHONHASHSEED=str(hs),
+        TORCH_DEVICE_BACKEND_AUTOLOAD="0",
+        SPYRE_SA_COOPT_RESTARTS=str(restarts),
+    )
     proc = subprocess.run(
         [
             sys.executable,
@@ -995,6 +1190,19 @@ class CrossProcessDeterminismTest(TestCase):
             for hs in (1, 2):
                 self.assertEqual(
                     _solve_with_hashseed(hs, case), base, f"{case} PYTHONHASHSEED={hs}"
+                )
+
+    def test_pythonhashseed_independent_with_restarts(self):
+        """The same with three restarts: the winner, and every restart's score,
+        are independent of the hash seed too."""
+        for case in ("sdpa", "big_chain"):
+            base = _solve_with_hashseed(0, case, restarts=3)
+            self.assertEqual(len(base["restarts"]), 3, case)
+            for hs in (1, 2):
+                self.assertEqual(
+                    _solve_with_hashseed(hs, case, restarts=3),
+                    base,
+                    f"{case} PYTHONHASHSEED={hs} restarts=3",
                 )
 
 
