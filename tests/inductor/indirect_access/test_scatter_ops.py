@@ -273,9 +273,14 @@ class TestIndexFillEagerCompile:
         )
 
     def test_index_fill_dim1_float16(self, execution_mode):
-        """index_fill_ on dim=1 with float16; fills columns [1, 3] with -1.0."""
+        """index_fill_ on dim=1 with float16; fills columns [1, 3] with -1.0.
+
+        Compiled: the re-tile (#4399) now succeeds, and the copy-back restickify,
+        written into a mutation target, is rejected by insert_restickify_padding
+        (#6163).
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4414
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -284,9 +289,9 @@ class TestIndexFillEagerCompile:
                 r"Could not run 'aten::index_fill_.int_Scalar'",
             ),
             compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+                6163,
+                "compile index_fill_ on an fp16 dest [8, 16] at dim=1: insert_restickify_padding cannot pad the copy-back restickify written into a slice of another buffer.",
+                r"insert_restickify_padding: restickify written into a slice of another buffer",
             ),
         )
         x = cached_randn((8, 16), differentiation="ifill_f16_02", dtype=torch.float16)
@@ -301,9 +306,14 @@ class TestIndexFillEagerCompile:
         )
 
     def test_index_fill_1d_dest_length_8(self, execution_mode):
-        """index_fill_ 1-D dest length 8 — compile leftover (#4399)."""
+        """index_fill_ 1-D dest length 8.
+
+        Compiled: the re-tile (#4399) now succeeds, and the copy-back restickify,
+        written into a mutation target, is rejected by insert_restickify_padding
+        (#6163).
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4414
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -312,9 +322,9 @@ class TestIndexFillEagerCompile:
                 r"Could not run 'aten::index_fill_.int_Scalar'",
             ),
             compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+                6163,
+                "compile index_fill_ on a 1-D fp16 dest [8]: insert_restickify_padding cannot pad the copy-back restickify written into a slice of another buffer.",
+                r"insert_restickify_padding: restickify written into a slice of another buffer",
             ),
         )
         x = torch.zeros(8, dtype=torch.float16)
@@ -590,10 +600,15 @@ class TestScatterRouterMaps:
 
     @gap_one_core
     def test_scatter_llama4_router_k1(self, execution_mode):
-        """torch.scatter dim=1 K=1 into -inf dest (192, 128) — Llama 4 router (#4403)."""
+        """torch.scatter dim=1 K=1 into -inf dest (192, 128) — Llama 4 router (#4403).
+
+        Compiled: the re-tile (#4399) now succeeds, and the copy-back restickify,
+        written into a mutation target, is rejected by insert_restickify_padding
+        (#6163).
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4404
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -602,9 +617,9 @@ class TestScatterRouterMaps:
                 r"Could not run 'aten::scatter.src_out'",
             ),
             compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+                6163,
+                "compile torch.scatter dim=1 K=1 on an fp16 dest (192, 128): insert_restickify_padding cannot pad the copy-back restickify written into a slice of another buffer.",
+                r"insert_restickify_padding: restickify written into a slice of another buffer",
             ),
         )
         T, E, K = 192, 128, 1
@@ -625,10 +640,15 @@ class TestScatterRouterMaps:
 
     @gap_one_core
     def test_scatter_qwen3_router_k8(self, execution_mode):
-        """torch.scatter dim=1 K=8 into zeros dest (192, 128) — Qwen3 MoE router (#4403)."""
+        """torch.scatter dim=1 K=8 into zeros dest (192, 128) — Qwen3 MoE router (#4403).
+
+        Compiled: the re-tile (#4399) now succeeds, and the copy-back restickify,
+        written into a mutation target, is rejected by insert_restickify_padding
+        (#6163).
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4404
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -637,9 +657,9 @@ class TestScatterRouterMaps:
                 r"Could not run 'aten::scatter.src_out'",
             ),
             compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+                6163,
+                "compile torch.scatter dim=1 K=8 on an fp16 dest (192, 128): insert_restickify_padding cannot pad the copy-back restickify written into a slice of another buffer.",
+                r"insert_restickify_padding: restickify written into a slice of another buffer",
             ),
         )
         T, E, K = 192, 128, 8
@@ -740,12 +760,14 @@ class TestScatter1DDestRestickify:
     def test_scatter_1d_dest_length_5_fp32(self, execution_mode):
         """scatter_ dest length 5 fp32 — leftover extra (#4474 Python).
 
-        Eager is aten::scatter.src_out (#1002). Compiled this log was
-        normalize_coordinates offset==0 (#4399), not the filed #4474
-        insert_restickify_padding string.
+        Eager is aten::scatter.src_out (#1002). Compiled: the indexed coordinate
+        is the stick, so the dest is re-tiled to one entry per stick (the #4399
+        re-tile rejection no longer applies to this case) and the copy-back
+        restickify, written into a mutation target, is rejected by
+        insert_restickify_padding (#6163).
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -754,9 +776,9 @@ class TestScatter1DDestRestickify:
                 r"Could not run 'aten::scatter.src_out'",
             ),
             compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+                6163,
+                "compile scatter_ on a 1-D fp32 dest [5]: insert_restickify_padding cannot pad the copy-back restickify written into a slice of another buffer.",
+                r"insert_restickify_padding: restickify written into a slice of another buffer",
             ),
         )
         x = torch.zeros(5, dtype=torch.float32)
@@ -772,9 +794,15 @@ class TestScatter1DDestRestickify:
 
     @gap_one_core
     def test_scatter_1d_dest_length_64(self, execution_mode, patch_sencores):
-        """scatter_ dest [64] fp16 — compile assert offset == 0 (#4399)."""
+        """scatter_ dest [64] fp16.
+
+        Compiled: the re-tile (#4399) now succeeds and the compile fails later with
+        KeyError tmp0 (#4637), the same error as scatter_reduce sum dim=1 fp16.
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4637
+        # A KeyError is a bug, not a deliberate rejection, so this is a strict
+        # xfail (a plain spec), not a rejection(...) assertion.
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -782,10 +810,10 @@ class TestScatter1DDestRestickify:
                 "aten::scatter.src_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.src_out'",
             ),
-            compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+            compiled=(
+                4637,
+                "compile scatter_ on a 1-D fp16 dest [64]: InductorError KeyError tmp0.",
+                r"KeyError: tmp0",
             ),
         )
         x = torch.zeros(64, dtype=torch.float16)
@@ -960,18 +988,20 @@ class TestScatterReduceTwoColliding:
         """scatter_reduce sum dim=1 fp16 dest (4, 64) src (4, 32).
 
         Eager is aten::scatter_reduce.two_out (#4361). Compiled is KeyError tmp0 (#4637),
-        not #4346 (indirect_sizes {}) and not #4354 (ranges_from_index_vars).
+        not #4346 (indirect_sizes {}) and not #4354 (ranges_from_index_vars). The
+        re-tile rejection (#4399) no longer applies to this case.
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4361
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4637
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # A KeyError is a bug, not a deliberate rejection, so this is a strict
+        # xfail (a plain spec), not a rejection(...) assertion.
         _xfail_existing(
             execution_mode,
             eager=_SR_TWO,
-            compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+            compiled=(
+                4637,
+                "compile scatter_reduce sum dim=1 on an fp16 dest (4, 64): InductorError KeyError tmp0.",
+                r"KeyError: tmp0",
             ),
         )
         dst = (
@@ -996,17 +1026,22 @@ class TestScatterReduceTwoColliding:
         )
 
     def test_scatter_reduce_sum_dim1_fp32(self, execution_mode):
-        """scatter_reduce sum dim=1 fp32 — ReStickifyOpHBM leftover (#1796)."""
+        """scatter_reduce sum dim=1 fp32 — ReStickifyOpHBM leftover (#1796).
+
+        Compiled: the re-tile (#4399) now succeeds, and the copy-back restickify,
+        written into a mutation target, is rejected by insert_restickify_padding
+        (#6163).
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4361
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1796
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
         _xfail_existing(
             execution_mode,
             eager=_SR_TWO,
             compiled=rejection(
-                4399,
-                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
-                r"cannot re-tile \S+: no size-1 stick target",
+                6163,
+                "compile scatter_reduce sum dim=1 on an fp32 dest (4, 64): insert_restickify_padding cannot pad the copy-back restickify written into a slice of another buffer.",
+                r"insert_restickify_padding: restickify written into a slice of another buffer",
             ),
         )
         dst = cached_randn((4, 64), differentiation="sr_f32", dtype=torch.float32)

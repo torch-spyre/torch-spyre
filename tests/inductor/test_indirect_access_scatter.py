@@ -980,6 +980,38 @@ class _ScatterScenarios:
             kernel, *self._flat_view_operands(N=8, P=4, dtype=torch.float16)
         )
 
+    @expects_raise
+    def test_scatter_1d_fp32_below_one_stick_unsupported(self):
+        """out.scatter_(0, index, src) on a 1-D fp32 tensor of 5 elements.
+
+        The indexed coordinate is the stick, so the destination is re-tiled to
+        one entry per stick (copy-in, scatter, copy-back). The re-tile needs the
+        scattered dim's size, which the op alone cannot supply, so
+        nonstick_dim_order passes it in; without it the compile fails earlier
+        with 'cannot re-tile: no size-1 stick target'.
+
+        The copy-back is a restickify written into a mutation target, which
+        insert_restickify_padding cannot pad, so the compile is rejected there.
+        """
+        x = torch.zeros(5, dtype=torch.float32).to("spyre")
+        index = torch.tensor([1, 3], dtype=torch.int64).to("spyre")
+        src = torch.tensor([100.0, 200.0], dtype=torch.float32).to("spyre")
+
+        def kernel(d, i, s):
+            out = d.clone()
+            out.scatter_(0, i, s)
+            return out
+
+        # TODO(#6163): the copy-back restickify cannot be padded in place. Once
+        # insert_restickify_padding restickifies into a fresh stick-multiple
+        # buffer and copies it into the target, turn this into a positive test
+        # that compares with the CPU result via _assert_compiled_matches_cpu.
+        with pytest.raises(
+            InductorError,
+            match="restickify written into a slice of another buffer",
+        ):
+            torch.compile(kernel, dynamic=False)(x, index, src)
+
     def test_scatter_through_bias_view_e2e(self):
         """A 4-D fp32 attention bias viewed as [B, S*S].
 
