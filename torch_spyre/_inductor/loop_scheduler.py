@@ -198,6 +198,11 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
         # read_writes.reads and set_read_writes rebuilds unmet_dependencies
         # from them, so the internal reads must leave read_writes too.
         self.set_read_writes(self._external(self.read_writes))
+        # A loop whose trip count is read on the device reads its count buffer
+        # itself (no body op does): a fake dependency, so it survives a rebuild
+        # from the children. Skipped by add_fake_dep when the loop writes it.
+        if loop_node.count_source is not None:
+            self.add_fake_dep(dependencies.StarDep(loop_node.count_source.buffer))
         self.outputs_by_name = {buf.get_name(): buf for buf in self.get_outputs()}
         self.group = max(self.snodes, key=lambda x: int(x.is_reduction())).group
         for buf in self.get_outputs():

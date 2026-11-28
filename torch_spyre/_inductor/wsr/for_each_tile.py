@@ -700,6 +700,7 @@ def for_each_tile(
     out_dim=None,
     out=None,
     reverse: bool = False,
+    active_count=None,
 ):
     """Run `body` once per tile over a co-indexed tiling of `operands`.
 
@@ -746,6 +747,16 @@ def for_each_tile(
             supported in a decomposition (see the tracing contract). ``None``
             (the default) returns a new output tensor instead.
         reverse: visit tiles high to low. The output still lands in natural order.
+        active_count: a device tensor whose first value (FP32, a whole number)
+            is how many tiles actually run, read on the device right before the
+            loop: on Spyre the loop stops after that many trips (at least one,
+            at most the static trip count). The loop is still written for the
+            static trip count, which is what runs on CPU, so trips past the
+            count must be harmless there (a pad row read, a sink row written).
+            Needs a static trip count and ``reverse=False``. The count must be
+            written on the device in the same kernel as the loop: a count passed
+            straight from the host is a kernel input, which is not supported yet,
+            so compute it with one device op (``active_count=cnt.abs()``).
 
     Returns:
         ``(final_carry, out)``, either of which is ``None`` for the unused mode.
@@ -792,6 +803,37 @@ def for_each_tile(
         raise ValueError("for_each_tile() requires at least one tile")
     if not isinstance(reverse, bool):
         raise TypeError("for_each_tile() reverse must be a bool")
+    if active_count is not None:
+        if not isinstance(active_count, torch.Tensor):
+            raise TypeError("for_each_tile() active_count must be a tensor")
+        if active_count.dtype != torch.float32:
+            raise TypeError(
+                "for_each_tile() active_count must be float32 (the device reads "
+                f"one FP32 value), got {active_count.dtype}"
+            )
+        if active_count.device != operands[0].device:
+            raise ValueError(
+                "for_each_tile() active_count must be on the operands' device "
+                f"({operands[0].device}), got {active_count.device}"
+            )
+        if any(
+            o is active_count and s.kind is not Kind.INVARIANT
+            for o, s in zip(operands, specs)
+        ):
+            raise ValueError(
+                "for_each_tile() active_count is also an operand this loop tiles; "
+                "the count must be read whole, not one tile per trip"
+            )
+        if reverse:
+            raise ValueError(
+                "for_each_tile() active_count runs the first tiles only, which "
+                "reverse=True would not"
+            )
+        if not isinstance(num_tiles, int):
+            raise ValueError(
+                "for_each_tile() active_count needs a static trip count, got "
+                f"{num_tiles}"
+            )
     if init is not None and (
         not tree_leaves(init)
         or any(not isinstance(t, torch.Tensor) for t in tree_leaves(init))
@@ -917,11 +959,15 @@ def for_each_tile(
             else _tile(whole.get(i, o), s, next(it))
             for i, (o, s) in enumerate(zip(operands, specs))
         )
+        if active_count is not None:
+            # The count is lifted last; the marker ties it to this loop.
+            torch.ops.spyre.active_count_marker(lifted[-1], num_tiles)
         next_carry, y = body(carry, tiles)
         if out_spec is not None:
-            _write_out_tiles(
-                out_spec, lifted[len(lifted_idx) :], y, sliced[out_index_leaf]
-            )
+            out_leaves = lifted[
+                len(lifted_idx) : len(lifted_idx) + len(out_spec.leaves)
+            ]
+            _write_out_tiles(out_spec, out_leaves, y, sliced[out_index_leaf])
         if map_mode:
             next_carry = step + 1 if pad is None else (step + 1, pad + 1)
         elif count_mode:
@@ -932,6 +978,8 @@ def for_each_tile(
     lifted = [operands[i] for i in lifted_idx]
     if out_spec is not None:
         lifted += out_spec.leaves
+    if active_count is not None:
+        lifted.append(active_count)
     if in_decomposition:
         # Reached from an AOT decomposition: trace the HOP without Dynamo.
         final_carry, ys = _scan_in_make_fx(combine_fn, scan_init, xs, lifted, reverse)

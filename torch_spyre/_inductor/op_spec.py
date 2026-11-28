@@ -488,7 +488,8 @@ class CountSource:
     The count stays in device memory, so the host never needs to see it. It is
     an FP32 value holding a whole number of trips. Only a count stored in the
     bundle's pool is supported for now, as the first value of a stick, typically
-    written by an earlier op in the same bundle.
+    written by an earlier op in the same bundle. The code that builds a
+    CountSource checks that stick alignment from the count buffer's layout.
 
     Plain integers only, so the record survives the generated-code round trip.
 
@@ -497,11 +498,19 @@ class CountSource:
         max_value: Largest count that can be read. The loop is planned for this
             many trips, so it equals the owning ``LoopSpec.count``.
         granularity: A number the count is always a multiple of.
+        outer_strides: Bytes the count moves per trip of each enclosing loop,
+            outermost first, one per enclosing loop. Empty reads one count for
+            every trip (as in decode). Prefill's expert loop over its tile loop
+            is ``(128,)``: one stick per expert, ``pool_offset + 128 * e``.
+            Under a chunk loop as well, ``(E * 128, 128)`` reads chunk b,
+            expert e at ``pool_offset + E*128 * b + 128 * e``. A 0 keeps the
+            count fixed across that loop.
     """
 
     pool_offset: int
     max_value: int
     granularity: int = 1
+    outer_strides: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass

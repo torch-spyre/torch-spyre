@@ -1982,6 +1982,43 @@ def lower_tile_dim_marker(x, dim):
     return pw
 
 
+@register_spyre_lowering(
+    torch.ops.spyre.active_count_marker,
+    type_promotion_kind=None,
+    # Registered globally for the same reason as tile_dim_marker above.
+    lowering_dict=lowering.lowerings,
+)
+def lower_active_count_marker(count, max_value):
+    # A one-element op that reads the count's first value, so the read (buffer
+    # and index over the enclosing loop variables) survives the splice like any
+    # other. splice_while_loops records it on the loop and removes the op.
+    if not isinstance(sympy.sympify(max_value), sympy.Integer):
+        # for_each_tile's own check sees a plain int under Dynamo; a loop over a
+        # declared dynamic dimension shows its symbolic trip count only here.
+        raise Unsupported(
+            "for_each_tile() active_count needs a static trip count, got "
+            f"{max_value} (the loop walks a declared dynamic dimension)"
+        )
+    count.realize()
+    loader = count.make_loader()
+    first = [sympy.Integer(0)] * len(count.get_size())
+
+    def inner_fn(index):
+        return loader(first)
+
+    pw = Pointwise.create(
+        device=count.get_device(),
+        dtype=count.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[1],
+        origin_node=V.get_current_node(),
+        traceback=count.get_traceback(),
+    )
+    pw.realize()
+    pw.data.data.active_count_max = int(max_value)
+    return pw
+
+
 @register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
 def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"

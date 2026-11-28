@@ -20,6 +20,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import sympy
+import torch
 
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
@@ -40,6 +41,8 @@ from torch_spyre._inductor.pass_utils import decompose_tiled_count
 
 logger = get_inductor_logger("sdsc_compile")
 sdsc_log = get_inductor_logger("sdsc")
+
+_COUNT_BYTES = torch.float32.itemsize  # a device-read count is one FP32 value
 
 # ---------------------------------------------------------------------------
 # Types
@@ -243,7 +246,8 @@ def generate_bundle(
     # needed across the whole tree.
     loop_bounds: list[sympy.Expr] = []
     loop_sources: list[CountSource | None] = []
-    _collect_loop_bounds(specs_list, loop_bounds, loop_sources)
+    loop_parents: list[int | None] = []
+    _collect_loop_bounds(specs_list, loop_bounds, loop_sources, loop_parents)
 
     # Affine map deduplication: stride_key -> map index (0-based).
     # A stride_key is a tuple of stride values in outermost-first level order.
@@ -262,6 +266,23 @@ def generate_bundle(
     _collect_affine_maps(
         specs_list, iter(compiled), [], affine_map_index, affine_map_loop_var_indices
     )
+
+    # A count that moves with its enclosing loops is one more affine access, so
+    # its stride key joins the tensors' map table and its #map is written with
+    # theirs at the top of the module. As for a tensor, a loop it does not move
+    # with (stride 0) is left out of the map; ``moving`` keeps the positions of
+    # the ones it does move with, outermost first.
+    count_maps: list[tuple[str, tuple[int, ...]] | None] = []
+    for src in loop_sources:
+        strides = src.outer_strides if src is not None else ()
+        moving = tuple(level for level, stride in enumerate(strides) if stride)
+        if not moving:
+            count_maps.append(None)
+            continue
+        count_key = tuple(strides[level] for level in moving)
+        if count_key not in affine_map_index:
+            affine_map_index[count_key] = len(affine_map_index)
+        count_maps.append((f"#map_{affine_map_index[count_key]}", moving))
 
     compiled_iter = iter(compiled)
     addr_counter = [0]
@@ -292,6 +313,7 @@ def generate_bundle(
             "a device-read loop count is only supported from the bundle's pool "
             "for now, and this bundle has none"
         )
+    _check_count_sources(loop_bounds, loop_sources, loop_parents, pool_size)
     # Indices of kernel-base symbols that become input_arg parameters.
     # Deduplicated by arg_index: multiple SDSCs operating on different slices of
     # the same logical tensor arg share one function parameter (the first-seen
@@ -505,7 +527,9 @@ def generate_bundle(
         # a symbolic one becomes "to <dim> step <G>"; a device-read one reads
         # its bound right before the loop. See _loop_level.
         loop_levels = [
-            _loop_level(lb, lb_idx, loop_dim_ssa, loop_sources[lb_idx])
+            _loop_level(
+                lb, lb_idx, loop_dim_ssa, loop_sources[lb_idx], count_maps[lb_idx]
+            )
             for lb_idx, lb in enumerate(loop_bounds)
         ]
 
@@ -775,15 +799,80 @@ def _compile_specs(
 # ---------------------------------------------------------------------------
 
 
-def _collect_loop_bounds(specs: list, bounds: list, sources: list) -> None:
-    """Collect each loop's trip count and device-read count source (or None)
-    depth-first (same order as loop var naming). One walk fills both lists, so
-    entry N of each always belongs to the same loop."""
+def _check_count_sources(
+    loop_bounds: list, loop_sources: list, loop_parents: list, pool_size: int
+) -> None:
+    """Refuse a device-read count that lies outside the pool, and one whose
+    address moves with its enclosing loops unless it gives one non-negative
+    stride per enclosing loop, every loop it moves with has a concrete trip
+    count, and the last count it reaches lies inside the pool."""
+    for idx, src in enumerate(loop_sources):
+        if src is None:
+            continue
+        first_end = src.pool_offset + _COUNT_BYTES
+        if first_end > pool_size:
+            raise Unsupported(
+                f"device-read loop count at byte {src.pool_offset} ends at byte "
+                f"{first_end}, past the {pool_size}-byte pool"
+            )
+        if not src.outer_strides:
+            continue
+        if any(stride < 0 for stride in src.outer_strides):
+            raise Unsupported(
+                f"device-read loop count outer_strides={src.outer_strides} "
+                "has a negative stride"
+            )
+        enclosing = _enclosing_loops(idx, loop_parents)
+        if len(src.outer_strides) != len(enclosing):
+            raise Unsupported(
+                f"device-read loop count has {len(src.outer_strides)} "
+                f"outer_strides for {len(enclosing)} enclosing loops; give one "
+                "per enclosing loop, outermost first"
+            )
+        last_end = src.pool_offset + _COUNT_BYTES
+        for loop_idx, stride in zip(enclosing, src.outer_strides):
+            if not stride:
+                continue
+            trips = loop_bounds[loop_idx]
+            if not isinstance(trips, (sympy.Integer, int)):
+                raise Unsupported(
+                    f"device-read loop count steps over a loop of {trips} trips; "
+                    "only a concrete enclosing trip count is supported, since a "
+                    "symbolic loop's variable steps by its tile size, not by one "
+                    "trip"
+                )
+            last_end += stride * (int(trips) - 1)
+        if last_end > pool_size:
+            raise Unsupported(
+                f"device-read loop count for the last trip of its enclosing loops "
+                f"ends at byte {last_end}, past the {pool_size}-byte pool"
+            )
+
+
+def _collect_loop_bounds(
+    specs: list, bounds: list, sources: list, parents: list, parent=None
+) -> None:
+    """Collect each loop's trip count, device-read count source (or None) and
+    directly enclosing loop index (or None) depth-first (same order as loop var
+    naming). One walk fills all three lists, so entry N of each always belongs
+    to the same loop."""
     for entry in specs:
         if isinstance(entry, LoopSpec):
+            idx = len(bounds)
             bounds.append(entry.count)
             sources.append(entry.count_from_buffer)
-            _collect_loop_bounds(entry.body, bounds, sources)
+            parents.append(parent)
+            _collect_loop_bounds(entry.body, bounds, sources, parents, idx)
+
+
+def _enclosing_loops(idx: int, parents: list) -> list[int]:
+    """The loops around loop ``idx``, outermost first."""
+    chain = []
+    parent = parents[idx]
+    while parent is not None:
+        chain.append(parent)
+        parent = parents[parent]
+    return chain[::-1]
 
 
 # ---------------------------------------------------------------------------
@@ -876,6 +965,11 @@ class LoopLevel:
     ``setup`` lines are written once at the top of the bundle. ``pre_loop``
     lines are written right before this level's ``scf.for``, for a value that
     only exists once the ops before the loop have run.
+
+    ``count_map``, when set, names the affine map of a device-read count whose
+    address moves with its enclosing loops, and ``count_vars`` the positions of
+    the loops it moves with among them, outermost first. _emit_specs applies the
+    map right before ``pre_loop``, since only it knows those loops' variables.
     """
 
     setup: "tuple[str, ...]"
@@ -883,6 +977,8 @@ class LoopLevel:
     step: str
     stride_scale: int
     pre_loop: "tuple[str, ...]" = ()
+    count_map: str = ""
+    count_vars: "tuple[int, ...]" = ()
 
 
 def _count_scale(count: sympy.Expr) -> int:
@@ -906,6 +1002,7 @@ def _loop_level(
     lb_idx: int,
     loop_dim_ssa: "dict[str, str]",
     source: "CountSource | None" = None,
+    count_map: "tuple[str, tuple[int, ...]] | None" = None,
 ) -> LoopLevel:
     """Pick the ``scf.for`` form for one loop level.
 
@@ -938,6 +1035,9 @@ def _loop_level(
         loop_dim_ssa: Symbol name to the SSA value its ``input_arg`` extracted
             to, so a symbolic bound can be wired to its parameter.
         source: Where a device-read count sits in the pool, or None.
+        count_map: The affine map of a device-read count that moves with its
+            enclosing loops and the positions of the loops it moves with, or
+            None when the count does not move.
 
     Returns:
         The level's setup lines, pre-loop lines, bound, step and stride scale.
@@ -948,7 +1048,7 @@ def _loop_level(
             a device-read count does not match its loop.
     """
     if source is not None:
-        return _device_read_loop_level(count, lb_idx, source)
+        return _device_read_loop_level(count, lb_idx, source, count_map)
 
     if isinstance(count, (sympy.Integer, int)):
         return LoopLevel(
@@ -996,11 +1096,14 @@ def _device_read_loop_level(
     count: sympy.Expr,
     lb_idx: int,
     source: CountSource,
+    count_map: "tuple[str, tuple[int, ...]] | None" = None,
 ) -> LoopLevel:
     """The ``scf.for`` form for a loop whose count is read from device memory.
 
     Refuses rather than emits whenever the loop and its source disagree, since
-    the backend plans every such loop for ``max_value`` trips.
+    the backend plans every such loop for ``max_value`` trips. ``count_map``
+    names the affine map of a count that moves with its enclosing loops and the
+    positions of the loops it moves with.
     """
     if not isinstance(count, (sympy.Integer, int)):
         raise Unsupported(
@@ -1022,11 +1125,29 @@ def _device_read_loop_level(
             f"device-read loop count max_value={source.max_value} is not a "
             f"multiple of granularity={source.granularity}"
         )
-    return LoopLevel(
-        setup=(
-            f"%cnt_off_{lb_idx} = arith.constant {source.pool_offset} : index",
+    if source.pool_offset < 0:
+        raise Unsupported(
+            f"device-read loop count pool_offset={source.pool_offset} is negative"
+        )
+    offset = f"%cnt_off_{lb_idx} = arith.constant {source.pool_offset} : index"
+    setup: "tuple[str, ...]"
+    map_name, map_vars = count_map if count_map is not None else ("", ())
+    if map_name:
+        # The address moves with the enclosing loops, so only its base is a
+        # constant here; _emit_specs applies the count's map inside them.
+        setup = (
+            offset,
+            f"%cnt_base_{lb_idx} = arith.addi %pool, %cnt_off_{lb_idx} : index",
+        )
+    else:
+        setup = (
+            offset,
             f"%cnt_addr_{lb_idx} = arith.addi %pool, %cnt_off_{lb_idx} : index",
-        ),
+        )
+    return LoopLevel(
+        setup=setup,
+        count_map=map_name,
+        count_vars=map_vars,
         pre_loop=(
             f"%n_{lb_idx} = sdscbundle.load_value_at_address %cnt_addr_{lb_idx} "
             f"{{granularity = {source.granularity}, "
@@ -1141,6 +1262,15 @@ def _emit_specs(
             )
             bound = level.bound if level is not None else f"%loop_bound_{lb_idx}"
             step = level.step if level is not None else "%c1"
+            if level is not None and level.count_map:
+                # base + each moving enclosing loop's stride times its variable.
+                # generate_bundle refuses a moving count over a symbolic loop,
+                # so every variable here steps by 1 and counts trips.
+                count_args = ", ".join(loop_vars[v] for v in level.count_vars)
+                f.write(
+                    f"{tab}%cnt_addr_{lb_idx} = affine.apply {level.count_map}"
+                    f"({count_args})[%cnt_base_{lb_idx}]\n"
+                )
             for line in level.pre_loop if level is not None else ():
                 f.write(f"{tab}{line}\n")
             f.write(f"{tab}scf.for {loop_var} = %c0 to {bound} step {step} {{\n")

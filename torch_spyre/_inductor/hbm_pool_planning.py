@@ -362,9 +362,25 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     # whole allocation when any name on it is read outside its writer.
     alloc_id_reader_bundles: dict[int, set[str]] = {}
 
+    def _count_reads(node_list: list[BaseSchedulerNode]):
+        """The buffers counted loops read their trip count from (a LoopNode's
+        ``count_source``): the loop reads it, no node of its body does."""
+        for n in node_list:
+            if isinstance(n, FusedSchedulerNode):
+                loop_node = getattr(n, "loop_node", None)
+                source = getattr(loop_node, "count_source", None)
+                if source is not None:
+                    yield source.buffer
+                yield from _count_reads(n.get_nodes())
+
     for bundle in nodes:
         bundle_name = bundle.get_name()
         bundle_flat = list(_iter_all_nodes([bundle]))
+        for name in _count_reads([bundle]):
+            if name not in graph_inputs:
+                buffer_reader_bundles.setdefault(name, set()).add(bundle_name)
+                if (alloc_id := _alloc_id(name)) is not None:
+                    alloc_id_reader_bundles.setdefault(alloc_id, set()).add(bundle_name)
         bundle_non_kernel = [
             n for n in bundle_flat if not isinstance(n, _kernel_arg_types)
         ]

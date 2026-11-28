@@ -36,6 +36,10 @@ What it checks:
    index uses an enclosing loop's variable must hold a tiling entry in those nodes
    (an op without one reads as "not in the loop", which would drop its advance
    silently).
+7. A loop whose trip count is read on the device (``count_source``) reads a
+   buffer an op writes before the loop, outside its body, or a graph input.
+   A pass that renames or removes the count buffer leaves the loop reading a
+   buffer that no longer exists.
 
 A loop no node covers is not checked: a loop-tiling lowering requests its
 nodes and the pass loop builds them once the pass has returned. So rule 4 fires
@@ -300,8 +304,55 @@ def _node_chain_problems(
         )
 
 
-def find_violations(operations: list[ir.Operation]) -> list[str]:
-    """Every structural violation in ``operations``, as messages."""
+def _count_source_problems(
+    operations: list[ir.Operation],
+    inputs: "set[str] | None",
+    problems: list[str],
+) -> None:
+    """Rule 7: a device-read count is written before its loop, outside it.
+
+    ``inputs`` are the names a loop may read with no writer in the tree (graph
+    inputs and constants); ``None`` skips that part (no graph at hand)."""
+    order: dict[str, int] = {}
+    position: dict[int, int] = {}
+    for i, (op, _enclosing) in enumerate(_walk(operations)):
+        position[id(op)] = i
+        for buf in op.get_outputs():
+            order.setdefault(buf.get_name(), i)
+
+    def visit(entries: list[ir.Operation]) -> None:
+        for node in entries:
+            if not isinstance(node, LoopNode):
+                continue
+            visit(node.body)
+            source = node.count_source
+            if source is None:
+                continue
+            leaves = [position[id(op)] for op in all_ops(node.body)]
+            first = min(leaves, default=None)
+            writer = order.get(source.buffer)
+            if writer is None:
+                if inputs is not None and source.buffer not in inputs:
+                    problems.append(
+                        f"{node.get_name()}: reads its trip count from "
+                        f"{source.buffer}, which no op writes and is not a graph "
+                        "input (a pass renamed or removed the count buffer)"
+                    )
+            elif first is not None and writer >= first:
+                problems.append(
+                    f"{node.get_name()}: its trip count {source.buffer} is written "
+                    "inside the loop or after it; it must be written before the loop"
+                )
+
+    visit(operations)
+
+
+def find_violations(
+    operations: list[ir.Operation], inputs: "set[str] | None" = None
+) -> list[str]:
+    """Every structural violation in ``operations``, as messages.
+
+    ``inputs``: the graph's inputs and constants, for rule 7."""
     problems: list[str] = []
     all_inductions = _inductions(operations)
 
@@ -353,6 +404,7 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
         _node_chain_problems(op, enclosing, problems)
     _membership_problems(operations, 0, (), problems, _covered_keys(operations))
     _non_members(operations, 0, problems)
+    _count_source_problems(operations, inputs, problems)
     return problems
 
 
@@ -367,6 +419,9 @@ def check_loops(graph: Any, *, where: str) -> None:
     operations = getattr(graph.operations, "real", graph.operations)
     if not any(isinstance(op, LoopNode) for op in operations):
         return
-    problems = find_violations(operations)
+    inputs = set(getattr(graph, "graph_inputs", {})) | set(
+        getattr(graph, "constants", {})
+    )
+    problems = find_violations(operations, inputs)
     if problems:
         raise LoopStructureError(where, problems)

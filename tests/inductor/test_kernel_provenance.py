@@ -173,6 +173,16 @@ class TestKernelProvenanceDescriptor:
 
         assert len({plain, at_0, at_128}) == 3
 
+    def test_device_read_count_strides_change_bundle_identity(self):
+        def key(strides):
+            source = CountSource(pool_offset=0, max_value=4, outer_strides=strides)
+            loop = LoopSpec(
+                count=Integer(4), body=[_op(None)], count_from_buffer=source
+            )
+            return build_kernel_provenance_descriptor([_op(None), loop]).key
+
+        assert len({key(()), key((128,)), key((512, 128))}) == 3
+
     def test_builds_bundle_identity_without_handles(self):
         specs = [
             _op(None),

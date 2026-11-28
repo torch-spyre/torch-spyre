@@ -44,6 +44,26 @@ def _(x: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.empty_like(x)
 
 
+@torch.library.custom_op("spyre::active_count_marker", mutates_args=())
+def active_count_marker(count: torch.Tensor, max_value: int) -> torch.Tensor:
+    """Marks the loop it is called in as running ``count``'s first value trips.
+
+    ``for_each_tile(active_count=...)`` calls it once in the body. It is
+    compile-time scaffolding: the splice records the count on the loop and
+    removes it, so nothing of it runs on the device. Eagerly it is a cheap read.
+    """
+    return count.reshape(-1)[:1].clone()
+
+
+@active_count_marker.register_fake
+def _(count: torch.Tensor, max_value: int) -> torch.Tensor:
+    return count.new_empty((1,))
+
+
+# Kept by every FX dead-code pass even though nothing reads its output.
+torch.fx.node.has_side_effect(torch.ops.spyre.active_count_marker.default)
+
+
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
