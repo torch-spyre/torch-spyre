@@ -339,6 +339,13 @@ def zeros_qfp8wt(
     device, giving ``[..., K, 1, N]`` for rank 3 and above.  A rank-2 ``[K, N]``
     tensor takes the default 2D-stick weight layout, as
     ``_dma_to_spyre_fp8_kernel`` does.
+
+    This is the only supported way to allocate a batched (rank 3 or higher)
+    QFP8WT tensor.  Host transfers of such a tensor address it in the device
+    order this layout produces, ``[outer][N-strip][last batch][K/2][stick]``,
+    and do not check the layout, so a batched QFP8WT tensor built with another
+    layout (for example ``spyre_empty_with_layout`` with ``list(range(rank))``)
+    would be read and written at the wrong addresses.
     """
     shape = tuple(shape)
     if len(shape) < 2:
