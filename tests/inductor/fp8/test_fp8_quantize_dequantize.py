@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch_spyre.constants import DEVICE_NAME
+from utils_inductor import expects_raise
 
 E4M3 = torch.float8_e4m3fn
 FP16 = torch.float16
@@ -130,8 +131,8 @@ class TestQuantizeFP8:
         "shape",
         [
             (2, 8),
-            pytest.param((2, 16), marks=_XFAIL_3033),
-            pytest.param((16, 128), marks=_XFAIL_3033),
+            (2, 16),
+            (16, 128),
         ],
         ids=["2x8", "2x16", "16x128"],
     )
@@ -149,6 +150,109 @@ class TestQuantizeFP8:
         torch.testing.assert_close(
             out_cpu.float(), expected.float(), atol=0.0, rtol=0.0
         )
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(2, 16), (4, 64), (4, 100), (4, 192), (16, 128), (2, 384)],
+        ids=["2x16", "4x64", "4x100", "4x192", "16x128", "2x384"],
+    )
+    def test_activation_quantize_2d_h2d_copy(self, shape):
+        """copy_ of host FP8 values into an activation FP8 (QFP8CH) tensor.
+
+        The copy must write the values in the element order qfp8ch uses, so
+        .cpu() gives them back. Shapes whose last dim is not a multiple of 128
+        end in a partly filled stick, which the copy pads to a whole one.
+        """
+        from torch_spyre._C import ElementArrangement
+
+        x = _make_arange_fp16(shape)
+        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+        out = _compile(_quantize_fn)(x, scale)
+        assert (
+            out.device_tensor_layout().element_arrangement == ElementArrangement.QFP8CH
+        )
+        # 2..32 in steps of 2: exact in E4M3, and different from what out holds.
+        new = (x.cpu().to(FP32) * 2).to(E4M3)
+        out.copy_(new)
+        torch.testing.assert_close(out.cpu().float(), new.float(), atol=0.0, rtol=0.0)
+
+    @pytest.mark.parametrize(
+        "shape,index",
+        [
+            ((4, 128), (slice(None), slice(0, 64))),
+            ((4, 256), (slice(None), slice(128, 256))),
+            ((4, 256), (slice(None), slice(72, 200))),
+            ((2, 3, 128), (slice(None), slice(None), slice(64, 128))),
+            ((4, 128), (slice(1, 3),)),
+            ((4, 128), (1,)),
+            ((2, 3, 128), (slice(None), slice(1, 2))),
+        ],
+        ids=[
+            "part_of_stick",
+            "whole_sticks",
+            "across_sticks",
+            "3d_part_of_stick",
+            "rows",
+            "int_index",
+            "3d_middle_dim",
+        ],
+    )
+    def test_activation_quantize_slice_cpu_copy(self, shape, index):
+        """.cpu() of a slice of a QFP8CH tensor.
+
+        The copy packs the sticks the slice touches, and the EA shuffle is
+        applied to them as if they were the whole tensor. That gives the right
+        elements here, because the QFP8CH interleave stays inside one stick.
+        """
+        x = _make_arange_fp16(shape)
+        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+        out = _compile(_quantize_fn)(x, scale)
+        expected = x.cpu().to(FP32).to(E4M3)[index]
+        torch.testing.assert_close(
+            out[index].cpu().float(), expected.float(), atol=0.0, rtol=0.0
+        )
+
+    @expects_raise
+    @pytest.mark.parametrize(
+        "host2device,shape,index",
+        [
+            (True, (4, 128), (slice(1, 3),)),
+            (True, (4, 128), (slice(None), slice(0, 64))),
+            (True, (4, 256), (slice(None), slice(128, 256))),
+            (True, (2, 3, 128), (1,)),
+            (False, (2, 3, 128), (1,)),
+            (False, (2, 3, 128), (slice(1, 2),)),
+        ],
+        ids=[
+            "h2d_rows",
+            "h2d_part_of_stick",
+            "h2d_whole_sticks",
+            "h2d_int_index",
+            "d2h_int_index",
+            "d2h_3d_rows",
+        ],
+    )
+    def test_activation_quantize_slice_copy_raises(self, host2device, shape, index):
+        """Copies of unsupported slices of a QFP8CH tensor are rejected.
+
+        The copy reorders elements with the DCI's dimwise_ea, which describes
+        the whole device tensor rather than the slice. Every H2D copy into a
+        slice is rejected. A D2H copy is rejected when the entries built for the
+        slice reach past the coordinate space they describe, which would
+        otherwise fail in the data conversion and leave the stream in an error
+        state.
+
+        TODO: once the EA shuffle supports slices, make this a positive test.
+        """
+        x = _make_arange_fp16(shape)
+        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+        out = _compile(_quantize_fn)(x, scale)
+        view = out[index]
+        with pytest.raises(RuntimeError, match="slice of a device tensor"):
+            if host2device:
+                view.copy_(torch.zeros(view.shape, dtype=E4M3))
+            else:
+                view.cpu()
 
     @pytest.mark.parametrize("op_name", _RAW_QUANTIZE_PARAMS)
     @pytest.mark.parametrize(
@@ -1297,8 +1401,8 @@ class TestFP8EagerMode:
         strict=True,
         raises=AssertionError,
         reason="https://github.com/torch-spyre/torch-spyre/issues/4313: no longer returns "
-        "None, but values differ from the CPU oracle: at K>=16 the .cpu() copy reads "
-        "elements from the wrong offset, as in issue 3033",
+        "None, but some values differ from the CPU oracle: subnormals and values near "
+        "FP8 midpoints round differently on the device",
     )
     def test_quantize_fp8_with_scale_eager(self):
         """quantize_fp8_with_scale eager: output shape, dtype, and values match CPU oracle."""

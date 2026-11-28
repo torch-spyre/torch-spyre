@@ -1420,6 +1420,87 @@ def test_ea_staggered_device_storage_offset():
     assert torch.equal(got_dl16, expected_dl16)
 
 
+@pytest.mark.parametrize(
+    "columns",
+    [(0, 64), (64, 128), (8, 40)],
+    ids=["pair0", "pair1", "inside_pair0"],
+)
+def test_ea_dl16_to_fp32_stick_dim_slice_d2h(columns):
+    """D2H of a DL16_TO_FP32 stick-dim slice whose sticks are whole pairs."""
+    x_dl16 = torch.arange(4 * 128, dtype=torch.float16).reshape(4, 128)
+    y_fp32 = _convert_one_row_per_core(x_dl16, torch.float32)
+    assert_ea(y_fp32, ElementArrangement.DL16_TO_FP32)
+
+    start, end = columns
+    got = y_fp32[:, start:end].cpu()
+    assert torch.equal(got, x_dl16[:, start:end].to(torch.float32))
+
+
+@expects_raise
+@pytest.mark.parametrize(
+    "columns",
+    [(32, 96), (0, 32), (64, 96)],
+    ids=["across_pairs", "first_stick_of_pair", "second_pair_first_stick"],
+)
+def test_ea_dl16_to_fp32_stick_dim_slice_d2h_split_pair_raises(columns):
+    """D2H of a DL16_TO_FP32 slice that touches part of a stick pair is rejected.
+
+    The copy packs only the sticks the slice touches, and the EA shuffle,
+    which describes the whole tensor, then pairs the wrong sticks. Before the
+    check, (32, 96) returned wrong values and the others raised in ea_shuffle.
+
+    TODO: once the EA shuffle supports slices, make this a positive test.
+    """
+    x_dl16 = torch.arange(4 * 128, dtype=torch.float16).reshape(4, 128)
+    y_fp32 = _convert_one_row_per_core(x_dl16, torch.float32)
+    assert_ea(y_fp32, ElementArrangement.DL16_TO_FP32)
+
+    start, end = columns
+    with pytest.raises(RuntimeError, match="whole stick pairs"):
+        y_fp32[:, start:end].cpu()
+
+
+@pytest.mark.parametrize(
+    "shape,index",
+    [
+        ((4, 128), (slice(1, 3),)),
+        ((2, 3, 128), (slice(None), slice(1, 2))),
+    ],
+    ids=["rows", "3d_middle_dim"],
+)
+def test_ea_fp32_to_dl16_row_slice_d2h(shape, index):
+    """D2H of a FP32_TO_DL16 slice along a non-stick dim returns the right values.
+
+    The FP32_TO_DL16 stagger stays inside one stick, so unstaggering the packed
+    sticks of the slice gives the right elements.
+    """
+    x_fp32 = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
+    y_dl16 = _convert_one_row_per_core(x_fp32, torch.float16)
+    assert_ea(y_dl16, ElementArrangement.FP32_TO_DL16)
+    assert torch.equal(y_dl16[index].cpu(), x_fp32.to(torch.float16)[index])
+
+
+@expects_raise
+@pytest.mark.parametrize(
+    "shape,index",
+    [((4, 128), (1,)), ((2, 3, 128), (1,)), ((2, 3, 128), (slice(1, 2),))],
+    ids=["2d_int_index", "3d_int_index", "3d_rows"],
+)
+def test_ea_fp32_to_dl16_slice_d2h_out_of_range_raises(shape, index):
+    """D2H of a slice whose EA entries reach past their extent is rejected.
+
+    Without the check the data conversion fails its index check and leaves the
+    stream in an error state.
+
+    TODO: once the EA shuffle supports slices, make this a positive test.
+    """
+    x_fp32 = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
+    y_dl16 = _convert_one_row_per_core(x_fp32, torch.float16)
+    assert_ea(y_dl16, ElementArrangement.FP32_TO_DL16)
+    with pytest.raises(RuntimeError, match="reaches device element"):
+        y_dl16[index].cpu()
+
+
 # ---------------------------------------------------------------------------
 # Shuffle op correctness verification to apply or restore element arrangement
 # ---------------------------------------------------------------------------
