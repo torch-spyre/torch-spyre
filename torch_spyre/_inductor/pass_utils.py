@@ -2963,6 +2963,81 @@ def restickify_device_size(
     return new_device_size
 
 
+def _var_valid_elements(stl: SpyreTensorLayout, idc: list, var) -> int:
+    """Number of valid elements of the loop variable ``var``, from valid_elements.
+
+    A valid_elements group counts one HOST dim, not a variable, so a variable's
+    count is read from the groups its device dims are in:
+
+    * The group holds only ``var``'s dims.  A constant-coordinate dim counts as
+      ``var``'s (its own stick-count dim, padding, or a slice that pins it).  The
+      group's count is exact, padding included.  device_size [2, 67, 64],
+      valid_elements {(0, 2): 67}, idc [0, d0, d1 + 3]: d1 has 67.
+    * ``var`` is in several groups: multiply them.  A split K, device_size
+      [16, 4096, 64], valid_elements {(0,): 16, (1,): 4096, (2,): 64},
+      idc [floor(d1/128), d0, Mod(d1, 64)]: d1 has 16 * 64 = 1024.
+    * The group also holds a dim of ANOTHER variable (one host dim split over two
+      loop variables).  Only a full group can be divided: its capacity over the
+      other variable's device sizes.  device_size [2, 64, 2, 1, 64],
+      valid_elements {(2, 4): 128, ...}, idc [d1, d0, d3, 0, d4]: d4 has 64.
+
+    Raises AssertionError rather than guess: a compound coordinate containing
+    ``var`` (2 * d1 + d3), a padded group shared with another variable, or a dim
+    of ``var`` in no group.
+    """
+    dims = [d for d, e in enumerate(idc) if var in e.free_symbols]
+    assert dims, f"{var} is in no device dim: idc={idc}"
+    for d in dims:
+        # An offset such as d1 + 3 is fine; a second variable is not.
+        assert idc[d].free_symbols == {var}, f"compound coordinate {idc[d]} for {var}"
+    keys: list[tuple[int, ...]] = []
+    for d in dims:
+        key = next((k for k in stl.valid_elements if d in k), None)
+        assert key is not None, f"dim {d} of {var} has no valid_elements group"
+        if key not in keys:
+            keys.append(key)
+    total = 1
+    for key in keys:
+        val = stl.valid_elements[key]
+        others = [d for d in key if d not in dims and idc[d].free_symbols]
+        if not others:
+            total *= val
+            continue
+        cap = math.prod(stl.device_size[d] for d in key)
+        # A padded group shared with another variable is rejected: the count says
+        # how many positions are valid but not which variable's range is short.
+        assert val == cap, (
+            f"group {key} is padded ({val}/{cap}) and shared with another variable"
+        )
+        total *= cap // math.prod(stl.device_size[d] for d in others)
+    return total
+
+
+def restickify_device_size_new(
+    stl: SpyreTensorLayout,
+    idc: list,
+    old_sd_outer_dim: int,
+    new_sd_outer_dim: int,
+    old_var,
+    new_var,
+    stick_size: int,
+) -> list:
+    """Computes the new device size after a restickify, from device geometry only.
+
+    The element counts of the old and new stick variables come from
+    ``valid_elements`` (see ``_var_valid_elements``).  An ``old_var`` of None is a
+    constant stick and a ``new_var`` of None a size-1 restickify; each has one
+    element.
+    """
+    old_var_elems = 1 if old_var is None else _var_valid_elements(stl, idc, old_var)
+    new_var_elems = 1 if new_var is None else _var_valid_elements(stl, idc, new_var)
+    new_device_size = list(stl.device_size)
+    new_device_size[-1] = stick_size
+    new_device_size[old_sd_outer_dim] = (new_var_elems + stick_size - 1) // stick_size
+    new_device_size[new_sd_outer_dim] = old_var_elems
+    return new_device_size
+
+
 def restickify_stride_map(
     old_stride_map: list,
     old_sd_outer_dim: int,
@@ -3123,6 +3198,25 @@ def compute_restickify_target_layout(
         new_sd_host_size,
         stick_size,
     )
+    # Dual-path check of restickify_device_size against valid_elements, with no
+    # host sizes.  Where the NEW count is right and the OLD path is wrong, the
+    # assert fails, so the test is skipped instead:
+    # test_single_arg_size1_after_staggered_ea (old path takes 128 for a
+    # 64-element variable and reads past the buffer) and
+    # test_compute_restickify_target_layout_factorized_new_sd (invalid fixture).
+    _new_device_size = restickify_device_size_new(
+        stl, idc, old_sd_outer_dim, new_sd_outer_dim, old_var, new_var, stick_size
+    )
+    assert list(device_size) == _new_device_size, (
+        f"restickify_device_size mismatch: old={list(device_size)} "
+        f"new={_new_device_size} "
+        f"old_device_size={old_device_size} old_sd={old_sd_outer_dim} "
+        f"new_sd={new_sd_outer_dim} "
+        f"old_sd_host_size={old_sd_host_size} new_sd_host_size={new_sd_host_size} "
+        f"stick_size={stick_size} stride_map={old_stride_map} "
+        f"ve={dict(stl.valid_elements)} idc={[str(e) for e in idc]} "
+        f"old_var={old_var} new_var={new_var}"
+    )
     stride_map = restickify_stride_map(
         old_stride_map,
         old_sd_outer_dim,
@@ -3214,6 +3308,23 @@ def compute_size1_restickify_layout(
         new_sd_outer_dim,
         1,
         stick_size,
+    )
+    # Dual-path check, as in compute_restickify_target_layout.  fp8
+    # test_4d_attention_layout[1x4x32x128] (temporarily skipped, fp8 is broken)
+    # fails here: rescale_stl_for_dtype grows the batch dim instead of the head
+    # dim's, so valid_elements records 64 head-dim elements where there are 128.
+    _new_device_size_s1 = restickify_device_size_new(
+        stl, idc, old_sd_outer_dim, new_sd_outer_dim, old_var, None, stick_size
+    )
+    assert list(device_size) == _new_device_size_s1, (
+        f"restickify_device_size mismatch (size1): old={list(device_size)} "
+        f"new={_new_device_size_s1} "
+        f"old_device_size={list(stl.device_size)} old_sd={old_sd_outer_dim} "
+        f"new_sd={new_sd_outer_dim} "
+        f"old_sd_host_size={old_sd_host_size} "
+        f"stick_size={stick_size} stride_map={list(stl.stride_map)} "
+        f"ve={dict(stl.valid_elements)} idc={[str(e) for e in idc]} "
+        f"old_var={old_var}"
     )
     stride_map = restickify_stride_map(
         list(stl.stride_map),

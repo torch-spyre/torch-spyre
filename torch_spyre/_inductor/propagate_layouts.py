@@ -824,13 +824,32 @@ def _qfp8wt_stl(
     last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
     c_size = outer_sizes + [last_dim]
     c_stride = outer_strides + [1]
-    return SpyreTensorLayout(
+    stl = SpyreTensorLayout(
         c_size,
         c_stride,
         output.dtype,
         qfp8wt_dim_order(len(c_size)),
         ElementArrangement.QFP8WT,
     )
+    if unaligned > 0:
+        # TEMP while FP8 is broken: revisit this workaround once it is fixed.
+        # c_size padded K to a full stick, so the constructor records 64 valid
+        # elements where the weight has stick_dim_size (e.g. 8).  Correct the
+        # count by rebuilding the layout: valid_elements is read-only on the
+        # object (Python gets a copy), so assigning to it would do nothing.
+        # test_2d_k8_small_m, test_2d_k8_large_m_uniform, test_zero_scale_weight.
+        ve = stl.valid_elements
+        stick_dim = len(stl.device_size) - 1
+        stick_key = next(k for k in ve if stick_dim in k)
+        ve[stick_key] = stick_dim_size
+        stl = SpyreTensorLayout(
+            list(stl.device_size),
+            list(stl.stride_map),
+            stl.device_dtype,
+            ve,
+            stl.element_arrangement,
+        )
+    return stl
 
 
 def _with_input_ea(
