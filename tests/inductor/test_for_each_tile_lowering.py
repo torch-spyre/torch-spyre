@@ -3600,6 +3600,7 @@ class TestPassPipelineRegistration(unittest.TestCase):
         )
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
+            split_multi_ops_in_while_loop_bodies,
         )
 
         pipeline = CustomPreSchedulingPasses()
@@ -3610,8 +3611,14 @@ class TestPassPipelineRegistration(unittest.TestCase):
         # trip count / max extent. Reversing the order would make
         # splice_while_loops see Dynamo's loose default range instead of the
         # declared one.
+        #
+        # split_multi_ops_in_while_loop_bodies runs between the two: it must
+        # still see each WhileLoop's own (not yet spliced) body_subgraph.graph,
+        # so it has to run before splice_while_loops flattens it away -- see
+        # that function's own docstring.
         self.assertIs(pipeline.passes[0], apply_reserved_dims_contract)
-        self.assertIs(pipeline.passes[1], splice_while_loops)
+        self.assertIs(pipeline.passes[1], split_multi_ops_in_while_loop_bodies)
+        self.assertIs(pipeline.passes[2], splice_while_loops)
 
 
 def test_tile_dim_marker_lowering_produces_distinct_operation():

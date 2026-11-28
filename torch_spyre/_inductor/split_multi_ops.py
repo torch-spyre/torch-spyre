@@ -448,6 +448,42 @@ def _init_vid_to_bufname(trace):
     return {vid: kwargs["_name"] for op, vid, _, kwargs in trace if op == "load"}
 
 
+def _make_name_stable_loader(name: str):
+    """A ``make_loader()`` replacement that re-resolves ``name`` on every call.
+
+    ``ir.Buffer.make_loader()`` (upstream) returns a closure over ``self`` --
+    reading ``self.name``/``self.get_layout()`` straight off the captured
+    object every time the loader runs, with no indirection through
+    ``V.graph.get_buffer(name)`` in between. That is fine as long as the
+    object is only ever mutated in place afterwards (as ``finalize_layouts``
+    does: ``op.layout = ...``). ``ComputedBuffer`` is a frozen dataclass,
+    though, so some passes (e.g. a read redirect, or inlining a tile marker)
+    replace the object outright instead -- correctly repointing every
+    NAME-based reference (``V.graph.name_to_buffer``, ``name_to_op``), but
+    never a closure another buffer's loader already captured over the old
+    object.
+
+    Re-resolving ``name`` via ``V.graph.get_buffer`` on every call sidesteps
+    this regardless of how many times the object is replaced afterwards:
+    whichever object is current when the loader actually runs is the one
+    used. Outside a loop body, where split_multi_ops's own intermediates are
+    never replaced after creation, this is a no-op -- the name always
+    resolves to the same object either way.
+    """
+
+    def make_loader():
+        def loader(index):
+            resolved = V.graph.get_buffer(name)
+            # Bypass any instance-level override (this function's own, or a
+            # future one) on the resolved object: call the unbound method so
+            # a chain of re-resolved buffers can't recurse into itself.
+            return type(resolved).make_loader(resolved)(index)
+
+        return loader
+
+    return make_loader
+
+
 def _lower_fx_node(node, gl, ops, before):
     """Lower an FX node to a buffer and insert it into operations list.
 
@@ -479,6 +515,9 @@ def _lower_fx_node(node, gl, ops, before):
     for new_op in new_ops:
         move_before(ops, before, new_op)
     gl.name_to_buffer[buf.get_name()] = buf
+    # A later intermediate built in this same call may read buf via
+    # make_loader() -- see _make_name_stable_loader's own docstring.
+    buf.make_loader = _make_name_stable_loader(buf.get_name())
     return buf
 
 

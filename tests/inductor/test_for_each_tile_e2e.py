@@ -106,6 +106,7 @@ from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     carried_expert_sum_fn,
     carried_reduction_fn,
+    cast_to_int32_tiled_fn,
     embedding_restickify_inputs,
     embedding_restickify_table_fn,
     fill_add_tiled_fn,
@@ -456,6 +457,39 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                     sums.cpu().float(), torch.stack(old_sums), atol=0, rtol=0
                 )
                 torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
+
+    def test_cast_to_int32_in_tile_body_matches_eager(self):
+        """`cast_to_int32_tiled_fn` matches a CPU `.to(torch.int32)` reference
+        for every floating source dtype, inside a `for_each_tile` body.
+        `float16`/`bfloat16` additionally round-trip through an extra
+        `float32` conversion fused around the same `lower_trunc` body
+        (`to_dtype`'s `float16_format` branch), so this exercises more than
+        just the plain `float32` case. `self.subTest` reports each dtype's
+        failure independently rather than stopping at the first.
+
+        Input values are quarter-integers (`k / 4` for integer `k`), which
+        `float16` holds exactly, so the comparison is exact (`atol=rtol=0`)
+        without `float16`'s own device round-trip precision loss
+        confounding the result. Includes both positive and negative values
+        so the check exercises `trunc`-toward-zero semantics, not just
+        rounding.
+        """
+        torch.manual_seed(6410)
+        rows, cols, tile_size = 128, 64, 64
+
+        for src_dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(src_dtype=src_dtype):
+                x = (torch.randint(-1000, 1000, (rows, cols)) / 4).to(src_dtype)
+                expected = x.to(torch.int32)
+
+                torch._dynamo.reset()
+                compiled = torch.compile(
+                    cast_to_int32_tiled_fn, fullgraph=True, dynamic=False
+                )
+                with torch.inference_mode():
+                    actual = compiled(x.to(DEVICE_NAME), tile_size=tile_size)
+
+                torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
     def test_computed_where_condition_in_broadcast_tile(self):
         from torch_spyre.ops.fallbacks import FallbackWarning

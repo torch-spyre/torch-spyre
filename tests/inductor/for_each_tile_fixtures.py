@@ -1608,6 +1608,24 @@ def scatter_carry_old_value_fn(values, indices, output):
     )
 
 
+def cast_to_int32_tiled_fn(x, *, tile_size):
+    """A plain cast to ``int32`` on each tile.
+
+    The device has no truncation op, so a float -> int cast routes through
+    ``lower_trunc``, synthesized as ``floor(|x|) * clip(x, -1, 1)``. A
+    ``float16``/``bfloat16`` source additionally round-trips through
+    ``float32`` first (``to_dtype``'s ``float16_format`` branch), fusing a
+    second conversion around the same ``lower_trunc`` body.
+    """
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(_carry, tiles):
+        return None, tiles[0].to(torch.int32)
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Graph-shape fixtures: for_each_tile bodies that interact with other passes
 # (restickify, views, broadcast, outside consumers, E-tiled matmul, carried
