@@ -445,7 +445,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHostWithH2D(
               "' already exists in pinned buffer map");
   try {
     // Allocate a minimal stub; real data flows via RaiiBuffer at launch time.
-    pinned_buffer_map_[ohandle] = HostBuffer(correction_size);
+    pinned_buffer_map_[ohandle] = std::make_shared<HostBuffer>(correction_size);
   }
   catch (const std::bad_alloc&) {
     TORCH_CHECK(false,
@@ -478,7 +478,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHostWithH2D(
     auto it = pinned_buffer_map_.find(ihandle);
     TORCH_CHECK(it != pinned_buffer_map_.end(), "ihandle '", ihandle,
                 "' not found in pinned buffer map");
-    inp_ptr = it->second.data();
+    inp_ptr = it->second->data();
   }
 
   // Parse hcm JSON
@@ -548,7 +548,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       auto it = pinned_buffer_map_.find(host_handle_str);
       TORCH_CHECK(it != pinned_buffer_map_.end(), "Host handle '",
                   host_handle_str, "' not found in pinned buffer map");
-      void* host_addr = it->second.data();
+      std::shared_ptr<HostBuffer> host_buffer = it->second;
       uint64_t device_ptr =
           safe_stoull(dev_ptr_str, "DataTransfer H2D dev_ptr");
       size_t transfer_size = safe_stoull(size_str, "DataTransfer H2D size");
@@ -557,7 +557,8 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       flex::CompositeAddress comp_addr = compute_offset_address(
           job_allocation_.at(0), device_ptr, transfer_size);
 
-      return std::make_unique<JobPlanStepH2D>(host_addr, std::move(comp_addr));
+      return std::make_unique<JobPlanStepH2D>(std::move(host_buffer),
+                                              std::move(comp_addr));
     }
 
     case TransferDirection::DeviceToHost: {
@@ -586,14 +587,16 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
                   host_handle_str, "' already exists in pinned buffer map");
 
       try {
-        pinned_buffer_map_[host_handle_str] = HostBuffer(transfer_size);
+        pinned_buffer_map_[host_handle_str] =
+            std::make_shared<HostBuffer>(transfer_size);
       }
       catch (const std::bad_alloc&) {
         TORCH_CHECK(false,
                     "Failed to allocate pinned buffer for D2H transfer '",
                     host_handle_str, "', size=", transfer_size, " bytes");
       }
-      void* host_addr = pinned_buffer_map_[host_handle_str].data();
+      std::shared_ptr<HostBuffer> host_buffer =
+          pinned_buffer_map_[host_handle_str];
 
       // If device_ptr is in segment 7, calculate CompositeAddress and store it
       // in JobPlanStepH2D. If device_ptr is in tensor segments, store
@@ -604,12 +607,12 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
         // Compute CompositeAddress with offset from device_addr
         flex::CompositeAddress comp_addr = compute_offset_address(
             job_allocation_.at(0), device_ptr, transfer_size);
-        return std::make_unique<JobPlanStepD2H>(std::move(comp_addr), host_addr,
-                                                transfer_size);
+        return std::make_unique<JobPlanStepD2H>(std::move(comp_addr),
+                                                host_buffer, transfer_size);
       } else {
         TORCH_CHECK(bind_io_addresses_ == true,
                     "D2H dev_ptr must be in program segment.")
-        return std::make_unique<JobPlanStepD2H>(device_ptr, host_addr,
+        return std::make_unique<JobPlanStepD2H>(device_ptr, host_buffer,
                                                 transfer_size);
       }
     }
@@ -714,7 +717,7 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   // TODO(jni): expected_input_shapes to be added once provided in SpyreCode
   // Create pinned_buffers vector from pinned_buffer_map_
   // Move tensors from map to avoid unnecessary reference count increments
-  std::vector<HostBuffer> pinned_buffers;
+  std::vector<std::shared_ptr<HostBuffer>> pinned_buffers;
   pinned_buffers.reserve(pinned_buffer_map_.size());
   for (auto& [ohandle, tensor] : pinned_buffer_map_) {
     pinned_buffers.push_back(std::move(tensor));

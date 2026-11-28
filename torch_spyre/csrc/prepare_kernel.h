@@ -165,7 +165,10 @@ class JobPlanBuilder {
   /// Whether to bind inputs and outputs addresses for compute
   bool bind_io_addresses_;
 
-  std::unordered_map<std::string, HostBuffer> pinned_buffer_map_;
+  // Shared so a launch's DMA callbacks can keep a buffer alive past the
+  // JobPlan (see JobPlan::pinned_buffers).
+  std::unordered_map<std::string, std::shared_ptr<HostBuffer>>
+      pinned_buffer_map_;
 
   std::vector<std::string> inits_;
 
