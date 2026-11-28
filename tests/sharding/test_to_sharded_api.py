@@ -20,12 +20,13 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch_spyre
 
 from torch_spyre._inductor import config as spyre_config
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 import torch_spyre._sharded_api as sharded_api
-from device_env import emulation_ready
+from device_env import emulation_ready, num_shards
 from side_effect_utils import subprocess_import_side_effects
 from torch_spyre._sharded_api import (
     is_sharded,
@@ -39,6 +40,12 @@ _REAL_ACTIVE_CORE_COUNT = sharded_api._active_core_count
 
 class _TensorSubclass(torch.Tensor):
     pass
+
+
+def expects_raise(test):
+    """Tag a rejection test (see tests/inductor/utils_inductor.py)."""
+    test._expects_raise = True
+    return test
 
 
 def _source(shape=(16,), dtype=torch.float32):
@@ -397,6 +404,69 @@ def test_device_fill_writes_every_shard(active_cores, num_shards, dim, dtype, op
         before.num_shards,
         before.shard_device_bytes,
     )
+
+
+@_requires_spyre
+@pytest.mark.parametrize(
+    "dim, dtype",
+    [(0, torch.float32), (0, torch.float16), (1, torch.float32), (1, torch.float16)],
+)
+@pytest.mark.parametrize("call", ["method", "function"])
+def test_clone_keeps_sharding(active_cores, dim, dtype, call):
+    # An eager clone of a sharded tensor is a sharded tensor with the same
+    # placement and values, in its own storage (#5823). It compiles, so the
+    # shard count is the active SENCORES (one core per shard), and Shard(0)
+    # rows are one stick wide (wider rows need #5827).
+    n = num_shards()
+    active_cores["cores"] = n
+    stick = torch_spyre._C.get_elem_in_stick(dtype)
+    shape = (4 * n, stick) if dim == 0 else (4, 64 * n)
+    y = torch.spyre.to_sharded(_source(shape, dtype), Shard(dim), num_shards=n)
+    before = y.cpu()
+
+    c = y.clone() if call == "method" else torch.clone(y)
+
+    assert torch.spyre.is_sharded(c)
+    got, want = torch.spyre.sharding_info(c), torch.spyre.sharding_info(y)
+    assert (got.placement, got.num_shards, got.shard_device_bytes) == (
+        want.placement,
+        want.num_shards,
+        want.shard_device_bytes,
+    )
+    assert torch.equal(c.cpu(), before)
+    # Its own storage: filling the clone leaves the source unchanged.
+    c.fill_(3)
+    assert torch.equal(c.cpu(), torch.full(shape, 3, dtype=dtype))
+    assert torch.equal(y.cpu(), before)
+
+
+@_requires_spyre
+@expects_raise
+def test_clone_of_box_view_of_sharded_fails_closed(active_cores):
+    # Only whole sharded tensors can be cloned so far: a box view's clone is
+    # rejected like any other compiled op on a box view, and the base is
+    # unchanged.
+    n = num_shards()
+    active_cores["cores"] = n
+    y = torch.spyre.to_sharded(
+        _source((4 * n, 64), torch.float16), Shard(0), num_shards=n
+    )
+    before = y.cpu()
+    with pytest.raises(RuntimeError, match="base tensors from to_sharded"):
+        y[0:n].clone()
+    assert torch.equal(y.cpu(), before)
+
+
+@_requires_spyre
+@expects_raise
+def test_clone_of_sharded_rejects_other_memory_formats(active_cores):
+    n = num_shards()
+    active_cores["cores"] = n
+    y = torch.spyre.to_sharded(
+        _source((4 * n, 64), torch.float16), Shard(0), num_shards=n
+    )
+    with pytest.raises(RuntimeError, match="supports only memory_format"):
+        y.clone(memory_format=torch.channels_last)
 
 
 @_requires_spyre
