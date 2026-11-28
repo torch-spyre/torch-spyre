@@ -463,24 +463,29 @@ class JobPlanStepD2H final : public JobPlanStep {
    * @brief Construct D2H step
    *
    * @param device_address Device memory address
-   * @param host_address Host memory address (caller manages lifetime)
+   * @param host_buffer Destination host buffer. The step shares ownership and
+   *        hands a reference to each launched DMA, so the buffer outlives an
+   *        in-flight transfer even if the JobPlan is destroyed first.
    * @param size Size of data to transfer
    */
-  JobPlanStepD2H(flex::CompositeAddress device_address, void* host_address,
-                 size_t size)
+  JobPlanStepD2H(flex::CompositeAddress device_address,
+                 std::shared_ptr<HostBuffer> host_buffer, size_t size)
       : device_address_(std::move(device_address)),
-        host_address_(host_address),
+        host_buffer_(std::move(host_buffer)),
         size_(size) {}
 
   /**
    * @brief Construct D2H step
    *
    * @param dmva Device memory virtual address
-   * @param host_address Host memory address (caller manages lifetime)
+   * @param host_buffer Destination host buffer (shared; see above)
    * @param size Size of data to transfer
    */
-  JobPlanStepD2H(uint64_t dmva, void* host_address, size_t size)
-      : device_address_(Dmva{dmva}), host_address_(host_address), size_(size) {}
+  JobPlanStepD2H(uint64_t dmva, std::shared_ptr<HostBuffer> host_buffer,
+                 size_t size)
+      : device_address_(Dmva{dmva}),
+        host_buffer_(std::move(host_buffer)),
+        size_(size) {}
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -488,7 +493,7 @@ class JobPlanStepD2H final : public JobPlanStep {
 
  private:
   std::variant<flex::CompositeAddress, Dmva> device_address_;
-  void* host_address_;
+  std::shared_ptr<HostBuffer> host_buffer_;
   size_t size_;
 };
 
@@ -677,13 +682,14 @@ struct JobPlan {
    * @brief Pinned host buffers owned by this JobPlan
    *
    * Stores pinned memory buffers (e.g., for correction tensors) that must
-   * remain alive for the lifetime of the JobPlan. Steps reference these
-   * buffers via raw pointers. Buffers are automatically freed when JobPlan
-   * is destroyed.
+   * remain alive for the lifetime of the JobPlan. Buffers are shared: a D2H
+   * step and each DMA it launches also hold a reference, so a transfer still
+   * in flight when the JobPlan is destroyed never writes into freed memory
+   * (torch-spyre#6063).
    *
    */
   // TODO(jni): not safe for multi streams. Make it per-stream. See #2520.
-  std::vector<HostBuffer> pinned_buffers;
+  std::vector<std::shared_ptr<HostBuffer>> pinned_buffers;
 
   /**
    * @brief Compiled programs

@@ -53,9 +53,13 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
     const auto& device_address =
         std::get<flex::CompositeAddress>(device_address_);
     auto* params =
-        flex::createDmaParams(host_address_, device_address.total_size(),
+        flex::createDmaParams(host_buffer_->data(), device_address.total_size(),
                               /*to_device=*/false, &device_address);
     params->pipeline_barrier = pipeline_barrier_;
+    // The DMA writes into host_buffer_ asynchronously; keep it alive until the
+    // transfer completes even if the JobPlan is destroyed first (#6063).
+    params->callback = [host_buffer = host_buffer_](
+                           void*, const flex::FlexCallbackMetadata*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   } else {
@@ -83,12 +87,14 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
     auto device_address =
         std::make_shared<flex::CompositeAddress>(offset_chunk);
 
-    auto* params =
-        flex::createDmaParams(host_address_, device_address->total_size(),
-                              /*to_device=*/false, device_address.get());
+    auto* params = flex::createDmaParams(
+        host_buffer_->data(), device_address->total_size(),
+        /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
-    params->callback = [device_address](void*,
-                                        const flex::FlexCallbackMetadata*) {};
+    // Keep both the device address and the destination host buffer alive
+    // until the asynchronous transfer completes (#6063).
+    params->callback = [device_address, host_buffer = host_buffer_](
+                           void*, const flex::FlexCallbackMetadata*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -102,7 +108,7 @@ void JobPlanStepD2H::write(std::ostream& os) const {
   } else {
     os << "    Device dmva: " << std::get<Dmva>(device_address_).value << "\n";
   }
-  os << "    Host address: " << host_address_ << "\n";
+  os << "    Host address: " << host_buffer_->data() << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }
@@ -314,7 +320,7 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   // Pinned buffers
   os << "Pinned buffers: " << plan.pinned_buffers.size() << "\n";
   for (size_t i = 0; i < plan.pinned_buffers.size(); ++i) {
-    const auto& buf = plan.pinned_buffers[i];
+    const auto& buf = *plan.pinned_buffers[i];
     os << "  Buffer " << i << ": ptr=" << buf.data() << ", size=" << buf.size()
        << " bytes\n";
   }
