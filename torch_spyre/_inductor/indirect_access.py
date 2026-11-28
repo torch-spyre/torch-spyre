@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from typing import Callable
 
-from sympy import Symbol
+from sympy import Integer, Symbol
 
 from .op_spec import IndirectAccess, OpSpec, TensorArg
 
@@ -71,6 +72,53 @@ def get_index_tensor_for_value(
         if getattr(arg, "name", "") in names:
             return arg
     return None
+
+
+def restore_unit_indirect_dim(op_spec: OpSpec) -> OpSpec:
+    """Re-add the size-1 loop Inductor drops on the dim an indirect write indexes.
+
+    Without it the index and source hold ``0`` where the destination has
+    ``IndirectAccess``, the SDSC loses that dim, and dbo-opt fails with
+    "Expect valid alloc users" (#4926). A size-1 loop only takes the value 0,
+    so putting it in place of that ``0`` changes no address.
+    """
+    for value in filter(is_indirect_value_tensor, op_spec.args):
+        index = get_index_tensor_for_value(op_spec, value)
+        rank = len(value.device_coordinates)
+        # Element-wise writes only (the index walks the destination's stick): a
+        # gather's input and a row index have their own handling.
+        if (
+            value.is_input
+            or index is None
+            or len(index.device_coordinates) != rank
+            or index.device_coordinates[-1] != value.device_coordinates[-1]
+        ):
+            continue
+        for pos, coord in enumerate(value.device_coordinates):
+            if not (
+                isinstance(coord, IndirectAccess)
+                and index.device_coordinates[pos] == 0
+                and index.device_size[pos] == 1
+            ):
+                continue
+            unit = Symbol("unit_indirect")
+            args = []
+            for arg in op_spec.args:
+                coords = list(arg.device_coordinates)
+                if arg is not value and len(coords) == rank and coords[pos] == 0:
+                    coords[pos] = unit
+                    arg = dataclasses.replace(arg, device_coordinates=coords)
+                args.append(arg)
+            work = op_spec.core_id_to_work_slice
+            return dataclasses.replace(
+                op_spec,
+                args=args,
+                iteration_space={unit: (Integer(1), 1), **op_spec.iteration_space},
+                core_id_to_work_slice=None
+                if work is None
+                else {unit: Integer(0), **work},
+            )
+    return op_spec
 
 
 def get_indirect_stride_idx(arg: TensorArg) -> int | None:

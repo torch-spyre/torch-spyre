@@ -658,6 +658,45 @@ class TestScatterRouterMaps:
 
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestScatterSingletonIndexDim0:
+    """torch.scatter dim=0 with a one-row index and source (#4926)."""
+
+    def test_scatter_dim0_one_row_index_fp32(self, execution_mode):
+        """Element-wise scatter dim=0, dest (8, 16), index/src (1, 16) (#4926)."""
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4409
+        _xfail_existing(
+            execution_mode,
+            eager=rejection(
+                1002,
+                "aten::scatter.src_out is not registered on Spyre.",
+                r"Could not run 'aten::scatter.src_out'",
+            ),
+            compiled=(
+                4409,
+                "compile element-wise scatter along dim 0: dbo-opt fails in sbf-ddc "
+                "with 'Expect index stick dim to be innermost in chunk loop order'.",
+                r"SubprocException.*Expect index stick dim to be innermost",
+            ),
+        )
+        dest = torch.zeros(8, 16, dtype=torch.float32)
+        src = torch.randn(1, 16, dtype=torch.float32)
+        # One write per column, so the result is well defined.
+        index = torch.tensor(
+            [[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int64
+        )
+        compare_mode(
+            execution_mode,
+            lambda d, i, s: d.scatter(0, i, s),
+            dest,
+            index,
+            src,
+            atol=0,
+            rtol=0,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
 class TestScatterValueStamp:
     """Scalar scatter_ extra dest ranks — grouped_mm offs and KV-cache slots. #4436 / #4472."""
 

@@ -64,6 +64,7 @@ from torch_spyre._inductor.indirect_access import (
     get_value_tensor_idx_for_index,
     is_index_tensor,
     is_indirect_value_tensor,
+    restore_unit_indirect_dim,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
@@ -3212,6 +3213,7 @@ def compile_op_spec(
     symbols: list[int],
     symbol_id_offset: int = 0,
 ) -> tuple[Any, list[int], list[list[dict]], list[SymbolKind]]:
+    op_spec = restore_unit_indirect_dim(op_spec)
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
     # Translate tiled_symbols from OpSpec's per-level inductor symbols (innermost-
