@@ -547,6 +547,12 @@ def _patch_tensor_for_spyre():
     # ``orig_to`` semantics for them).
     torch._dynamo.allow_in_graph(torch.Tensor.to)
     torch.empty = spyre_empty
+    # AOTAutogradCache finds a graph's call targets by import path; publish both
+    # wrappers at module level so graphs that call them can be cached (see
+    # torch_spyre._inductor._allow_tensor_wrapper_caching).
+    for wrapper in (spyre_to, spyre_empty):
+        wrapper.__qualname__ = wrapper.__name__
+        globals()[wrapper.__name__] = wrapper
 
     # ── Optimal weight loading (issue #1339) ──────────────
     # Patch dim_order=[1,0] transfer + nn.Module.to override (issue #1339).
