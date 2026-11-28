@@ -306,6 +306,53 @@ def test_the_runner_labels_are_the_ones_the_perf_job_uses():
         assert label in perf and label in WORKFLOW.read_text()
 
 
+def _labels(job):
+    """One job's runs-on as a single string, whether it is written as a list or an expression."""
+    runs_on = workflow()["jobs"][job]["runs-on"]
+    return " ".join(runs_on) if isinstance(runs_on, list) else runs_on
+
+
+def test_a_caller_named_image_still_asks_for_a_card():
+    """runner_label names an image; asking for it alone matches that image's zero-card pod too."""
+    bench = _labels("bench")
+    assert "inputs.runner_label" in bench
+    for label in ("x86_64", "spyre_pf_x1", "linux"):
+        assert label in bench, f"{label} is not in the bench job's runs-on"
+    # The subject of the rows is the image the bench job ran on, not the standing one.
+    identity = _labels("artifact_identity")
+    assert "inputs.runner_label" in identity and "spyre_pf_x0" in identity
+
+
+def _card_guard_snippet():
+    run = next(s for s in workflow()["jobs"]["bench"]["steps"] if s.get("id") == "run")[
+        "run"
+    ]
+    return "cards=" + run.partition("cards=")[2].split("source ")[0]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize(
+    "env,rc",
+    [
+        ({"AIU_WORLD_SIZE": "1"}, 0),
+        ({"AIU_WORLD_SIZE": "2"}, 0),
+        ({"SPYRE_DEVICES": "0"}, 0),
+        ({}, 1),
+        ({"AIU_WORLD_SIZE": "0"}, 1),
+        ({"AIU_WORLD_SIZE": ""}, 1),
+        ({"AIU_WORLD_SIZE": "not-a-number"}, 1),
+    ],
+)
+def test_the_card_guard_passes_only_with_a_device(env, rc):
+    r = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", _card_guard_snippet()],
+        env={"PATH": os.environ["PATH"], **env},
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == rc, r.stdout + r.stderr
+
+
 def test_the_smoke_mode_ingests_nothing_and_needs_no_cards():
     steps = {s.get("id") or s["name"]: s for s in workflow()["jobs"]["bench"]["steps"]}
     for key in ("plan", "run", "collect", "ingest", "verdict"):

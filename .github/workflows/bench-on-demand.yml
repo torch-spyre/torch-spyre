@@ -27,7 +27,7 @@ on:
         type: string
         default: ''
       runner_label:
-        description: Standing runner-set label to target; empty = the default one-card set
+        description: Runner-set label of the image to run in; empty = image_spyre_backend. The card label is this workflow's own.
         required: false
         type: string
         default: ''
@@ -113,11 +113,13 @@ jobs:
   artifact_identity:
     name: Derive artifact identity
     if: ${{ !inputs.smoke }}
+    # The image the bench job runs on, so the identity describes the subject under test rather than the
+    # standing image; no card, so the x0 set.
     runs-on:
       - x86_64
       - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - ${{ inputs.runner_label || 'image_spyre_backend' }}
     timeout-minutes: 10
     continue-on-error: true
     outputs:
@@ -148,8 +150,11 @@ jobs:
     name: On-demand op benchmarks (advisory)
     needs: [artifact_identity]
     if: ${{ !cancelled() }}
-    # smoke wins (hosted, card-free); then a caller-named standing set; else the default one-card set.
-    runs-on: ${{ inputs.smoke && fromJSON('["ubuntu-latest"]') || inputs.runner_label != '' && fromJSON(format('["{0}"]', inputs.runner_label)) || fromJSON('["x86_64","spyre_pf_x1","linux","image_spyre_backend"]')
+    # smoke wins (hosted, card-free); otherwise a one-card runner of the image the caller named. The
+    # label set always stays complete: runner_label is the image label, and asking for it alone matches
+    # that image's zero-card pod just as readily -- which is how every op case came back
+    # `repeats_failed` behind `IBM AIU Devices Found: 0`.
+    runs-on: ${{ inputs.smoke && fromJSON('["ubuntu-latest"]') || fromJSON(format('["x86_64","spyre_pf_x1","linux","{0}"]', inputs.runner_label || 'image_spyre_backend'))
       }}
     timeout-minutes: 240
     # Advisory: a failing benchmark never turns the workflow red or blocks anything.
@@ -290,6 +295,14 @@ jobs:
           # shellcheck disable=SC1090
           source "${RUNNER_SETUP_SCRIPT}" || exit 1
           set -u
+          # Say so once, here: a card-less runner otherwise shows up as every case failing with
+          # `repeats_failed` and nothing naming the missing device.
+          cards="${AIU_WORLD_SIZE:-0}"
+          case "${cards}" in '' | *[!0-9]*) cards=0 ;; esac
+          if [ "${cards}" -lt 1 ] && [ -z "${SPYRE_DEVICES:-}" ]; then
+            echo "::error::no AIU device on this runner (AIU_WORLD_SIZE='${AIU_WORLD_SIZE:-unset}', SPYRE_DEVICES='${SPYRE_DEVICES:-unset}'); the op cases need one"
+            exit 1
+          fi
           # shellcheck disable=SC1091
           source "${PREBAKED_VENV_PATH}/bin/activate"
           make bench-run BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1 \
