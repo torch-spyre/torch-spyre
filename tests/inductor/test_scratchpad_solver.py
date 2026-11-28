@@ -2342,6 +2342,19 @@ class TestSympyExprToCpSatPrinter(TestCase):
             # The single-menu table fits, but multiplying its wide integer
             # by z does not. The original factored terms still fit the bound.
             sympy.Piecewise((80_000_000 * x, x <= 2), (80_000_000 * x + 1, True)) * z,
+            # The same overflow under a Piecewise the table cannot absorb (its
+            # guard reads the free residency flag): the untabled retry has to
+            # re-lower the Piecewise, not reuse its tabled lowering.
+            sympy.Piecewise(
+                (
+                    sympy.Piecewise(
+                        (80_000_000 * x, x <= 2), (80_000_000 * x + 1, True)
+                    ),
+                    resident > 0,
+                ),
+                (0, True),
+            )
+            * z,
             sympy.Piecewise(
                 (0.25 * x * y, sympy.And(x >= 2, y >= 2)),
                 (1e-6 * x**2, sympy.Or(x <= 1, y <= 1)),
