@@ -222,6 +222,33 @@ def _get_backend_compiler_version() -> str:
     return f"deeptools={versions['ibm-deeptools']};flex={versions['ibm-flex']}"
 
 
+@lru_cache(maxsize=8)
+def _dbo_opt_identity(path_env: str) -> str:
+    """Identify the ``dbo-opt`` binary that the compile will run.
+
+    ``_get_backend_compiler_version()`` reads the deeptools release from
+    ``LIB_VERSION_FILE``, which does not change when a developer rebuilds
+    deeptools locally, so the key must also cover the binary itself: its
+    resolved path plus mtime and size.  Resolution uses the same PATH the
+    compile subprocess receives (``_run_backend_compiler`` passes the parent's
+    ``os.environ``).
+
+    Never raises: if dbo-opt cannot be found the compile itself fails with a
+    clear message (``_check_backend_compiler_on_path``), so the key only needs
+    to be stable here.  The result is memoised per PATH value, so a rebuild
+    during one process is not noticed until the next.
+    """
+    path = shutil.which("dbo-opt", path=path_env)
+    if path is None:
+        return "dbo-opt=unresolved"
+    real = os.path.realpath(path)
+    try:
+        st = os.stat(real)
+    except OSError:
+        return f"dbo-opt={real}"
+    return f"dbo-opt={real}:{st.st_mtime_ns}:{st.st_size}"
+
+
 @lru_cache(maxsize=1)
 def _get_torch_spyre_version() -> str:
     """Return the torch_spyre package version string."""
@@ -311,6 +338,10 @@ def _key_context(
         # indistinguishable -- _REQUIRED_ARTIFACTS are the same filenames --
         # and would be served as hits, so dbo-opt would never run.
         "backend=dbo-opt",
+        # The dbo-opt binary that actually runs, so a local deeptools rebuild
+        # invalidates entries (and stored precomputed keys) without clearing
+        # the cache by hand.
+        _dbo_opt_identity(os.environ.get("PATH", os.defpath)),
     ]
     return fields, versions
 
@@ -377,6 +408,12 @@ def compute_specs_hash(
     specs_list = list(specs)
 
     content_parts: list[bytes] = []
+    # Always include use_symbols as an explicit discriminator so that two
+    # compilations of the same specs under different BUNDLE_SYMBOLIC_ARGS
+    # settings never collide, even when the symbol-kind tag list is empty
+    # (e.g. a pure pointwise op with no pool/slice/derived symbols).
+    content_parts.append(f"use_symbols:{int(use_symbols)}".encode())
+
     symbols: list[int] = []
     symbol_id_offset = 0
     sdsc_idx = 0
@@ -498,12 +535,21 @@ def compute_specs_hash(
                 # IDs in sdsc_N.json, so they must be hashed separately to
                 # distinguish graphs that differ only in their offsets.
                 if use_symbols:
-                    for sk in local_symbol_kinds:
+                    # local_sym_values is parallel to local_symbol_kinds. A pool
+                    # symbol's offset lives only in its key (see offset_as_symbol:
+                    # ("pool", offset)); SymbolKind.pool() carries no offset.
+                    for sk, sym_key in zip(local_symbol_kinds, local_sym_values):
                         if sk.kind == "pool":
-                            tag = f"pool:{sk.offset}"
+                            assert sym_key[0] == "pool", sym_key
+                            tag = f"pool:{sym_key[1]}"
                             content_parts.append(tag.encode())
                             _debug_pool_offsets.append(tag)
-                            logger.debug("  [hash]   pool offset=%d", sk.offset)
+                            logger.debug("  [hash]   pool offset=%d", sym_key[1])
+                        elif sk.kind == "kernel":
+                            tag = f"kernel:arg{sk.arg_index}"
+                            content_parts.append(tag.encode())
+                            _debug_pool_offsets.append(tag)
+                            logger.debug("  [hash]   kernel arg%d", sk.arg_index)
                         elif sk.kind == "kernel_slice":
                             tag = f"slice:arg{sk.arg_index}:{sk.offset}"
                             content_parts.append(tag.encode())
@@ -859,12 +905,39 @@ def register_precomputed_key(cache_key: str, kernel_name: str, specs: Sequence) 
     )
 
 
+def _incomplete_reason(kernel_dir: str) -> Optional[str]:
+    """Return why kernel_dir is not a usable cache entry, or None if it is complete.
+
+    Checks for every entry in _REQUIRED_ARTIFACTS and at least one sdsc_N.json.
+    Shared by get_cached_kernel_dir and commit_compile_dir so a lookup and a
+    commit never disagree about whether an entry is usable.
+    """
+    missing = [
+        p
+        for p in _REQUIRED_ARTIFACTS
+        if not os.path.isfile(os.path.join(kernel_dir, p))
+    ]
+    if missing:
+        return f"missing artifacts {missing}"
+
+    try:
+        has_sdsc = any(
+            f.startswith("sdsc_") and f.endswith(".json")
+            for f in os.listdir(kernel_dir)
+            if os.path.isfile(os.path.join(kernel_dir, f))
+        )
+    except OSError as e:
+        return f"unreadable ({e})"
+    if not has_sdsc:
+        return "no sdsc_N.json files"
+    return None
+
+
 def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
     """Return the cached kernel directory if all required artifacts are present.
 
-    Checks for every entry in _REQUIRED_ARTIFACTS and at least one sdsc_N.json.
-    A partial write from a killed process will fail this check and trigger
-    recompilation.
+    A partial write from a killed process will fail the completeness check and
+    trigger recompilation.
     """
     cache_root = get_cache_root_dir()
     cached_dir = os.path.join(cache_root, cache_key)
@@ -873,28 +946,10 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
         logger.info("Cache MISS: No cached kernel found for key %s", cache_key)
         return None
 
-    missing = [
-        p
-        for p in _REQUIRED_ARTIFACTS
-        if not os.path.isfile(os.path.join(cached_dir, p))
-    ]
-    if missing:
+    reason = _incomplete_reason(cached_dir)
+    if reason is not None:
         logger.info(
-            "Cache MISS: Cached dir exists but missing artifacts %s for key %s",
-            missing,
-            cache_key,
-        )
-        return None
-
-    has_sdsc = any(
-        f.startswith("sdsc_") and f.endswith(".json")
-        for f in os.listdir(cached_dir)
-        if os.path.isfile(os.path.join(cached_dir, f))
-    )
-    if not has_sdsc:
-        logger.info(
-            "Cache MISS: No sdsc_N.json files found in cached dir for key %s",
-            cache_key,
+            "Cache MISS: Cached dir for key %s is incomplete: %s", cache_key, reason
         )
         return None
 
@@ -964,30 +1019,79 @@ def allocate_compile_dir(cache_key: str, *, kernel_name: str = "") -> str:
 def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
     """Atomically promote tmp_dir to <cache_root>/<cache_key>/.
 
-    If another process already committed the same key, discards the temp dir
-    and reuses the existing entry. Returns the final cache dir.
+    Uses ``os.rename`` as the sole synchronisation point — it is atomic on
+    POSIX when source and destination are on the same filesystem (guaranteed
+    by ``allocate_compile_dir`` placing tmp_dir inside the cache root).
+
+    If another process committed the same key concurrently, ``os.rename``
+    raises ``OSError`` (ENOTEMPTY / EEXIST on Linux).  A pre-check with
+    ``os.path.isdir`` would introduce a TOCTOU race window without adding any
+    safety, so it is intentionally absent.  Only a *complete* existing entry
+    is treated as the winner of a race: we discard our copy and return it.
+
+    An existing entry that is incomplete (for example one committed from a
+    mocked backend compiler, or left by a killed process) is not a winner.
+    get_cached_kernel_dir reports it as a miss, so reusing it here would make
+    the key permanently unusable: every compile would be thrown away and the
+    incomplete dir loaded.  It is moved to ``failed/`` and the rename retried.
+    Returns the final cache dir.
     """
     cache_root = get_cache_root_dir()
     cached_dir = os.path.join(cache_root, cache_key)
 
-    if os.path.isdir(cached_dir):
-        # Another process/thread won the race — discard our copy, but first
-        # merge our recorded kernel names into the winner's file so no name
-        # is lost.
-        _merge_kernel_names(tmp_dir, cached_dir)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
-        return cached_dir
+    # One retry is enough: after quarantining the incomplete entry the only
+    # thing that can still block the rename is another process committing the
+    # same key, and that winner is checked for completeness on the next pass.
+    for _attempt in range(2):
+        try:
+            os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
+            logger.info("Saved compiled kernel to cache: %s", cached_dir)
+            return cached_dir
+        except OSError:
+            reason = _incomplete_reason(cached_dir)
+            if reason is None:
+                _merge_kernel_names(tmp_dir, cached_dir)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                logger.info(
+                    "Cache race resolved: reusing existing entry at %s", cached_dir
+                )
+                return cached_dir
+            logger.warning(
+                "Cache entry %s is incomplete (%s); moving it to failed/ and "
+                "committing the new compile in its place.",
+                cached_dir,
+                reason,
+            )
+            _quarantine_incomplete_dir(cached_dir)
 
+    # Both attempts lost to something that was not a complete entry. tmp_dir is
+    # complete and lives in the cache root, so load from it rather than fail.
+    logger.warning(
+        "Could not commit %s to the kernel cache; using it in place.", tmp_dir
+    )
+    return tmp_dir
+
+
+def _quarantine_incomplete_dir(kernel_dir: str) -> None:
+    """Move an incomplete cache entry to ``failed/`` under a unique name.
+
+    Unlike _move_to_failed_dir the destination gets a uuid suffix, so repeated
+    quarantines of the same key never collide on a non-empty ``failed/<key>``.
+    Never raises: if the move fails, the caller's retry loop gives up.
+
+    Another process may have replaced the dir with a complete entry between the
+    caller's check and this move; that only costs a cache entry (the next
+    lookup misses and recompiles), never correctness.
+    """
+    failed_root = os.path.join(get_cache_root_dir(), "failed")
     try:
-        os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
-        logger.info("Saved compiled kernel to cache: %s", cached_dir)
-    except OSError:
-        _merge_kernel_names(tmp_dir, cached_dir)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
-
-    return cached_dir
+        os.makedirs(failed_root, exist_ok=True)
+        dest = os.path.join(
+            failed_root, f"{os.path.basename(kernel_dir)}.incomplete.{uuid.uuid4().hex}"
+        )
+        os.rename(kernel_dir, dest)
+    except OSError as e:
+        logger.info("Could not quarantine incomplete entry %s: %s", kernel_dir, e)
 
 
 def _merge_kernel_names(tmp_dir: str, cached_dir: str) -> None:

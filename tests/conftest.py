@@ -630,6 +630,25 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         terminalreporter.write_line(rep.nodeid)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_kernel_cache():
+    """Give every test its own, empty inductor/Spyre kernel cache.
+
+    The kernel cache is on by default, so any test that compiles writes entries
+    under the cache root. Without this, tests using ``mock_backend_compiler()``
+    (which writes no ``init_binary.bin``) would commit incomplete entries into
+    the developer's real cache. ``InductorTestCase`` already does this per test;
+    this covers plain pytest functions too. Nesting ``fresh_cache()`` is safe.
+    """
+    try:
+        from torch._inductor.utils import fresh_cache
+    except ImportError:  # tests that do not need torch
+        yield
+        return
+    with fresh_cache():
+        yield
+
+
 def _is_spyre_hardware_available() -> bool:
     """
     Detect whether Spyre hardware is available.

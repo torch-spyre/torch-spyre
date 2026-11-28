@@ -31,7 +31,7 @@ from torch._inductor.scheduler import (
     SchedulerNode,
 )
 from torch._inductor.test_case import TestCase as InductorTestCase
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import fresh_cache, run_and_get_code
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from utils_inductor import mock_backend_compiler
@@ -848,12 +848,34 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             output_dirs_by_kernel[kernel_name] = output_dir
             return output_dir
 
+        from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+
+        real_runner_cls = SpyreSDSCKernelRunner
+        # fresh_cache() deletes its directory when the with-block exits, and a
+        # kernel dir can be moved aside by a later commit under the same key, so
+        # read each bundle while it exists rather than after the block.
+        bundle_texts_by_kernel = {}
+
+        def _recording_runner(kernel_name, code_dir, **kwargs):
+            output_dirs_by_kernel.setdefault(kernel_name, code_dir)
+            with open(os.path.join(code_dir, "bundle.mlir")) as f:
+                bundle_texts_by_kernel[kernel_name] = f.read()
+            return real_runner_cls(kernel_name, code_dir, **kwargs)
+
+        # fresh_cache() so the compile always misses the kernel cache and the
+        # fallback warning is guaranteed to fire.
         with (
+            fresh_cache(),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),
             mock_patch.object(
                 async_compile_mod, "get_output_dir", _recording_get_output_dir
+            ),
+            mock_patch.object(
+                async_compile_mod,
+                "SpyreSDSCKernelRunner",
+                side_effect=_recording_runner,
             ),
             pytest.warns(UserWarning),
         ):
@@ -884,12 +906,8 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         self.assertTrue(kernel_names)
         saw_pool_allocate = False
         for kernel_name in kernel_names:
-            self.assertIn(kernel_name, output_dirs_by_kernel)
-            bundle_path = os.path.join(
-                output_dirs_by_kernel[kernel_name], "bundle.mlir"
-            )
-            with open(bundle_path) as f:
-                bundle_text = f.read()
+            self.assertIn(kernel_name, bundle_texts_by_kernel)
+            bundle_text = bundle_texts_by_kernel[kernel_name]
             self.assertNotIn("%pool_base_addr", bundle_text)
             if "device_mem_allocate" in bundle_text:
                 saw_pool_allocate = True
@@ -915,6 +933,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
 
         with (
+            fresh_cache(),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),

@@ -233,6 +233,73 @@ class TestSymbolKindTagging(unittest.TestCase):
             "different offsets produce different hashes even with use_symbols=False.",
         )
 
+    def test_pool_layout_changes_hash_when_sdsc_json_identical(self):
+        """Same SDSC JSON, same ops, but the pool offsets are assigned to the ops
+        in a different order (e.g. fused ops whose buffers are swapped, as in
+        left-pad vs right-pad). The pool offsets only reach bundle.mlir, so the
+        hash must cover them or the second kernel is served the first one's
+        cache entry."""
+        from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+
+        def _fake_compile(offsets):
+            def fake(idx, entry, symbols, symbol_id_offset):
+                keys = [("pool", o) for o in offsets]
+                kinds = [SymbolKind.pool() for _ in offsets]
+                return {"same": "json"}, keys, [], kinds
+
+            return fake
+
+        specs = [_make_op_spec()]
+        with patch(
+            "torch_spyre._inductor.codegen.superdsc.compile_op_spec",
+            _fake_compile([0, 128, 256]),
+        ):
+            h_low = _hash(specs, use_symbols=True)
+        with patch(
+            "torch_spyre._inductor.codegen.superdsc.compile_op_spec",
+            _fake_compile([384, 512, 640]),
+        ):
+            h_high = _hash(specs, use_symbols=True)
+
+        self.assertNotEqual(
+            h_low,
+            h_high,
+            "Pool offsets that appear only in bundle.mlir must change the hash.",
+        )
+
+    def test_kernel_arg_wiring_changes_hash_when_sdsc_json_identical(self):
+        """Same SDSC JSON, but the op reads different kernel args (e.g. arg_0 and
+        arg_3 vs arg_3 and arg_4). The wiring only reaches bundle.mlir, so the
+        hash must cover it."""
+        from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+
+        def _fake_compile(arg_indices):
+            def fake(idx, entry, symbols, symbol_id_offset):
+                keys = [("kernel", a) for a in arg_indices]
+                kinds = [SymbolKind.kernel(arg_index=a) for a in arg_indices]
+                return {"same": "json"}, keys, [], kinds
+
+            return fake
+
+        specs = [_make_op_spec()]
+        with patch(
+            "torch_spyre._inductor.codegen.superdsc.compile_op_spec",
+            _fake_compile([0, 3]),
+        ):
+            h_a = _hash(specs, use_symbols=True)
+        with patch(
+            "torch_spyre._inductor.codegen.superdsc.compile_op_spec",
+            _fake_compile([3, 4]),
+        ):
+            h_b = _hash(specs, use_symbols=True)
+
+        self.assertNotEqual(
+            h_a,
+            h_b,
+            "Kernel argument wiring that appears only in bundle.mlir must change "
+            "the hash.",
+        )
+
 
 class TestAffineStridesHashed(unittest.TestCase):
     """affine_strides (per-level tile byte strides) must be included in
@@ -502,6 +569,102 @@ class TestVersionStringsHashed(unittest.TestCase):
         h1 = self._hash_with_versions("1.0.0", "0.0.1")
         h2 = self._hash_with_versions("1.0.0", "0.0.1")
         self.assertEqual(h1, h2, "Same versions must produce the same hash.")
+
+
+class TestBackendCompilerInputsHashed(unittest.TestCase):
+    """Inputs that reach dbo-opt but not the SDSC JSON must change the key."""
+
+    def _key(self, *, device: str = "", dbo_opt_identity: str = "dbo-opt=/a:1:1"):
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        with (
+            patch(
+                "torch_spyre.execution.kernel_cache._get_backend_compiler_version",
+                return_value="test-backend-1.0",
+            ),
+            patch(
+                "torch_spyre.execution.kernel_cache._get_torch_spyre_version",
+                return_value="test-spyre-0.0",
+            ),
+            patch(
+                "torch_spyre.execution.kernel_cache._dbo_opt_identity",
+                return_value=dbo_opt_identity,
+            ),
+            patch("torch_spyre._inductor.config.bundle_symbolic_args", False),
+            patch("torch_spyre._inductor.config.ktir_device_mlir", device),
+        ):
+            return compute_specs_hash([_make_op_spec()], kernel_name="k")
+
+    def test_ktir_device_mlir_changes_hash(self):
+        self.assertNotEqual(
+            self._key(device="/dev_a.mlir"),
+            self._key(device="/dev_b.mlir"),
+            "--device=... reaches dbo-opt, so a different device file must "
+            "not share a cache entry.",
+        )
+
+    def test_ktir_device_mlir_default_follows_config(self):
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        with patch("torch_spyre._inductor.config.ktir_device_mlir", "/dev_a.mlir"):
+            explicit = self._key(device="/dev_a.mlir")
+            with (
+                patch(
+                    "torch_spyre.execution.kernel_cache._get_backend_compiler_version",
+                    return_value="test-backend-1.0",
+                ),
+                patch(
+                    "torch_spyre.execution.kernel_cache._get_torch_spyre_version",
+                    return_value="test-spyre-0.0",
+                ),
+                patch(
+                    "torch_spyre.execution.kernel_cache._dbo_opt_identity",
+                    return_value="dbo-opt=/a:1:1",
+                ),
+                patch("torch_spyre._inductor.config.bundle_symbolic_args", False),
+            ):
+                implicit = compute_specs_hash([_make_op_spec()], kernel_name="k")
+        self.assertEqual(explicit, implicit)
+
+    def test_dbo_opt_binary_change_changes_hash(self):
+        self.assertNotEqual(
+            self._key(dbo_opt_identity="dbo-opt=/a:1:1"),
+            self._key(dbo_opt_identity="dbo-opt=/a:2:1"),
+            "A rebuilt dbo-opt must invalidate entries it did not produce.",
+        )
+
+
+class TestDboOptIdentity(unittest.TestCase):
+    def setUp(self):
+        from torch_spyre.execution.kernel_cache import _dbo_opt_identity
+
+        self.fn = _dbo_opt_identity
+        self.fn.cache_clear()
+        self.addCleanup(self.fn.cache_clear)
+
+    def test_unresolved_does_not_raise(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertEqual(self.fn(empty), "dbo-opt=unresolved")
+
+    def test_mtime_and_size_are_part_of_identity(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "dbo-opt")
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(exe, 0o755)
+            first = self.fn(d)
+            self.assertIn(os.path.realpath(exe), first)
+
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n# rebuilt\n")
+            os.utime(exe, ns=(1, 1))
+            self.fn.cache_clear()
+            self.assertNotEqual(first, self.fn(d))
 
 
 if __name__ == "__main__":

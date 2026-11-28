@@ -865,13 +865,19 @@ Environment Variables
        stderr (default empty)
    * - ``SPYRE_KERNEL_CACHE``
      - Cache compiled Spyre kernels on disk and reuse them across
-       invocations (default ``0``; set ``1`` to enable). When enabled,
+       invocations (default ``1``; set ``0`` to disable). When enabled,
        ``LIB_VERSION_FILE`` must point at the compiler version file, which
        supplies the compiler version for the cache key. If it is unset, the
        cache key cannot be computed: torch-spyre logs a warning and compiles
        that kernel without caching instead of failing. Set
        ``SPYRE_KERNEL_CACHE=0`` to run without caching when no version file is
-       available
+       available. Entries live in ``inductor-spyre-cache/`` under the Inductor
+       cache directory, which ``TORCHINDUCTOR_CACHE_DIR`` sets. To clear the
+       cache, call ``torch_spyre.execution.kernel_cache.clear_cache()`` or
+       delete that directory. The key covers the ``dbo-opt`` binary (resolved
+       path, mtime and size) and ``KTIR_DEVICE_MLIR``, so rebuilding deeptools
+       or changing the device file starts a fresh set of entries. Entries from
+       older compilers are not removed automatically
    * - ``LIB_VERSION_FILE``
      - Path to the compiler version file read to form the kernel-cache key.
        Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,

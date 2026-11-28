@@ -726,7 +726,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         symbol_kinds,
                         _cached_bundle_dir_prefix(cache_key),
                     )
-                except Exception:  # subprocess.CalledProcessError:
+                except Exception:  # noqa: BLE001
                     # Move the failed dir to failed/ for manual debugging
                     # rather than leaving .tmp. dirs accumulating in the root.
                     _move_to_failed_dir(compile_dir)
