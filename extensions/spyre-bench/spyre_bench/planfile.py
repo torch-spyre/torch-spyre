@@ -93,7 +93,11 @@ ENV_ALLOW = frozenset(
     | {"MAKEFLAGS", "MAKELEVEL", "MFLAGS", "CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "CPPFLAGS"}
     | {"LIBRARY_PATH", "CPATH", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"}
     | {"TRANSFORMERS_CACHE"}
+    # Upper-case spellings only: env_filter matches a name upper-cased (the variable is `pybind11_DIR`).
+    | {"_IBM_AIU_SETUP", "PYBIND11_DIR"}
 )
+# What `/etc/profile.d/ibm-aiu-setup.sh` exports: without it a case sees no card and the runtime refuses with CFGERR.
+SPYRE_DEVICE_PREFIX = ("AIU", "FLEX_", "SEN", "DEEPRT_", "DT_", "DEEPTOOLS_", "RUNTIME_", "TVM_", "MLSERVER_")
 ENV_ALLOW_PREFIX = (
     "LC_",
     "PYTHON",
@@ -106,7 +110,7 @@ ENV_ALLOW_PREFIX = (
     "CUDA_",
     "TORCH_",
     "VLLM_",
-) + ("KMP_", "GOMP_", "HF_DATASETS_", "CMAKE_", "CCACHE_")
+) + ("KMP_", "GOMP_", "HF_DATASETS_", "CMAKE_", "CCACHE_", *SPYRE_DEVICE_PREFIX)
 INGEST_ENV_PREFIX = ("CLICKHOUSE_", "INGEST_")
 
 

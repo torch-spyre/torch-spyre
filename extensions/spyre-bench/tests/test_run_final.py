@@ -289,6 +289,27 @@ class EnvSegmentTests(unittest.TestCase):
         env, dropped = planfile.env_filter({n: "v" for n in names})
         self.assertEqual((sorted(env), dropped), (sorted(names), {}))
 
+    def test_a_case_inherits_the_whole_spyre_device_environment(self):
+        """Every name `/etc/profile.d/ibm-aiu-setup.sh` exports on a one-card host: drop one and the runtime
+        refuses with CFGERR, which reaches the leg as `repeats_failed` and names no cause."""
+        names = [
+            "AIU_WORLD_SIZE", "AIU_WORLD_RANK_0", "AIU_DEVICE_0", "AIU_ENV_FILE", "AIU_TOPO_FILE",
+            "AIU_AUTOGEN_SENLIB_CONFIG_FILE", "AIU_TIER_0_NUM_SETS", "AIU_TIER_0_SET_0_SIZE", "AIU_TIER_0_SET_0_RANK_0",
+            "AIUCARDMGMT_INSTALL_DIR", "FLEX_DEVICE", "FLEX_COMPUTE", "SENCORES", "SENDNN_DIR", "SENDNN_INSTALL_DIR",
+            "SENLIB_INSTALL_DIR", "SENTIENT_BASE_INSTALL_DIR", "SENTINYEXEC_INSTALL_DIR", "SEN_PROJECT_PACKAGE",
+            "SEN_COMMON_HEADERS", "DT_DEEPRT_VERBOSE", "DEEPTOOLS_INSTALL_DIR", "DEEPTOOLS_PATH",
+            "RUNTIME_INSTALL_DIR", "RUNTIME_FULL_INSTALL_DIR", "TVM_INSTALL_DIR", "MLSERVER_TVM_INSTALL_DIR",
+            "_IBM_AIU_SETUP", "pybind11_DIR",
+        ]  # fmt: skip
+        env, dropped = planfile.env_filter({n: "v" for n in names})
+        self.assertEqual((sorted(env), dropped), (sorted(names), {}))
+
+    def test_a_secret_in_a_device_family_is_still_withheld(self):
+        """The new families widen what a case inherits, not what a secret-looking name may carry."""
+        env, dropped = planfile.env_filter({"AIU_PROFILING_CREDS": "v", "SENLIB_API_KEY": "v", "FLEX_DEVICE": "PF"})
+        self.assertEqual(env, {"FLEX_DEVICE": "PF"})
+        self.assertEqual(sorted(dropped), ["AIU_PROFILING_CREDS", "SENLIB_API_KEY"])
+
     def test_a_proxy_with_credentials_reaches_the_ingest_only_when_named(self):
         env = {"HTTPS_PROXY": "http://user:pw0rd@proxy:3128", "PATH": "/bin"}
         self.assertNotIn("HTTPS_PROXY", planfile.ingest_env(env, (), "/h"))
