@@ -14,8 +14,13 @@ python3 examples.py add mm     # or just some
 `examples.py` compiles each op with `torch.compile(fn, backend="inductor")`,
 checks the result against CPU, and copies the one kernel directory it produces
 to `build/<name>`. That directory holds the SDSC bundle (`bundle.mlir`,
-`sdsc_*.json`) and `spyreCodeDir/`, which is what `spyre launch` loads. Ops that
-compile to more than one kernel are rejected, since `spyre launch` runs one.
+`sdsc_*.json`) and `spyreCodeDir/`, which is what `spyre launch` loads.
+
+It rejects an example that `spyre launch` could not run correctly: one that
+compiles to more than one kernel, since `spyre launch` runs one; one whose
+kernel takes its inputs in a different order than the op does; or one whose
+kernel takes arguments besides its inputs and output. The last two are read
+from the compiled wrapper's kernel call, and are described under Limitations.
 
 Tensors are fp16 unless noted:
 
@@ -38,6 +43,23 @@ Tensors are fp16 unless noted:
 | `mean_keepdim` | `a.mean(dim=-1, keepdim=True)` | `spyre launch -i 512x1024@fp16 -o 512x1@fp16 build/mean_keepdim` |
 | `mm` | `a @ b` | `spyre launch -i 512x1024@fp16 -i 1024x256@fp16 -o 512x256@fp16 build/mm` |
 | `bmm` | `torch.bmm(a, b)` | `spyre launch -i 8x128x256@fp16 -i 8x256x128@fp16 -o 8x128x128@fp16 build/bmm` |
+
+## Fused PE + SFP
+
+Each of these compiles to one kernel in which a matmul on the PE array
+(`pt`) feeds elementwise or reduction steps on the SFP (`sfp`), and
+`examples.py` checks that it uses exactly those two units. `x` is
+`512x1024`, `w` `1024x256` and `r` `512x256`:
+
+| Example | Op | Command |
+|---|---|---|
+| `mm_relu` | `relu(x @ w)` | `spyre launch -i 512x1024@fp16 -i 1024x256@fp16 -o 512x256@fp16 build/mm_relu` |
+| `mm_gelu` | `F.gelu(x @ w)` | `spyre launch -i 512x1024@fp16 -i 1024x256@fp16 -o 512x256@fp16 build/mm_gelu` |
+| `mm_silu` | `F.silu(x @ w)` | `spyre launch -i 512x1024@fp16 -i 1024x256@fp16 -o 512x256@fp16 build/mm_silu` |
+| `mm_residual` | `x @ w + r` | `spyre launch -i 512x1024@fp16 -i 1024x256@fp16 -i 512x256@fp16 -o 512x256@fp16 build/mm_residual` |
+| `mm_scale` | `(x @ w) * s`, `s` a 1-element tensor | `spyre launch -i 512x1024@fp16 -i 1024x256@fp16 -i 1@fp16 -o 512x256@fp16 build/mm_scale` |
+| `swiglu_mlp` | `F.silu(x @ w1) * (x @ w3)` | `spyre launch -i 512x1024@fp16 -i 1024x256@fp16 -i 1024x256@fp16 -o 512x256@fp16 build/swiglu_mlp` |
+| `attn_scores` | `torch.softmax(q @ k.T, dim=-1)` | `spyre launch -i 512x128@fp16 -i 512x128@fp16 -o 512x512@fp16 build/attn_scores` |
 
 The CLI fills every input with ones, so e.g. `add` prints a tensor of 2s.
 
@@ -70,3 +92,14 @@ add an entry to `EXAMPLES` and `references()` in `examples.py`.
   rejects the launch ("Number of inputs provided (2) does not match number of
   inputs expected (4)"). Ops like `torch.where(a > 0, a, b)` and an RMSNorm
   with an epsilon hit the same limit.
+  A constant passed as a tensor input instead works: `mm_scale` multiplies by
+  a 1-element tensor, and runs where the same op with a Python scalar does
+  not.
+- A kernel can take its inputs in a different order than the op, so `spyre
+  launch`, which binds positionally, runs it with the wrong tensors. The
+  kernel for `torch.addmm(b, x, w)` takes `(x, w, b, out)`. Reordering the op's
+  parameters does not help, because the kernel reorders by position: with the
+  inputs given as `(x, w, b)` it takes `(w, b, x, out)`. Launched in the op's
+  order it runs and gives wrong results, with no error. `F.linear` behaves the
+  same way, so neither is included here, and `examples.py` rejects any example
+  whose kernel reorders its inputs.
