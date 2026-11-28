@@ -137,6 +137,24 @@ class TestFallbacks(TestCase):
             self._assert_close(op, output_spyre, output_cpu)
             self.assertEqual(id(buffer_spyre), id(output_spyre))
 
+    # Spyre currently has no sort.
+    # aten.sort (and argsort) falls back to CPU.
+    # values are small integers with repeats, exact in fp16 on device, 
+    # so the stable order is checked exactly.
+    @parametrize("dtype", [torch.int32, torch.float16])
+    @parametrize("compiled", [False, True])
+    def test_sort_argsort(self, dtype, compiled):
+        x = (torch.arange(512) * 37 % 128).to(dtype).reshape(64, 8)
+
+        def fn(x):
+            values, indices = torch.sort(x, dim=-1, descending=True, stable=True)
+            return values, indices, torch.argsort(x.reshape(-1), stable=True)
+
+        run = torch.compile(fn) if compiled else fn
+        torch._dynamo.reset()
+        for out_spyre, out_cpu in zip(run(x.to("spyre")), fn(x)):
+            self.assertEqual(out_spyre.cpu(), out_cpu, exact_dtype=False)
+
 
 _WARNING_TYPES = (FallbackWarning, RetileWarning)
 _IMPORT_TIMEOUT_S = 130  # Hang guard for the subprocess's torch import.
