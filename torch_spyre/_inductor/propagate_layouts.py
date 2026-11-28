@@ -454,6 +454,31 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
+def _device_dims_match_read(
+    stl: SpyreTensorLayout, dep: MemoryDep, device_coords: list
+) -> bool:
+    """Whether each device dim that one loop variable indexes directly is exactly
+    as long as that variable's range.
+
+    A tensor declared with ``.to("spyre", dynamic=...)`` and then ``resize_``d
+    below its maximum keeps the layout of the maximum: 128 rows of ``[128, 64]``
+    fp16 sit in ``[1, 512, 64]``. A rescale keeps every device dim, so an fp32
+    conversion would get ``[2, 512, 32]`` for 128 rows, and copying that
+    staggered result to the host crashes or returns NaN (#6728). Such a read
+    takes the sliced path, which sizes the output from its host size.
+
+    Inside a compile over the declared dim, ``concretize_expr`` resolves the
+    range to the declared maximum, so the layout of the maximum still matches
+    and is rescaled. A coordinate that is not a bare variable (a tile index
+    ``floor(d/64)``, a stick position) is not checked.
+    """
+    return all(
+        stl.device_size[d] == concretize_expr(dep.ranges[c])
+        for d, c in enumerate(device_coords[:-1])
+        if isinstance(c, sympy.Symbol) and c in dep.ranges
+    )
+
+
 def _can_rescale_input_stl(
     in_layout: FixedLayout,
     output: FixedLayout,
@@ -485,6 +510,8 @@ def _can_rescale_input_stl(
     too, since the rescale has no dim to resize: a ``[16, 4096]`` hidden state
     with its 16 tokens on the stick reads at ``[d1, d0]``. Such a dim's coordinate
     carries the stick var, or is zero for a stick dim no longer than one stick.
+
+    So does a layout longer than the read (``_device_dims_match_read``).
     """
     device_coords = device_coordinates(stl, dep, None)
     stick_vars = device_coords[-1].free_symbols if device_coords else set()
@@ -493,6 +520,7 @@ def _can_rescale_input_stl(
         and dep.index == output_dep.index
         and host_coordinates(in_layout, dep, None)
         == host_coordinates(output, output_dep, None)
+        and _device_dims_match_read(stl, dep, device_coords)
         and all(len(c.free_symbols) <= 1 for c in device_coords)
         and (
             not stick_vars

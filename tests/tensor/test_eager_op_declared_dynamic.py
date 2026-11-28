@@ -195,6 +195,45 @@ class TestOtherEagerOpsOnDeclaredTensor(TestCase):
                 self.assertIn(0, x._dynamo_dynamic_indices)
 
 
+class TestDtypeConversionBelowMax(TestCase):
+    """An fp32 conversion of a declared tensor resized below its maximum. Before
+    the fix its result kept the layout of the maximum, and the copy to the host
+    crashed with SIGSEGV, or returned NaN once the tensor had been converted at
+    its maximum (#6728). Read back as ``.float().cpu()``, as the issue does.
+    """
+
+    # The host-to-device copy rounds fp16 to the device's DLFloat16, 9 mantissa
+    # bits, so by at most 2**-10 relative; the fp32 conversion is exact.
+    RTOL, ATOL = 2.0**-9, 1e-6
+
+    def _check(self, got, cpu):
+        torch.testing.assert_close(
+            got.cpu(), cpu.float(), rtol=self.RTOL, atol=self.ATOL
+        )
+
+    def test_float_below_max_matches_cpu(self) -> None:
+        for rows in SIZES:
+            with self.subTest(rows=rows):
+                cpu, x = _declared(DECLARATION[0]["max"])
+                x.resize_(rows, COLS)
+                self._check(x.float(), cpu[:rows])
+
+    def test_to_float32_below_max_matches_cpu(self) -> None:
+        for rows in SIZES:
+            with self.subTest(rows=rows):
+                cpu, x = _declared(DECLARATION[0]["max"])
+                x.resize_(rows, COLS)
+                self._check(x.to(torch.float32), cpu[:rows])
+
+    def test_float_of_one_tensor_across_sizes(self) -> None:
+        # SIZES starts at the maximum, the order that returned NaN.
+        cpu, x = _declared(DECLARATION[0]["max"])
+        for rows in SIZES:
+            with self.subTest(rows=rows):
+                x.resize_(rows, COLS)
+                self._check(x.float(), cpu[:rows])
+
+
 class TestUserCompileStaysStrict(TestCase):
     """The marks are stripped only for the internal eager kernels. A user
     ``torch.compile`` that specialises a declared dim must keep raising, so an
