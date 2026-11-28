@@ -3905,14 +3905,29 @@ def compute_restickify_needed(
         # have extra dimensions in which the input will be broadcasted into.
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
-            # expand_sparse keeps the stick on the input's own last host dim. When the
-            # consumer reads another stick (a stick-dim gather written into a wider
-            # stick at an offset, as in cat), restickify straight to that stick: a
-            # second, stick-padded restickify would write at offset 0 and past it.
+            # expand_sparse keeps the stick on the input's own last host dim, so
+            # the expanded form is only usable when that stick matches what the
+            # consumer reads. Two cases need a different stick:
+            #  - the consumer wants another host dim (e.g. the row axis of a
+            #    [64, 256] tensor for a topk-along-dim-1 consumer); using the
+            #    expanded form would cause a "different stick loop variables"
+            #    error in parse_op_spec;
+            #  - the consumer reads another stick (a stick-dim gather written
+            #    into a wider stick at an offset, as in cat); a second,
+            #    stick-padded restickify would write at offset 0 and past it.
+            # In both cases restickify straight to the consumer's stick via
+            # compute_restickify_target_layout, keeping the expanded form as
+            # the fallback when that finds no target.
             expanded_idc = try_device_coordinates(
                 expanded_stl, in_dep, ind_sizes, op=op
             )
-            if expanded_idc is not None and stick_compatible([expanded_idc, out_idc]):
+            exp_stick = expanded_idc[-1] if expanded_idc else None
+            if (
+                expanded_idc is not None
+                and exp_stick is not None
+                and exp_stick.free_symbols == target_stick.free_symbols
+                and stick_compatible([expanded_idc, out_idc])
+            ):
                 return True, expanded_stl
             sparse_target = expanded_stl
 

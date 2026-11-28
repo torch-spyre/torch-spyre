@@ -1304,6 +1304,115 @@ def _build_fp32_proxy_cpu_refs(
     return kwargs
 
 
+def _sort_ties(shape, mod, dtype):
+    # Repeats a few small integers so every row has ties (exercising stability)
+    # and fp16 holds every value exactly.
+    return (torch.arange(math.prod(shape)) * 7 % mod).reshape(shape).to(dtype)
+
+
+def _sort_inf_input(dim, dtype=torch.float16):
+    # One inf near the front of every line along the sort dim (67 is
+    # unsplittable): +inf in half the lines, -inf in the rest.
+    shape = (67, 16) if dim == 0 else (16, 67)
+    x = (torch.arange(67 * 16) * 7 % 5).reshape(shape).to(dtype)
+    lines = x.movedim(dim, -1)
+    lines[:8, 0] = float("inf")
+    lines[8:, 5] = float("-inf")
+    return x
+
+
+# torch.sort cases as (make_input(dtype), dim, descending). The same cases
+# run in fp32 (test_sort: values and indices, both exact) and in fp16
+# (test_sort_values: values only, because topkindex returns indices in the
+# input dtype and the int64 cast via staggered fp32 comes back wrong, #4393).
+_SORT_CASES = {
+    # Random columns, so each column's indices differ and a permuted readback
+    # is caught.
+    "2d_dim0_asc": (
+        lambda dt: unique_randn_along_dim((8, 64), dim=0, dtype=dt),
+        0,
+        False,
+    ),
+    "2d_ties_dim0": (lambda dt: _sort_ties((128, 64), 7, dt), 0, False),
+    "3d_ties_dim1": (lambda dt: _sort_ties((2, 16, 64), 3, dt), 1, False),
+    "2d_size1_dim0": (
+        lambda dt: unique_randn_along_dim((1, 64), dim=1, dtype=dt),
+        0,
+        False,
+    ),
+    # Last (stick) dim, width not a whole number of sticks.
+    "2d_ties_last_dim_w60": (lambda dt: _sort_ties((16, 60), 5, dt), 1, False),
+    # Sort-dim size topk can't split across cores: padded to the next size
+    # that can (127 -> 128).
+    "2d_ties_unsplittable_n127_last_dim": (
+        lambda dt: _sort_ties((16, 127), 5, dt),
+        1,
+        False,
+    ),
+    # Sort dims over TOPK_MAX_K (128): spyre_topk peels them in chunks of 128.
+    # 165 leaves 37, padded to 40 so the last chunk splits across cores.
+    "2d_ties_peeling_n165_dim0_desc": (
+        lambda dt: _sort_ties((165, 32), 11, dt),
+        0,
+        True,
+    ),
+}
+
+
+def _sort_params(dtype, names=None):
+    suffix = {torch.float16: "fp16", torch.float32: "fp32"}[dtype]
+    return {
+        f"{name}_{suffix}": (make(dtype), dim, descending)
+        for name, (make, dim, descending) in _SORT_CASES.items()
+        if names is None or name in names
+    }
+
+
+# Sort-dim sizes 256, 999 and 1024 in 1D and 2D, as (input, dim, descending).
+# fp32 runs in test_sort, which checks the indices. fp16 runs in test_sort_values
+# (values only, since the int64 index cast fails). fp16 and fp32 use the same
+# sizes: DLFloat16 has integer precision up to FP16_TOPK_MAX_DIM (1024), so all
+# three sizes are within range.
+_SORT_SIZES = (256, 999, 1024)
+_SORT_SIZES_FP16 = {
+    f"2d_dim0_n{n}_fp16": (_sort_ties((n, 32), 11, torch.float16), 0, False)
+    for n in _SORT_SIZES
+}
+_SORT_SIZES_FP32 = {
+    **{
+        f"2d_dim0_n{n}_fp32": (_sort_ties((n, 32), 11, torch.float32), 0, False)
+        for n in _SORT_SIZES
+    },
+    "2d_dim0_n1024_c64_fp32": (
+        _sort_ties((1024, 64), 11, torch.float32),
+        0,
+        False,
+    ),
+    **{
+        f"1d_n{n}_fp32": (_sort_ties((n,), 11, torch.float32), 0, False)
+        for n in _SORT_SIZES
+    },
+    **{
+        f"2d_dim1_n{n}_fp32": (_sort_ties((32, n), 11, torch.float32), 1, False)
+        for n in _SORT_SIZES
+    },
+}
+
+# Integer sorts, as (input, dim, descending). topkvalue/topkindex only bind
+# fp16/fp32, so the decomposition sorts integers as fp32 and casts the values
+# back; the indices come from the fp32 sort, so they are exact.
+_SORT_INT_CASES = {
+    "int64_negative_dim0": (
+        ((torch.arange(64 * 8) * 7 % 11) - 5).reshape(64, 8),
+        0,
+        False,
+    ),
+    "int32_dim0_desc": (_sort_ties((64, 8), 11, torch.int32), 0, True),
+    # n=192 peels as 128 + 64.
+    "int64_peeling_n192_dim0": (_sort_ties((192, 32), 11, torch.int64), 0, False),
+}
+
+
 # keep_by_index / mask_by_index cases, as (shape, k, dim, fill value). Each runs
 # in fp16 (plain names) and fp32 (names suffixed _fp32) - see _masking_ops_params.
 _MASKING_OPS_CASES = {
@@ -2379,6 +2488,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     128,
                     0,
                 ),
+                # Along the stick dim, k over TOPK_MAX_K: masking works here.
+                "2d_k192_dim_1_peeling": (
+                    unique_randn_along_dim((16, 256), dim=1),
+                    192,
+                    1,
+                ),
+                # k=35's divisors are 1, 5, 7, 35: none give k // d <= 4 with
+                # d <= SENCORES (32), so spyre_topk runs k=36 and keeps 35. With
+                # the dim also 35, the input is back-padded with -inf first.
+                "2d_k35_n35_dim_0_padded": (
+                    unique_randn_along_dim((35, 64), dim=0),
+                    35,
+                    0,
+                ),
+                "2d_k35_n256_dim_0_narrowed": (
+                    unique_randn_along_dim((256, 64), dim=0),
+                    35,
+                    0,
+                ),
+                # k over TOPK_MAX_K (128): spyre_topk peels in chunks of 128
+                # (256 is two full chunks).
+                "2d_k256_dim_0_peeling_fp32": (
+                    unique_randn_along_dim((320, 32), dim=0, dtype=torch.float32),
+                    256,
+                    0,
+                ),
                 "2d_k8_dim1_fp16": (
                     unique_randn_along_dim((128, 64), dim=1),
                     8,
@@ -2536,6 +2671,54 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_sort", "test_sort_cpu"): {
+            # fp32: checks both values and indices. fp16 runs in test_sort_values.
+            "param_sets": {
+                **_sort_params(torch.float32),
+                **_SORT_INT_CASES,
+                **_SORT_SIZES_FP32,
+                # The pad for an unsplittable sort dim is -inf in topk's key
+                # space and sits at the back, so it loses every tie with a real
+                # +-inf element. The indices show it: a pad winning a tie would
+                # put an index past the end.
+                "unsplittable_with_inf_dim0_fp32": (
+                    _sort_inf_input(0, torch.float32),
+                    0,
+                    False,
+                ),
+                "unsplittable_with_inf_dim1_fp32": (
+                    _sort_inf_input(1, torch.float32),
+                    1,
+                    False,
+                ),
+            },
+        },
+        # fp16, values only: topkindex returns indices in the input dtype and
+        # the int64 cast via staggered fp32 comes back wrong (#4393).
+        ("test_sort_values", "test_sort_values_cpu"): {
+            "param_sets": {
+                **_sort_params(torch.float16),
+                **_SORT_SIZES_FP16,
+                "stick_dim_peeling": (
+                    (torch.arange(16 * 192) * 7 % 11).reshape(16, 192).half(),
+                    1,
+                    False,
+                ),
+                # n=35 cannot be split across cores, so spyre_topk pads it with
+                # -inf.
+                "1d_unsplittable": (cached_randn((35,)), 0, False),
+                # The same inf inputs in fp16, values only (fp32 is in test_sort).
+                "unsplittable_with_inf_dim0": (_sort_inf_input(0), 0, False),
+                "unsplittable_with_inf_dim1": (_sort_inf_input(1), 1, False),
+                # Sort along the stick dim: values are exact, indices are not.
+                "2d_ties_dim1_desc_fp16": (
+                    _sort_ties((8, 64), 5, torch.float16),
+                    1,
+                    True,
+                ),
+                "1d_ties_fp16": (_sort_ties((64,), 4, torch.float16), 0, False),
+            },
+        },
         ("test_topk_indices", "test_topk_indices_cpu"): {
             "param_sets": {
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
@@ -2552,19 +2735,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     unique_randn_along_dim((1, 128), dim=1),
                     4,
                     1,
-                ),
-            },
-            # The cast's fp32 value lacks the second stick of a stick pair, so it
-            # reads memory that was never written: the result is wrong on most runs
-            # and right on some, and a pass is reported, not an error.
-            "expect_fail_unstable": {
-                "2d_batch1_k4_dim1_lt64": (
-                    "the cast's fp32 value lacks the second stick of a stick pair "
-                    "(#3999), so the indices come back wrong on most runs"
-                ),
-                "2d_batch1_k4_dim1_gt64": (
-                    "the cast's fp32 value lacks the second stick of a stick pair "
-                    "(#3999), so the indices come back wrong on some runs"
                 ),
             },
         },
@@ -11873,18 +12043,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
-    @expects_raise
-    def test_topk_unsplittable_k_rejected(self):
-        # k=35's divisors are 1, 5, 7, 35: none give k // d <= 4 with
-        # d <= SENCORES (32), so no valid multi-core split exists.
-        x = unique_randn_along_dim((64, 35), dim=-1)
-        with pytest.raises(Exception, match="Unsupported"):
-            _compile_and_run(
-                lambda x: torch.topk(x, 35, dim=-1)[0],
-                [x],
-                "spyre",
-            )
-
     def test_topk_sparse_input(self):
         # amax over the stick dim produces a sparse output (constant 0 in the
         # rightmost device coord). topk.ddl does not accept sparse inputs
@@ -11906,6 +12064,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             x,
             run_eager=False,
         )
+
+    def test_sort_cpu(self, x, dim: int, descending: bool):
+        # Indices are compared too: the decomposition is always stable, so
+        # they must match CPU's stable sort exactly, ties included. A sort only
+        # permutes its input, so values and indices are compared exactly (the
+        # default tolerance would let integer indices through off by ~10%).
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True),
+            x,
+            atol=0,
+            rtol=0,
+        )
+
+    def test_sort_values_cpu(self, x, dim: int, descending: bool):
+        # Values only, so the sort is still checked while the int64 index
+        # cast is an expected failure in test_sort.
+        def fn(x):
+            return torch.sort(x, dim=dim, descending=descending, stable=True)[0]
+
+        if x.dtype == torch.float16 and torch.isinf(x).any():
+            # Host infinities are finite +/-2^32 on device. The sort preserves
+            # them, but the additional LX arithmetic may overflow to NINF.
+            ref_input = x.to(torch.float64)
+            ref_input = torch.where(
+                torch.isinf(ref_input),
+                ref_input.sign() * DLFLOAT16_INF_SENTINEL,
+                ref_input,
+            )
+            self.compare_with_cpu(
+                fn, x, dlfloat16_reference=fn(ref_input), run_eager=False
+            )
+        else:
+            self.compare_with_cpu(fn, x, run_eager=False)
+
+    @expects_raise
+    def test_sort_fp16_index_range_rejected(self):
+        # topkindex yields indices in the input dtype, and Spyre's fp16 holds
+        # integers exactly only up to FP16_TOPK_MAX_DIM, so a longer fp16
+        # sort dim must be rejected.
+        x = unique_randn_along_dim((1025, 8), dim=0)
+        with pytest.raises(Exception, match="the indices are held in float16"):
+            _compile_and_run(lambda x: torch.sort(x, dim=0), [x], "spyre")
 
     def test_masking_ops_cpu(self, op, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)
