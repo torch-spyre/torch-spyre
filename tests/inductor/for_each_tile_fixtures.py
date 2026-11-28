@@ -1608,6 +1608,94 @@ def scatter_carry_old_value_fn(values, indices, output):
     )
 
 
+def kv_cache_write_tiled_fn(
+    key_cache, value_cache, key, value, positions, *, tile_size
+):
+    """A KV-cache write (``index_copy`` keyed by a data-dependent row) tiled
+    by ``for_each_tile`` -- issue #6483.
+
+    Unlike ``scatter_carry_fn``/``scatter_carry_old_value_fn`` above, the
+    carry here is written by ``index_copy`` ALONE: no accumulate, no
+    reduction op shares the loop body with it. That is what makes this
+    Scatter op's write index carry nothing but the data-dependent row
+    symbol (e.g. ``d1 + 128*tmp0``) -- the WhileLoop-splice loop var never
+    appears in it, even though ``for_each_tile`` still stamps that var's
+    ``dim_hints`` onto the op simply for being part of the spliced body.
+    ``pass_utils.op_out_coords`` used to fold that irrelevant loop var into
+    ``indirect_sizes`` unconditionally, turning the Scatter op's
+    deliberate "size unknown, skip" ``None`` into a dict missing the real
+    row symbol, and crashing with "indirect symbol tmp0 not found in
+    indirect_sizes {u0: N}".
+    """
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(carry, tiles):
+        key_tile, value_tile, position_tile = tiles
+        next_key = carry[0].index_copy(0, position_tile, key_tile)
+        next_value = carry[1].index_copy(0, position_tile, value_tile)
+        return (next_key, next_value), None
+
+    (result_key, result_value), _ = for_each_tile(
+        body,
+        (key, value, positions),
+        dims=(0, 0, 0),
+        tile_size=tile_size,
+        init=(key_cache, value_cache),
+    )
+    return result_key, result_value
+
+
+def index_copy_into_cloned_tile_fn(cache, value, slot, *, tile_size):
+    """``blk = tile.clone(); blk.index_copy_(...); return blk`` under
+    ``out_dim`` map-mode stacking -- issue #6412.
+
+    Unlike ``kv_cache_write_tiled_fn`` above (a carry written by
+    ``index_copy``), this body has NO user carry at all (``init=None``):
+    `for_each_tile` threads a synthetic step counter instead, and the
+    body's own tile output (``blk``) is stacked into the final result via
+    plain ``scan`` ``ys`` semantics. Upstream ``scan``'s own
+    ``while_loop`` lowering implements that stacking internally as a
+    SEPARATE carry mutated through a view (``select`` then ``copy_``) --
+    positionally indistinguishable from a real accumulator carry at the
+    ``ir.WhileLoop`` level, which `for_each_tile_lowering.py`'s
+    ``_stacking_carry_indices`` correctly classifies as ``stacking``, not
+    ``accumulator``.
+
+    The actual bug lived one level deeper: `blk`'s own tile is cache's
+    ``tile_dim_marker`` (a per-trip, local view of ``cache``), and
+    ``index_copy_`` mutates THAT marker buffer in place -- its destination
+    row (``slot``) is a loaded, data-dependent value, not an affine
+    function of the loop var, so the actual write is a genuine ``Scatter``
+    targeting the marker's own buffer via ``MutationLayoutSHOULDREMOVE``.
+    `_consume_tile_dim_markers` erases a marker by inlining its (read-only)
+    body into each consumer that reads it -- correct for an ordinary,
+    never-mutated marker, but this marker is ALSO the Scatter's mutation
+    target: inlining it into the consumer that stacks `blk` into the final
+    result substituted the marker's RAW, pre-mutation input for that read,
+    silently discarding the entire scatter with no error at all. Every
+    position outside the scattered row stayed correct (the marker's own
+    read-only transform is exact there); only the scattered row was wrong
+    -- stale at the old cache value for roughly half of it, and corrupted
+    by a mismatched row's value for the rest.
+    """
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(_carry, tiles):
+        tile, value_tile, slot_tile = tiles
+        blk = tile.clone()
+        blk.index_copy_(1, slot_tile, value_tile.unsqueeze(1))
+        return None, blk
+
+    _, result = for_each_tile(
+        body,
+        (cache, value, slot),
+        dims=(0, 0, None),
+        tile_size=tile_size,
+        out_dim=0,
+    )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Graph-shape fixtures: for_each_tile bodies that interact with other passes
 # (restickify, views, broadcast, outside consumers, E-tiled matmul, carried

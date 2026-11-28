@@ -109,6 +109,8 @@ from for_each_tile_fixtures import (
     embedding_restickify_inputs,
     embedding_restickify_table_fn,
     fill_add_tiled_fn,
+    index_copy_into_cloned_tile_fn,
+    kv_cache_write_tiled_fn,
     matmul_x_yt_nested_fn,
     matmul_x_yt_tile_m_fn,
     matmul_x_yt_tile_n_fn,
@@ -456,6 +458,135 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                     sums.cpu().float(), torch.stack(old_sums), atol=0, rtol=0
                 )
                 torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
+
+    def test_kv_cache_write_tiled_matches_eager_index_copy(self):
+        """Regression test for issue #6483.
+
+        `kv_cache_write_tiled_fn`'s `index_copy` destination row is a
+        loaded, data-dependent value (`positions`), never an affine
+        function of `for_each_tile`'s own WhileLoop-splice loop var --
+        see that fixture's docstring. Before the
+        `pass_utils.op_out_coords` fix, compiling this raised
+        `InductorError: Unsupported: Spyre backend does not support:
+        indirect symbol tmp0 not found in indirect_sizes {u0: 8}` (the
+        loop var's irrelevant range got folded into `indirect_sizes`
+        anyway, turning the Scatter op's "size unknown, skip" `None`
+        into a dict still missing the real row symbol). Reverting that
+        fix reproduces the crash here. 8 trips (cache_rows=256,
+        tile_size=32) is the smallest shape found that both reproduces
+        the pre-fix crash and respects codegen's int32-index stick
+        alignment (see the tile_size comment below) -- fewer trips
+        (checked down to 2) happen to take a different, already-working
+        resolution path and would not catch a regression here.
+
+        `positions` is a full permutation of every cache row, so each
+        row is written exactly once and there is no "untouched row"
+        case to separately check. Row tags are `row / cache_rows` (key)
+        and its complement (value): both unique per row, dyadic
+        (cache_rows is a power of two), and small in magnitude, so they
+        are exactly representable in fp16/dl16/fp32 alike with no
+        addition to risk losing precision -- the comparison below needs
+        no tolerance at all, same idiom as
+        `test_scatter_carry_preserves_old_value_read_after_update`
+        above. The cache is pre-filled with an out-of-range negative
+        value so a silently-skipped write (as opposed to a crash)
+        would also be caught.
+        """
+        generator = torch.Generator().manual_seed(6483)
+        # tile_size must be a multiple of 32: positions downcasts to int32,
+        # and codegen's _check_indirect_index_step requires each visit's
+        # int32 sticks (32 elements) to stay adjacent, uncut by a tile
+        # boundary -- same constraint test_scatter_carry_runtime_indices_
+        # and_preserved_initializer's rows above already observes.
+        cache_rows, head_dim, tile_size = 256, 64, 32
+
+        positions = torch.randperm(cache_rows, generator=generator).to(torch.int64)
+        key = (
+            (torch.arange(cache_rows, dtype=torch.float16) / cache_rows)
+            .view(-1, 1)
+            .expand(-1, head_dim)
+            .contiguous()
+        )
+        value = 1.0 - key
+
+        key_cache = torch.full((cache_rows, head_dim), -1.0, dtype=torch.float16)
+        value_cache = torch.full((cache_rows, head_dim), -2.0, dtype=torch.float16)
+
+        expected_key = key_cache.clone().index_copy_(0, positions, key)
+        expected_value = value_cache.clone().index_copy_(0, positions, value)
+
+        torch._dynamo.reset()
+        compiled = torch.compile(kv_cache_write_tiled_fn, fullgraph=True, dynamic=False)
+        with torch.inference_mode():
+            actual_key, actual_value = compiled(
+                key_cache.to(DEVICE_NAME),
+                value_cache.to(DEVICE_NAME),
+                key.to(DEVICE_NAME),
+                value.to(DEVICE_NAME),
+                positions.to(DEVICE_NAME),
+                tile_size=tile_size,
+            )
+        torch.testing.assert_close(
+            actual_key.cpu().float(), expected_key.float(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            actual_value.cpu().float(), expected_value.float(), atol=0, rtol=0
+        )
+
+    def test_index_copy_into_cloned_tile_matches_eager(self):
+        """Regression test for issue #6412.
+
+        `index_copy_into_cloned_tile_fn`'s body has NO user carry (plain
+        `out_dim=0` map mode): the per-trip tile's own output (`blk`) is
+        stacked into the final result through `scan`'s native `ys`
+        mechanism, not a carry the user ever sees. See that fixture's
+        docstring for the full mechanism: `blk` is cache's own
+        `tile_dim_marker`, mutated in place by `index_copy_`'s `Scatter`
+        write, and `_consume_tile_dim_markers` used to inline that
+        marker's pre-mutation body into the op that stacks it -- silently
+        discarding the scatter with no error at all, rather than crashing.
+        Before the fix, this assertion failed with roughly 1/64 of all
+        elements wrong (every position of the scattered row, across every
+        tile row): some stale at the old `cache` value, the rest corrupted
+        by a mismatched row's value.
+
+        `cache` is pre-filled with an out-of-range negative sentinel so a
+        silently-skipped write (as opposed to a crash) is caught. `value`'s
+        rows are `row / ROWS` -- unique per row, dyadic (ROWS is a power of
+        two), small in magnitude, and reach the device through no
+        arithmetic at all, so (as in
+        `test_scatter_carry_preserves_old_value_read_after_update` and
+        `test_kv_cache_write_tiled_matches_eager_index_copy` above) the
+        comparison needs no tolerance whatsoever.
+        """
+        rows, scatter_dim, stick_dim, tile_size, slot_pos = 16, 64, 64, 8, 5
+
+        cache = torch.full((rows, scatter_dim, stick_dim), -1.0, dtype=torch.float16)
+        value = (
+            (torch.arange(rows, dtype=torch.float16) / rows)
+            .view(-1, 1)
+            .expand(-1, stick_dim)
+            .contiguous()
+        )
+        slot = torch.tensor([slot_pos], dtype=torch.int64)
+
+        expected = cache.clone()
+        expected[:, slot_pos, :] = value
+
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            index_copy_into_cloned_tile_fn, fullgraph=True, dynamic=False
+        )
+        with torch.inference_mode():
+            actual = compiled(
+                cache.to(DEVICE_NAME),
+                value.to(DEVICE_NAME),
+                slot.to(DEVICE_NAME),
+                tile_size=tile_size,
+            )
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(), atol=0, rtol=0
+        )
 
     def test_computed_where_condition_in_broadcast_tile(self):
         from torch_spyre.ops.fallbacks import FallbackWarning

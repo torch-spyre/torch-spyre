@@ -646,10 +646,24 @@ class MarkerResolution(enum.Enum):
     operations would break coarse_tile.py's _validate_contiguous
     gapless-block invariant), even if other consumers of the same marker
     were inlined.
+
+    MUTATED_KEPT: some OTHER op in the group mutates the marker's own
+    buffer in place (a MutationLayoutSHOULDREMOVE targeting it -- e.g. an
+    index_copy_/Scatter writing a data-dependent row into the exact tile
+    this marker reads). Inlining the marker's pre-mutation read-index
+    transform into a consumer would substitute the marker's raw upstream
+    input for the read, silently discarding whatever the mutating op just
+    wrote -- so, like STAR_DEP_KEPT, the marker stays live as a real,
+    addressable buffer instead, and every ComputedBuffer consumer's
+    existing `ops.load(marker_name, ...)` is left exactly as it was: that
+    is what let Inductor's ordinary mutation-ordering machinery (not a
+    read dependency at all) make the consumer observe the mutation before
+    this pass ever ran.
     """
 
     INLINE_ERASED = "inline_erased"
     STAR_DEP_KEPT = "star_dep_kept"
+    MUTATED_KEPT = "mutated_kept"
 
 
 def _marker_resolution(op: "ir.Operation") -> "MarkerResolution | None":
@@ -1350,6 +1364,7 @@ def _consume_tile_dim_markers(
     which has no index) reduction-coordinate check.
     """
     from torch._inductor.dependencies import MemoryDep, StarDep
+    from torch._inductor.ir import MutableBox, MutationLayoutSHOULDREMOVE
 
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         _substitute_direct_input_refs,
@@ -1371,11 +1386,49 @@ def _consume_tile_dim_markers(
         read_writes_cache[id(op)] = (op, rw)
         return rw
 
+    # Names of every buffer some op in group_ops mutates in place, e.g. an
+    # index_copy_/Scatter whose MutationLayoutSHOULDREMOVE targets a tile
+    # this group also reads through a marker. See MarkerResolution.MUTATED_KEPT.
+    #
+    # Raises rather than silently skipping an unresolved target: unlike a
+    # similar skip elsewhere in this module (e.g. _stacking_carry_indices,
+    # where declining falls back to an already-safe, pre-existing path),
+    # skipping HERE would mean "not recognized as mutated" -> falls through
+    # to the ordinary inline-and-erase path below -- i.e. the one unsafe
+    # branch this whole mechanism exists to avoid. Silently guessing
+    # "probably not mutated" is exactly how the #6412 class of bug (a
+    # marker's mutation silently discarded by inlining) would reappear for
+    # a target shape this unwrap doesn't yet handle, so this must fail
+    # loud instead. Every MutationLayoutSHOULDREMOVE target observed in
+    # practice resolves to a name after unwrapping MutableBox (confirmed
+    # across the full for_each_tile test suite), so this is not expected
+    # to ever fire.
+    mutated_buffer_names: set[str] = set()
+    for op in group_ops:
+        layout = getattr(op, "layout", None)
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            continue
+        target = layout.target
+        while isinstance(target, MutableBox):
+            target = target.data
+        target_name = getattr(target, "get_name", lambda: None)()
+        if target_name is None:
+            raise AssertionError(
+                f"{op.get_name()!r} has a MutationLayoutSHOULDREMOVE layout "
+                f"whose target {target!r} has no get_name() after unwrapping "
+                "MutableBox; cannot determine which buffer it mutates, so a "
+                "marker that buffer belongs to cannot be safely classified "
+                "as mutated or not. This is an unrecognized shape for this "
+                "check -- see the comment above."
+            )
+        mutated_buffer_names.add(target_name)
+
     for marker_op in list(group_ops):
         dim = _marker_dim(marker_op)
         if dim is None:
             continue
         marker_name = marker_op.get_name()
+        marker_is_mutated = marker_name in mutated_buffer_names
 
         consumers: list[tuple[ir.Operation, Dep]] = []
         for candidate in group_ops:
@@ -1466,7 +1519,20 @@ def _consume_tile_dim_markers(
             # Set by the ComputedBuffer branch; stays False (unchanged behavior)
             # for a StarDep consumer, which has no captured load-site coordinate.
             _marker_axis_consumed = False
-            if hasattr(consumer_op, "data"):
+            if marker_is_mutated:
+                # Some other op in the group mutates marker_op's own buffer
+                # in place (see mutated_buffer_names above /
+                # MarkerResolution.MUTATED_KEPT) -- inlining would silently
+                # substitute the marker's pre-mutation input for this read,
+                # discarding that write. Leave the read exactly as it is,
+                # whether it is a MemoryDep (ops.load(marker_name, ...)
+                # already resolves correctly as long as marker_op stays a
+                # live buffer) or a StarDep (no different from the existing
+                # StarDep branch below, which this condition also implies
+                # keeping materialized): no object reconstruction, no
+                # re-pointing, nothing to patch.
+                new_consumer, new_dep = consumer_op, consumer_dep
+            elif hasattr(consumer_op, "data"):
                 # A consumer can independently read marker_input_name BEFORE
                 # inlining too -- e.g. a body op shaped like
                 # `x @ tile_dim_marker(x)` reads the marker's own input
@@ -1587,12 +1653,23 @@ def _consume_tile_dim_markers(
         # leave later consumers' MemoryDep/StarDep reads dangling (naming a
         # marker no longer present in `operations`).
         #
+        # If the marker's own buffer is mutated elsewhere in the group, it
+        # must stay materialized for every consumer's sake, the same way a
+        # StarDep consumer forces it to -- see mutated_buffer_names and
+        # MarkerResolution.MUTATED_KEPT above; marker_is_mutated being True
+        # already routed every consumer through the keep-as-is branch, so
+        # none of them were inlined to begin with. Checked before
+        # any_star_dep_consumer only because it is the more specific reason
+        # when both happen to hold; either alone is sufficient to keep.
+        #
         # If ANY consumer reached the marker via a StarDep, the marker must
         # stay materialized for that consumer's sake (see the StarDep branch
         # above) -- even when OTHER consumers were ComputedBuffers and had
         # the marker's transform inlined into them directly. Erasing here
         # would only be safe if every consumer was inlined.
-        if any_star_dep_consumer:
+        if marker_is_mutated:
+            marker_op.tile_marker_resolution = MarkerResolution.MUTATED_KEPT
+        elif any_star_dep_consumer:
             marker_op.tile_marker_resolution = MarkerResolution.STAR_DEP_KEPT
         else:
             # Only the ComputedBuffer/inline branch actually fuses the
