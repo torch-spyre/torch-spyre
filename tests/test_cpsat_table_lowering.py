@@ -1071,6 +1071,26 @@ def test_a_factor_over_two_buffers_is_ranked_on_their_combined_position():
     assert isinstance(plan.index, CompactIndex) and plan.index.parent.size == 12
 
 
+def test_a_switch_whose_factor_and_rest_share_an_input_is_exact():
+    """log(x) and x + y both read x: each case's x is the rest's x. Under a log the
+    switch is read as its table, on one grid over x and y."""
+
+    def shared() -> tuple[Case, Index, sympy.Basic]:
+        case = Case()
+        position = case.add_input("x", x=[1.0, 2.0, 4.0])
+        case.add_input("y", y=[0.5, 3.0, 5.0, 9.0])
+        x, y = case.symbol("x"), case.symbol("y")
+        return case, position, (x + y) * sympy.log(x)
+
+    case, position, product = shared()
+    plan = case.assert_exact(product)
+    assert type(plan) is SwitchRealization and plan.index == position
+    assert type(plan.rest) is SumRealization
+    assert plan.entries() == 10  # one table over x and y holds 12
+    case, _, product = shared()
+    assert type(case.assert_exact(sympy.log(1 + product))) is TableRealization
+
+
 def test_a_literal_times_a_sum_is_the_two_value_switch():
     """The rest's entries count once, where Stage 5's one table held them twice."""
     case = Case()
