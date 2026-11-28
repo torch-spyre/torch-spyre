@@ -251,6 +251,44 @@ the other compile's work, and a negative delta means another compile reset the
 store mid-pass. Profile with a single compiling thread to get per-compile
 figures.
 
+## Compile summary
+
+`TORCH_SPYRE_COMPILE_SUMMARY_DIR=dir` writes one
+`dir/compile_summary.<pid>.json` per process at exit, so a benchmark run can
+record what compiling cost it without patching the compiler. Off by default:
+unconfigured, the module reads one environment variable at import and registers
+no exit hook.
+
+```json
+{"v": 1, "total_s": 0.87,
+ "passes": {"CustomPreSchedulingPasses:span_reduction": 0.026},
+ "cache": {"entries": 4, "hits": 3, "misses": 1}}
+```
+
+`total_s` sums the outermost `stage:compile_fx:spyre_compile` regions (a nested
+compile is counted once, under the outer one), `passes` is each pass's self
+time keyed `<Pipeline>:<pass>`, and `cache` counts the kernel cache registry.
+
+`total_s` and `passes` come from the timing recorder, so set
+`TORCH_SPYRE_TIMING=1` as well; without it both come back empty and the dump
+logs a warning saying so. `cache` does not depend on the recorder and is always
+populated. The summary is derived from those two sources and drives nothing, so
+it cannot change what a compile does.
+
+`torch_spyre.profiler._compile_summary.dump(dir)` writes it earlier than exit --
+useful in a long-lived server, where waiting for the exit hook means waiting for
+the process to end.
+
+The directory is joined verbatim, so a relative path resolves against the
+process working directory at exit; prefer an absolute one. The name carries the
+pid, so an xdist run leaves one file per worker, and each is written through a
+temporary file so a reader globbing the directory never sees a partial summary.
+
+In CI, the `perf` job of `_test_matrix.yaml` sets both variables and uploads the
+result as the `compile-summary` artifact. The benchmark's own `report.xml` is
+never uploaded (on a public repo its numbers must stay private); the summary
+holds frontend compile times and cache counters, not benchmark numbers.
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |

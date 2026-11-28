@@ -20,6 +20,7 @@ The public API provides FFDC retrieval (``get_diagnostic_report``, also bound as
 ``torch.spyre.is_available()``, not a flag on this package.
 """
 
+from torch_spyre.profiler import _compile_summary  # noqa: F401  (exit dump)
 from torch_spyre.profiler._ffdc import get_diagnostic_report
 
 __all__ = ["get_diagnostic_report"]
