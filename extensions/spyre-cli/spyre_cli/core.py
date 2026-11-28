@@ -15,8 +15,13 @@
 from pathlib import Path
 
 
-def _launch(path, tensors):
+def _launch(path, tensors, symbol_kinds=None):
     """Launch the bundle and return the runner.
+
+    ``symbol_kinds`` are the bundle's runtime-slot descriptors, read from the
+    folder's launch spec. With them the runner resolves each slot by its kind,
+    as an in-process launch does; without them the runtime writes one address
+    per tensor, which is wrong for any slot that is not a tensor address.
 
     The returned runner MUST be kept alive until the outputs have been read
     back. Dropping it frees the JobPlan, and with it the device allocation and
@@ -27,7 +32,7 @@ def _launch(path, tensors):
 
     # this is the magic line
     # should have already compiled at this point
-    runner = SpyreSDSCKernelRunner("spyre-cli", str(path))
+    runner = SpyreSDSCKernelRunner("spyre-cli", str(path), symbol_kinds=symbol_kinds)
     runner.run(*tensors)
     return runner
 
@@ -78,37 +83,92 @@ def create_tensor_info(tinfo):
     return (dims, dtype)
 
 
-def launch_from_cli(path, inputs, outputs):
+def launch_from_cli(path, inputs, outputs, bindings=None):
     path = Path(path)
     import torch
 
-    tensors = []
-    for iarg in inputs:
-        shape, dtype = create_tensor_info(iarg)
-        tensor = torch.ones(
-            shape,
-            dtype=getattr(torch, dtype),
-            device="spyre",
+    # Deferred, like the other torch-spyre imports here: launch_spec imports
+    # torch at module level, and `spyre --help` must work without it.
+    from .launch_spec import (
+        _symbol_kinds_from_spec,
+        check_tensors_against_spec,
+        default_tensors,
+        load_kernelspec,
+        tensors_from_spec,
+    )
+
+    bindings = bindings or {}
+    spec = load_kernelspec(path)
+
+    if spec is None and not inputs and not outputs:
+        # Nothing to launch with: no spec to read the arguments from, and none
+        # given. Caught here rather than in the CLI, which cannot see whether
+        # the folder has a spec. Launching anyway would pass zero tensors and
+        # fail deep in the runtime with an argument-count error.
+        raise ValueError(
+            f"{path} has no launch spec, so the tensors must be described: "
+            "pass -i/-o, or recompile to get a folder that describes itself."
         )
-        tensors.append(tensor)
 
-    for oarg in outputs:
-        shape, dtype = create_tensor_info(oarg)
-        tensor = torch.empty(
-            shape,
-            dtype=getattr(torch, dtype),
-            device="spyre",
-        )
-        tensors.append(tensor)
+    if spec is not None and not inputs and not outputs:
+        # The folder describes itself, so there is nothing to retype. Ones
+        # are a smoke test and said to be one: this path answers "does it
+        # run", not "is it right". A caller with real data allocates with
+        # tensors_from_spec and writes its own values.
+        tensors = tensors_from_spec(spec, bindings)
+        default_tensors(spec, tensors)
+        # By role, not by position: an output need not be a trailing argument,
+        # and an in-place arg is both. ``arg_offset`` skips the pool, which sits
+        # at 0 and is not one of ``args``.
+        out_positions = [
+            arg.arg_index + spec.arg_offset for arg in spec.args if arg.role != "input"
+        ]
+        print(f"using {spec.kernel_name} launch spec from {path}")
+    else:
+        tensors = []
+        for iarg in inputs:
+            shape, dtype = create_tensor_info(iarg)
+            tensor = torch.ones(
+                shape,
+                dtype=getattr(torch, dtype),
+                device="spyre",
+            )
+            tensors.append(tensor)
 
-    runner = _launch(path, tensors)
+        for oarg in outputs:
+            shape, dtype = create_tensor_info(oarg)
+            tensor = torch.empty(
+                shape,
+                dtype=getattr(torch, dtype),
+                device="spyre",
+            )
+            tensors.append(tensor)
+        # Explicit form appends outputs after inputs, so they are the tail.
+        out_positions = list(range(len(inputs), len(tensors)))
 
-    # TODO: deal with the cases when we have multiple outputs
-    # which ops would those be?
-    if len(outputs) > 1:
-        print("WARNING: multiple outputs found, but only last one printed!")
+        if spec is not None:
+            # Explicit arguments AND a spec: check them rather than trusting
+            # them. This is the case that used to launch and return wrong data.
+            problems = check_tensors_against_spec(spec, tensors, bindings)
+            if problems:
+                raise ValueError(
+                    "the tensors given do not match what this kernel expects:\n"
+                    + "\n".join(f"  - {p}" for p in problems)
+                    + "\n\nOmit -i/-o to build them from the spec instead."
+                )
 
-    print(tensors[-1].cpu())
+    runner = _launch(
+        path, tensors, _symbol_kinds_from_spec(spec) if spec is not None else None
+    )
+
+    # Every output, not just the last: reading them all back is also what makes
+    # a failed launch visible, since .cpu() is where a dead kernel surfaces.
+    if not out_positions:
+        out_positions = [len(tensors) - 1]
+    for pos in out_positions:
+        if len(out_positions) > 1:
+            print(f"output (arg {pos}):")
+        print(tensors[pos].cpu())
     del runner
 
 
@@ -119,6 +179,16 @@ def launch(*tensors, path="."):
     the outputs have been read back. Calling this as a bare statement frees the
     JobPlan while the launch is still in flight, and the device then faults
     with what looks like a hardware error.
+
+    The tensors are taken as given. Only the slot descriptors are read from
+    the folder's launch spec, when it has one, so the runtime knows which slots
+    are addresses and which are, say, a dimension size read off a tensor.
     """
     path = Path(path)
-    return _launch(path, tensors)
+    # Deferred, like the other torch-spyre imports here.
+    from .launch_spec import _symbol_kinds_from_spec, load_kernelspec
+
+    spec = load_kernelspec(path)
+    return _launch(
+        path, tensors, _symbol_kinds_from_spec(spec) if spec is not None else None
+    )

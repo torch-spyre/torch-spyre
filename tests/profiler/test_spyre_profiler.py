@@ -507,13 +507,16 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(
     pending_captures = []
     original_sdsc = SpyreAsyncCompile.sdsc
 
-    def capture_sdsc(self, kernel_name, specs, pool_size=0, precomputed_key=None):
+    def capture_sdsc(
+        self, kernel_name, specs, pool_size=0, precomputed_key=None, launch_args=None
+    ):
         result = original_sdsc(
             self,
             kernel_name,
             specs,
             pool_size=pool_size,
             precomputed_key=precomputed_key,
+            launch_args=launch_args,
         )
         handles = []
 
