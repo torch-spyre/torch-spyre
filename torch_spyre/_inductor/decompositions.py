@@ -68,6 +68,7 @@ from .sliding_window_plan import (
 )
 from . import config
 from .logging_utils import get_inductor_logger
+from .propagate_hints import spyre_hint
 
 from . import customops  # noqa: F401
 from .wsr import for_each_tile
@@ -2926,6 +2927,238 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         values = torch.ops.aten.amax(input, dim=dim, keepdim=keepdim)
         indices = torch.ops.aten.argmax(input, dim=dim, keepdim=keepdim)
         return torch.return_types.max((values, indices))
+
+
+# A dim longer than this is ranked in this many interleaved chunks: element v
+# is (l, c) with v = l * chunks + c.
+_ARG_REDUCE_CHUNKS = 1024
+
+
+def _nan_first_key(x: torch.Tensor, largest: bool) -> torch.Tensor:
+    """x, or -x for the smallest, with every NaN written as a positive NaN.
+
+    The device topk ranks a positive NaN first, but the float32 one ranks a NaN
+    with the sign bit set last of all, so it would lose to every number. NaNs
+    made on the device, and float("nan"), are positive, but a host-made one (x86
+    0/0 and inf - inf give one) keeps its sign bit through the copy in, and the
+    topk has no room to check for it. Making it positive takes three passes over
+    x, as abs, <= and where are each an op of their own; a cheaper test misses it
+    on the device, where -nan <= inf holds. abs(x) <= inf is false only for a NaN,
+    of either sign; negating a NaN on the device flips its sign bit, so -x is
+    written back the same way.
+    """
+    if largest:
+        key = x
+    else:
+        key = -x
+    return torch.where(x.abs() <= float("inf"), key, float("nan"))
+
+
+def _rank_key(x: torch.Tensor, largest: bool) -> torch.Tensor:
+    """What a k=1 topk ranks for the largest (or smallest) element of ``x``.
+
+    The float16/bfloat16 (DLFloat16) topk ranks every NaN first whatever its
+    sign, equal ones lowest index first, so x or -x serves as it is; float32
+    needs every NaN made positive.
+    """
+    if x.dtype != torch.float32:
+        if largest:
+            return x
+        else:
+            return -x
+    return _nan_first_key(x, largest)
+
+
+def _chunk_topk_hint(
+    shape: Sequence[int], scanned_dim: int, dtype: torch.dtype
+) -> dict[str, Any]:
+    """spyre_hint arguments that split a chunk topk over the cores.
+
+    ``shape`` is the chunk view: the topk scans the dim at ``scanned_dim``, and
+    its chunks follow it. The planner prices a topk whose scanned dim is off the
+    stick the same on any number of cores and so gives it too few (#6753), so the
+    split is given as a hint: the chunks take the cores first, then the other
+    dims, innermost first, and the scanned dim is never split.
+
+    The decomposition cannot see which dim the layout puts on the stick, so a
+    dim is split k ways only if its size is a multiple of k sticks, a split that
+    is legal whether or not the dim holds the stick.
+    """
+    elems_per_stick = _STICK_BYTES // dtype.itemsize
+    names = [f"_arg_reduce_d{i}" for i in range(len(shape))]
+    chunk_dim = scanned_dim + 1
+    others = [
+        d for d in reversed(range(len(shape))) if d not in (scanned_dim, chunk_dim)
+    ]
+    work_div = {}
+    free = config.sencores
+    for d in [chunk_dim, *others]:
+        sticks, rest = divmod(shape[d], elems_per_stick)
+        if rest:
+            split = 1
+        else:
+            split = math.gcd(sticks, free)
+        work_div[names[d]] = split
+        free //= split
+    return {"named_dims": names, "work_div": work_div}
+
+
+def _first_max_index_chunked(x: torch.Tensor, dim: int, largest: bool) -> torch.Tensor:
+    """Index of the largest (or smallest) element along ``dim``, in keepdim shape.
+
+    The head of ``dim``, its ``length`` whole chunks, is viewed as [length,
+    chunks]: element v is (l, c) with v = l * chunks + c. A k=1 topk over
+    ``length`` gives each chunk's best value and its l, split over the cores by
+    a hint (``_chunk_topk_hint``). The first match is then the smallest l among
+    the chunks holding the best value (or its NaN, where there is one), and the
+    first c among those, a k=1 topk of -l. Both stay below 1024, exact in
+    DLFloat16, and l * chunks + c is formed in float32 on the reduced size-1 dim;
+    an all -inf head gives 0. A float16/bfloat16 dim of more than 1024 chunks
+    would have an l past 1024, which it does not support yet.
+
+    The tail, the fewer than ``chunks`` elements left over, is ranked by one k=1
+    topk and wins only with a larger value, or a NaN the head lacks, as ties go
+    to the lowest index. Slicing it off, rather than padding ``dim`` to whole
+    chunks, saves a copy of the input.
+    """
+    dim = dim % x.dim()
+    before, elements, after = x.shape[:dim], x.shape[dim], x.shape[dim + 1 :]
+    chunks = _ARG_REDUCE_CHUNKS
+    length, rest = divmod(elements, chunks)
+
+    if x.dtype != torch.float32 and length > FP16_TOPK_MAX_DIM:
+        # TODO(#6752): support longer float16/bfloat16 dims.
+        raise Unsupported(
+            f"argmax/argmin of a {x.dtype} dim of {elements} elements: at most "
+            f"{(FP16_TOPK_MAX_DIM + 1) * chunks - 1} are ranked exactly"
+        )
+
+    head_elements = length * chunks
+    if rest:
+        head = x.narrow(dim, 0, head_elements)
+    else:
+        head = x
+    view = [*before, length, chunks, *after]
+
+    # TODO(#6753): drop the hint once the planner splits the topk itself.
+    with spyre_hint(**_chunk_topk_hint(view, dim, x.dtype)):
+        # Keyed on the chunk view: a pointwise op over the whole long dim exceeds
+        # the LX relayout planner's proof limit.
+        xc = _rank_key(head.view(view), largest)
+        local = torch.ops.spyre.topkindex(xc, 1, dim)
+        best = torch.ops.spyre.topkvalue(xc, 1, dim)
+
+    local, best = local.squeeze(dim), best.squeeze(dim)
+    is_nan = ~(best.abs() <= float("inf"))
+    nan_count = torch.amax(is_nan.to(best.dtype), dim=dim, keepdim=True)
+    has_nan = nan_count > 0
+    top = torch.amax(best, dim=dim, keepdim=True)
+
+    match = torch.where(has_nan, is_nan, best == top)
+    matched_l = torch.where(match, local, float(length))
+    l_min = torch.amin(matched_l, dim=dim, keepdim=True)
+    # topk returns the lowest index among equal values, so the first chunk at
+    # the smallest l is the index of the largest -l.
+    c_min = torch.ops.spyre.topkindex(-matched_l, 1, dim)
+    # In float32 a row of -inf matches no chunk (best == top fails), which
+    # leaves l_min at length; such a row gives index 0.
+    no_match = l_min >= length
+    l_min = torch.where(no_match, 0.0, l_min)
+    c_min = torch.where(no_match, 0.0, c_min)
+    index = l_min.to(torch.float32) * chunks + c_min.to(torch.float32)
+
+    if not rest:
+        return index
+
+    # A topk restickifies the buffer it reads, which for a slice is all of x, so
+    # the tail is keyed into a buffer of its own in every dtype.
+    tail = _nan_first_key(x.narrow(dim, head_elements, rest), largest)
+    tail_index = torch.ops.spyre.topkindex(tail, 1, dim)
+    tail_best = torch.ops.spyre.topkvalue(tail, 1, dim)
+
+    # The head-or-tail choice is counted in the data dtype and compared once: a
+    # bool op over operands of different device formats is not supported.
+    tail_is_nan = (~(tail_best.abs() <= float("inf"))).to(x.dtype)
+    tail_larger = (tail_best > top).to(x.dtype)
+    tail_wins = ((tail_is_nan + tail_larger) * (1 - nan_count)).to(torch.float32) > 0
+    return torch.where(tail_wins, tail_index.to(torch.float32) + head_elements, index)
+
+
+def _arg_reduce(
+    input: torch.Tensor, dim: Optional[int], keepdim: bool, largest: bool
+) -> torch.Tensor:
+    """argmax (largest) or argmin of ``input`` along ``dim``, as PyTorch picks it.
+
+    The lowest index wins among equal values, and a NaN wins over any number.
+    The index is converted to int64. A dim of at most 1024 elements is a k=1
+    topk index; a longer one, at any position, is ranked in interleaved chunks
+    (``_first_max_index_chunked``), as a DLFloat16 index is exact only up to
+    1024 and a single topk keeps the scan on few cores. A dim longer than 2**24
+    elements is not supported, as its index is not exact in float32.
+    ``dim=None`` ranks a 1-D tensor.
+    """
+    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        # TODO: integer inputs; an fp32 upcast is not exact past 2**24.
+        raise Unsupported(f"argmax/argmin of {input.dtype}")
+
+    if dim is None:
+        if input.dim() > 1:
+            # TODO: support it; flattening the input does not compile today (#5850).
+            raise Unsupported("argmax/argmin with dim=None of a multi-dim tensor")
+        if keepdim:
+            shape = [1] * input.dim()
+        else:
+            shape = []
+        return _arg_reduce(input.reshape(-1), 0, False, largest).reshape(shape)
+
+    if input.dim() == 0 or input.shape[dim] == 1:
+        # A single candidate is the answer. topkindex of a size-1 dim returns
+        # the value instead of index 0.
+        shape = list(input.shape)
+        if input.dim() > 0:
+            if keepdim:
+                shape[dim] = 1
+            else:
+                del shape[dim]
+        return input.new_zeros(shape, dtype=torch.int64)
+
+    if input.shape[dim] > _FLOAT32_EXACT_LIMIT:
+        # TODO: rank longer dims in a second level of chunks, or with an int32 index.
+        raise Unsupported(
+            f"argmax/argmin over a dim of {input.shape[dim]} elements: at most "
+            f"{_FLOAT32_EXACT_LIMIT} have an exact float32 index"
+        )
+
+    if input.shape[dim] > _ARG_REDUCE_CHUNKS:
+        index = _first_max_index_chunked(input, dim, largest)
+    else:
+        index = torch.ops.spyre.topkindex(_rank_key(input, largest), 1, dim)
+
+    # The index is integer-valued, so flooring converts it exactly.
+    # TODO(#5580): squeeze before converting, so the values share sticks rather
+    # than each fill one in the keepdim shape. A float16/bfloat16 index becomes
+    # int64 through a staggered float32 value, which a conversion of the
+    # squeezed view tags STANDARD.
+    index = torch.ops.spyre.to_int_floored(index, torch.int64)
+
+    if keepdim:
+        return index
+    else:
+        return index.squeeze(dim)
+
+
+@register_spyre_decompositions([torch.ops.aten.argmax.default])
+def spyre_argmax(
+    input: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    return _arg_reduce(input, dim, keepdim, largest=True)
+
+
+@register_spyre_decompositions([torch.ops.aten.argmin.default])
+def spyre_argmin(
+    input: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    return _arg_reduce(input, dim, keepdim, largest=False)
 
 
 @register_spyre_decompositions([torch.ops.aten.min.dim])
