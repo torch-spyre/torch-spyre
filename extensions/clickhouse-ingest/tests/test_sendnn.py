@@ -27,11 +27,13 @@ from spyre_clickhouse_ingest.results import _bench_entries
 
 DATA = Path(__file__).parent / "data" / "sendnn"
 AID = "93c0abb3-ed25-5934-b811-31b6c149ba47"
-# The ids prod spyre_v2 holds for these benchmarks, as both CI's report.xml (backend spyre) and
-# the hand-loaded sendnn runs (backend sendnn) wrote them.
+# The ids these benchmarks get, as both CI's report.xml (backend spyre) and the hand-loaded
+# sendnn runs (backend sendnn) write them. The FMS Granite run's id is
+# new: it was the bare family "granite", which merged every granite model into one
+# benchmark, and is now results.LEGACY_GRANITE_MODEL.
 PROD_IDS = {
     "matmul": "3c086bfe-db98-51f8-a661-908f073dc177",
-    "granite": "f0ebde0b-2e2d-5b05-80c8-0ec6c860daa8",
+    "granite-8b-fms": "1a5109f3-ec2e-5a17-9d71-828c8b096d5e",
 }
 
 

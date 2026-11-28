@@ -45,6 +45,7 @@ from pathlib import Path
 
 
 # Aliased to `schema_model` so the call sites below read unchanged.
+from spyre_clickhouse_ingest import multi_aiu
 from spyre_clickhouse_ingest import schema as schema_model
 from spyre_clickhouse_ingest import (
     error_case_names,
@@ -127,15 +128,46 @@ _PERF_NAME_RE = re.compile(
 
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
 
+# Testcase tags that describe how a model was RUN, not what was measured: the cards it ran on and
+# the persistent storage (PVC) it took. A perf runner can write them per model. They land
+# in the row's run props (benchmark_runs.props), never in the benchmark identity: a model
+# run on another card or with a bigger cache is the same benchmark.
+_RUN_CONTEXT_TAGS = (
+    "num_cards",
+    "spyre_devices",
+    "download_gib",
+    "pvc_hf_gib",
+    "pvc_inductor_gib",
+    "pvc_traces_gib",
+    "pvc_total_gib",
+)
+
 
 def _is_model_record(op_name: str, tags: dict) -> bool:
     # The explicit model tag wins; the granite_ prefix covers reports that predate it.
     return bool(tags.get("model")) or op_name.startswith("granite_")
 
 
+# The name a model record gets when its report names no model at all: only the perf suite's
+# FMS Granite run wrote such rows, and it labels its own output
+# `granite_8b` whatever variant it loaded (8b-base, a local tiny 8b and 8b-instruct over its
+# history, or any GRANITE_MODEL_PATH), so the variant is not recorded and is not guessed here.
+LEGACY_GRANITE_MODEL = "granite-8b-fms"
+# hf-adapters' granite op names carry the model: granite_<model>_bs1_pl512_prefill_only_full_model.
+_GRANITE_OP_MODEL_RE = re.compile(r"^granite_(?P<model>granite[^_]*)_bs\d")
+
+
 def _model_operation_name(op_name: str, tags: dict) -> str:
-    # granite_ ops keep the single "granite" series so existing history stays continuous.
-    return "granite" if op_name.startswith("granite_") else tags["model"]
+    """The model a model record measured: its `model` tag, else the model in a granite_ op name.
+
+    Never the bare family "granite": two granite models (granite-3.3-2b-instruct and
+    granite-4.0-1b-base in one weekly report) would share one name and so one benchmark id,
+    and one model's numbers would hide the other's.
+    """
+    if tags.get("model"):
+        return tags["model"]
+    m = _GRANITE_OP_MODEL_RE.match(op_name)
+    return m["model"] if m else LEGACY_GRANITE_MODEL
 
 
 def _model_shape(op_name: str, tags: dict):
@@ -356,6 +388,9 @@ def parse_benchmark_xml(
                 "created_at": created_at,
                 "torch_spyre_ms": torch_spyre_ms,
                 "ratio": ratio,
+                "run_context": {
+                    k: tags[k] for k in _RUN_CONTEXT_TAGS if tags.get(k, "") != ""
+                },
             }
         )
 
@@ -731,6 +766,39 @@ def _purpose_skipped(args, why: str) -> None:
         )
 
 
+# The model list a run was measured against (hf-adapters tests/model_lists/perf.yaml at one commit), as the
+# runner recorded it: kept as run props on every row of the run, so the list changes with the commit the run
+# used and a page can name that commit. Never part of a benchmark's identity.
+MODEL_LIST_PREFIX = "model_list."
+
+
+def _model_list_props(args) -> dict:
+    """{model_list.name, .commit, .source, .models (comma-joined)} from --model-list-json; {} without it."""
+    path = getattr(args, "model_list_json", "") or ""
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    models = [str(m).strip() for m in data.get("models") or [] if str(m).strip()]
+    if not data.get("name") or not models:
+        raise SystemExit(
+            f"--model-list-json {path}: needs a name and a non-empty models list"
+        )
+    out = {
+        f"{MODEL_LIST_PREFIX}name": str(data["name"]),
+        f"{MODEL_LIST_PREFIX}models": ", ".join(models),
+    }
+    for key in ("commit", "source", "committed_at"):
+        if data.get(key):
+            out[f"{MODEL_LIST_PREFIX}{key}"] = str(data[key])
+    return out
+
+
+def _run_level_props(args) -> dict:
+    """Every run-level prop a CLI flag gives: run.purpose and the model list."""
+    return {**_purpose_props(args), **_model_list_props(args)}
+
+
 def _bench_entries(records: list, run_props: dict | None = None) -> list:
     """This producer's perf records in the shared writer's entry shape.
 
@@ -753,6 +821,19 @@ def _bench_entries(records: list, run_props: dict | None = None) -> list:
     entries = []
     for rec in records:
         num_runs = rec.get("num_runs")
+        # The report's own time (testsuite timestamp), so a late or back-filled ingest is still
+        # dated by the measurement: v_benchmark_results_enriched reads run_ts from run_utc.
+        created = rec.get("created_at")
+        row_run_props = {
+            **(
+                {"run_utc": created.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")}
+                if isinstance(created, datetime) and created.tzinfo
+                else {}
+            ),
+            # how the model was run (cards, PVC storage): per row, never identity
+            **(rec.get("run_context") or {}),
+            **(run_props or {}),
+        }
         entries.append(
             {
                 "name": rec.get("operation_name") or "",
@@ -771,7 +852,7 @@ def _bench_entries(records: list, run_props: dict | None = None) -> list:
                 "iterations": int(num_runs) if num_runs is not None else 0,
                 "disc": rec,
                 "disc_keys": _V2_BENCH_ID_KEYS,
-                **({"run_props": dict(run_props)} if run_props else {}),
+                **({"run_props": row_run_props} if row_run_props else {}),
             }
         )
     return entries
@@ -1563,9 +1644,12 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
 # ---------------------------------------------------------------------------
 
 
-def _leg_state(failed: int, total: int) -> str:
-    """artifact_results.state. 'error' for no cases: that suite did not run, it did not regress."""
-    if total <= 0:
+def _leg_state(failed: int, total: int, incomplete: str = "") -> str:
+    """artifact_results.state. 'error' for no cases: that suite did not run, it did not regress.
+
+    `incomplete` (why a perf leg's numbers are missing) is 'error' too: it measured, but not what
+    it set out to, so it must not read as a pass."""
+    if total <= 0 or incomplete:
         return "error"
     return "failed" if failed > 0 else "passed"
 
@@ -1581,6 +1665,13 @@ def _leg_failure(state: str, acc: dict, result_props: dict) -> dict:
             "failure_reason": "test_failure",
             "failure_detail": f"{acc['failed']} of {acc['total']} failed"
             + (f": {first}" if first else ""),
+            "failure_confidence": "1",
+        }
+    if state == "error" and acc.get("incomplete"):
+        return {
+            "failure_reason": "infra_env",
+            "failure_subreason": "no_device_spans",
+            "failure_detail": acc["incomplete"],
             "failure_confidence": "1",
         }
     if state == "error":
@@ -1773,7 +1864,7 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     aid = identity.artifact_id
     recorded = True
     for run_id, tier, acc in admitted:
-        state = _leg_state(acc["failed"], acc["total"])
+        state = _leg_state(acc["failed"], acc["total"], acc.get("incomplete", ""))
         if insert_artifact_result(
             client,
             v2db,
@@ -1825,6 +1916,26 @@ def build_parser() -> argparse.ArgumentParser:
         "the test_case_id they hash into) name the suite's real owner.",
     )
     parser.add_argument("--gha-run-id", default="")
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Model a Multi-AIU run measured, for report XMLs that do not name it; a model "
+        "the XML declares wins. Part of each benchmark's identity.",
+    )
+    parser.add_argument(
+        "--model-list-json",
+        default="",
+        help="The model list the run was measured against (JSON: name, models, commit, source), e.g. "
+        "hf-adapters perf.yaml's weekly list at one commit. Stored as model_list.* run props on every "
+        "perf row of the run; never part of a benchmark's identity.",
+    )
+    parser.add_argument(
+        "--workload-json",
+        default="",
+        help="A Multi-AIU run's workload description (JSON: command, prompt, decode steps, "
+        "dtype, versions, ...). Stored as workload.* run props on every row of the run; "
+        "never part of a benchmark's identity.",
+    )
     parser.add_argument(
         "--run-attempt",
         type=int,
@@ -2119,6 +2230,14 @@ def main(argv=None, assigned_trust=""):
         bench_ready = False
     if args.purpose and not bench_ready:
         _refuse_purpose("the v2 benchmark tables are absent or incomplete")
+    # One id for the invocation: a Multi-AIU run is several files (a report per rank, kernel
+    # reports, a summary) and, with no CI coordinate, must stay one run.
+    multi_aiu_local_id = str(uuid.uuid4().int >> 64)
+    multi_aiu_cards = (
+        None  # the run's card count, read from all its files on first need
+    )
+    multi_aiu_model = None  # the run's model, likewise
+    multi_aiu_workload = None  # the run's workload description, read once
 
     for xml_path in xml_files:
         print(f"Processing: {xml_path.name}")
@@ -2126,9 +2245,83 @@ def main(argv=None, assigned_trust=""):
         tree = etree.parse(str(xml_path))
         root = tree.getroot()
 
-        # ── Dispatch: kernel breakdown vs benchmark vs test-result ─────────
-        # Kernel first: is_benchmark_xml() also matches these.
-        if is_kernel_benchmark_xml(root):
+        # ── Dispatch: multi-AIU vs kernel breakdown vs benchmark vs test-result ──
+        # Multi-AIU first: its classnames contain 'benchmark', so is_benchmark_xml() would
+        # take it and parse zero records. Kernel next: is_benchmark_xml() also matches those.
+        if multi_aiu.is_multi_aiu_xml(root):
+            print("  Detected: multi-AIU report XML")
+            if multi_aiu_cards is None:
+                multi_aiu_cards = multi_aiu.num_cards_of(xml_files)
+            if multi_aiu_model is None:
+                multi_aiu_model = multi_aiu.model_of(xml_files) or args.model.strip()
+            if multi_aiu_workload is None:
+                multi_aiu_workload = {}
+                if args.workload_json:
+                    with open(args.workload_json, encoding="utf-8") as fh:
+                        multi_aiu_workload = json.load(fh)
+            entries = multi_aiu.parse(
+                xml_path, multi_aiu_cards, multi_aiu_model, multi_aiu_workload
+            )
+            if not entries:
+                print(f"  No benchmark records in {xml_path.name} — skipping")
+                continue
+            parsed_benchmarks += len(entries)
+            # v2 only: there is no v1 table shape for per-card, per-step rows.
+            if not bench_ready:
+                print(
+                    "  [warn] multi-AIU XML needs the v2 benchmark tables "
+                    "(--schema v2 and CLICKHOUSE_DB_V2) — nothing written",
+                    file=sys.stderr,
+                )
+                continue
+            _v2_run_id = run_id_for(
+                args, multi_aiu_local_id, args.platform or "", "perf"
+            )
+            if not _v2_run_id:
+                print("  [warn] v2 skipped: run_id not derivable", file=sys.stderr)
+                continue
+            if benchmarks_already_ingested(
+                client,
+                v2db,
+                _v2_run_id,
+                component_of(args, COMPONENT_DEFAULT),
+                multi_aiu.REPORT_KIND,
+                xml_path.name,
+            ):
+                print(
+                    f"  v2: already ingested multi-AIU report for "
+                    f"run_id={_v2_run_id} — skipping"
+                )
+            else:
+                _n = insert_benchmarks(
+                    client,
+                    v2db,
+                    component_of(args, COMPONENT_DEFAULT),
+                    _v2_run_id,
+                    entries,
+                    report_kind=multi_aiu.REPORT_KIND,
+                    source_file=xml_path.name,
+                )
+                print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+            _perf_leg(artifact_legs, args, _v2_run_id, len(entries))
+            if (
+                multi_aiu.lacks_device_spans(entries)
+                and (_v2_run_id, "perf") in artifact_legs
+            ):
+                # The generator printed 0 for flex_rt / aiu_rt / aiu_hw: the trace has no
+                # flexRoundTrip / aiuRoundtrip spans, so the layer split was not measured.
+                artifact_legs[(_v2_run_id, "perf")]["incomplete"] = (
+                    f"{xml_path.name}: flex_rt, aiu_rt and aiu_hw are all 0 -- the trace has no "
+                    "flexRoundTrip / aiuRoundtrip spans, so only the torch-spyre totals are measured"
+                )
+                print(
+                    f"  [warn] {xml_path.name}: no device spans in the trace; "
+                    "the layer split is not measured",
+                    file=sys.stderr,
+                )
+            total_benchmarks += len(entries)
+
+        elif is_kernel_benchmark_xml(root):
             print("  Detected: per-kernel breakdown XML")
             benchmark_xmls += 1
             # The v1 kernel tables are a precondition only for the v1 write; checked before
@@ -2217,7 +2410,7 @@ def main(argv=None, assigned_trust=""):
                             v2db,
                             component_of(args, COMPONENT_DEFAULT),
                             _v2_run_id,
-                            _bench_entries(kernels, _purpose_props(args)),
+                            _bench_entries(kernels, _run_level_props(args)),
                             report_kind="kernel",
                             source_file=run_meta["source_file"],
                         )
@@ -2342,7 +2535,7 @@ def main(argv=None, assigned_trust=""):
                             v2db,
                             component_of(args, COMPONENT_DEFAULT),
                             _v2_run_id,
-                            _bench_entries(benchmarks, _purpose_props(args)),
+                            _bench_entries(benchmarks, _run_level_props(args)),
                             report_kind="benchmark",
                             source_file=run_meta["source_file"],
                         )

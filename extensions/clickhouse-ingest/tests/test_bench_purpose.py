@@ -79,7 +79,9 @@ def test_the_purpose_is_not_part_of_the_benchmark_identity(tmp_path):
     assert [(e["name"], e["tags"], e["disc"]) for e in plain] == [
         (e["name"], e["tags"], e["disc"]) for e in tagged
     ]
-    assert all("run_props" not in e for e in plain)
+    # run_utc (the report's own time) may be there; the purpose must not be.
+    assert all("run.purpose" not in e.get("run_props", {}) for e in plain)
+    assert all(e["run_props"]["run.purpose"] == "nightly" for e in tagged)
 
 
 @pytest.mark.parametrize("bad", ["a b", "-x", "x" * 33, "nïghtly", "1st", "a/b"])
