@@ -576,7 +576,8 @@ def spyre_constant_tensor(const_val, device, dtype=torch.float16):
     (value, device, dtype). In-place mutation would corrupt all callers.
 
     Inductor enforces immutability via:
-      - SpyreConstantFallback.should_allocate() == False
+      - SpyreConstantFallback's buffer in V.graph.never_reuse_buffers, so no
+        later buffer or kernel output takes its storage
       - SpyreConstantFallback.get_mutation_names() == []
 
     Any pass that modifies this contract MUST update this function.
@@ -686,7 +687,8 @@ def spyre_arange_tensor(length, device, dtype=torch.float16, column=False):
 
     WARNING: returns a view of a buffer shared across every forward pass, which
     MUST NEVER be mutated in place.  Inductor upholds this via
-    ``SpyreArangeFallback.should_allocate() == False`` and its empty
+    ``SpyreArangeFallback``'s buffer in ``V.graph.never_reuse_buffers``, so no
+    later buffer or kernel output takes its storage, and its empty
     ``get_mutation_names()``; any pass that changes that contract must update
     this function.
 

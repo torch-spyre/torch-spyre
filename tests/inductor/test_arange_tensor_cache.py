@@ -27,9 +27,12 @@ represents exactly, so ``torch.equal`` reports only real cache errors.
 
 import threading
 import unittest
+from unittest import mock
 
 import torch
+from torch._inductor.graph import GraphLowering
 
+from torch_spyre._inductor.ir import SpyreArangeFallback, SpyreConstantFallback
 from torch_spyre._inductor.op_spec import (
     _ARANGE_MAX_LEN,
     _ARANGE_SEED_LEN,
@@ -172,6 +175,42 @@ class TestArangeTensorCache(unittest.TestCase):
         for ramp in results:
             expect = torch.arange(ramp.shape[0], dtype=torch.float16)
             self.assertTrue(torch.equal(ramp.cpu(), expect))
+
+
+class TestCachedBuffersAreNeverReused(unittest.TestCase):
+    """A cached ramp or constant is shared across forward passes, so Inductor
+    must never hand its storage to another buffer or to a kernel's output.
+
+    torch-spyre turns both reuse paths off today (``allow_buffer_reuse`` and
+    no ``INPLACE_BUFFERS``), so a wrong reuse cannot be observed in a run.
+    Both paths consult ``never_reuse_buffers``, so the test checks that every
+    cached buffer is in it once the graph is lowered.
+    """
+
+    def test_ramp_and_constant_buffers_are_never_reused(self):
+        seen: dict[str, bool] = {}
+        codegen = GraphLowering.codegen
+
+        def record(graph, *args, **kwargs):
+            # After codegen: the scheduling passes add constants of their own.
+            result = codegen(graph, *args, **kwargs)
+            for buf in graph.buffers:
+                if isinstance(buf, (SpyreArangeFallback, SpyreConstantFallback)):
+                    seen[buf.get_name()] = buf.get_name() in graph.never_reuse_buffers
+            return result
+
+        def fn(x):
+            ramp = torch.arange(64, dtype=x.dtype, device=x.device)
+            return (x + ramp) * 3.0
+
+        torch._dynamo.reset()
+        x = torch.zeros(64, dtype=torch.float16).to(SPYRE)
+        with mock.patch.object(GraphLowering, "codegen", record):
+            out = torch.compile(fn, dynamic=False)(x)
+
+        self.assertTrue(torch.equal(out.cpu(), torch.arange(64.0).half() * 3))
+        self.assertGreaterEqual(len(seen), 2, "no cached ramp and constant lowered")
+        self.assertEqual([name for name, kept in seen.items() if not kept], [])
 
 
 if __name__ == "__main__":
