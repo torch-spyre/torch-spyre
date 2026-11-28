@@ -22,8 +22,11 @@ Small dests stay eager + compiled at default config. Eager is never a SENCORES v
 
 import pytest
 import torch
+from torch._dynamo.exc import BackendCompilerFailed
+from torch._inductor.exc import InductorError
+from torch_spyre._inductor.errors import Unsupported
 
-from utils_inductor import DEVICE, cached_randn
+from utils_inductor import DEVICE, cached_randn, compare_with_cpu
 from conftest import (
     gap_one_core,
     _xfail_existing,
@@ -93,6 +96,426 @@ _SR_TWO = rejection(
     "aten::scatter_reduce.two_out is not registered on Spyre.",
     r"Could not run 'aten::scatter_reduce.two_out'",
 )
+
+
+def _mode_flags(mode: str):
+    """Return (run_eager, run_compile) booleans from the 'mode' parameter string."""
+    return (mode == "eager", mode == "compile")
+
+
+# Shared execution-mode parametrizations. Pass each case's issue, exception, and
+# failure description here so the XFAIL policy is defined in one place.
+def _xfail(issue, exception, reason):
+    return pytest.mark.xfail(
+        strict=True, raises=exception, reason=f"{reason}, #{issue}"
+    )
+
+
+def _mode_params(*, eager=None, compile=None):
+    """Build eager/compile parameters; each XFAIL is (issue, exception, reason)."""
+    params = []
+    for mode, xfail in (("eager", eager), ("compile", compile)):
+        params.append(pytest.param(mode, marks=_xfail(*xfail)) if xfail else mode)
+    return tuple(params)
+
+
+_MODE_PARAMS_SCATTER_HIGH_RANK_XFAIL = _mode_params(
+    eager=(
+        4473,
+        NotImplementedError,
+        "Spyre eager scatter dispatch is unsupported for this case",
+    ),
+    compile=(
+        6574,
+        InductorError,
+        "dbo-opt GatherIndexConversion fails its divisibility assertion",
+    ),
+)
+_MODE_PARAMS_SCATTER_TRANSPOSED_SOURCE_STRIDED_INDEX_XFAIL = _mode_params(
+    eager=(
+        4473,
+        NotImplementedError,
+        "Spyre eager scatter dispatch is unsupported for this case",
+    ),
+    compile=(
+        4927,
+        InductorError,
+        "Inductor does not support slice_scatter with step=2 for a strided destination view",
+    ),
+)
+_MODE_PARAMS_SCATTER_1D_SINGLE_ELEMENT_XFAIL = _mode_params(
+    eager=(
+        4473,
+        NotImplementedError,
+        "Spyre eager scatter dispatch is unsupported for this case",
+    ),
+    compile=(
+        4637,
+        InductorError,
+        "Inductor indirect-scatter alignment fails with KeyError: tmp0",
+    ),
+)
+_MODE_PARAMS_SCATTER_1D_INPLACE_SCALAR_FILL_XFAIL = _mode_params(
+    eager=(
+        4473,
+        NotImplementedError,
+        "Spyre eager scatter dispatch is unsupported for this case",
+    ),
+    compile=(
+        4474,
+        InductorError,
+        "Inductor cannot pad the sliced scatter output in place during restickification",
+    ),
+)
+_MODE_PARAMS_SCATTER_ADD_EAGER_ONLY_XFAIL = _mode_params(
+    eager=(
+        4396,
+        NotImplementedError,
+        "aten::scatter_add.out has no registered Spyre eager kernel",
+    )
+)
+_MODE_PARAMS_INDEX_ADD_STORAGE_OFFSET_XFAIL = _mode_params(
+    eager=(3507, NotImplementedError, "Enable Tensor.index_add_ / aten::index_add"),
+    compile=(
+        6707,
+        InductorError,
+        "Inductor layout propagation cannot resolve sharding because graph and real input counts differ",
+    ),
+)
+_MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL = _mode_params(
+    eager=(
+        4396,
+        NotImplementedError,
+        "aten::scatter_add.out has no registered Spyre eager kernel",
+    ),
+    compile=(
+        6707,
+        InductorError,
+        "Inductor layout propagation cannot resolve sharding because graph and real input counts differ",
+    ),
+)
+_MODE_PARAMS_SCATTER_REDUCE_DYNAMIC_SYMINT_XFAIL = _mode_params(
+    eager=(
+        4361,
+        NotImplementedError,
+        "indexed-reduction eager dispatch is reported unsupported",
+    ),
+    compile=(
+        6575,
+        InductorError,
+        "dbo-opt scheduler rejects the scatter page-size constraint",
+    ),
+)
+_MODE_PARAMS_SCATTER_ADD_BF16_SUBNORMAL_XFAIL = _mode_params(
+    eager=(
+        4396,
+        NotImplementedError,
+        "aten::scatter_add.out has no registered Spyre eager kernel",
+    ),
+    compile=(
+        6574,
+        InductorError,
+        "dbo-opt GatherIndexConversion fails its divisibility assertion",
+    ),
+)
+
+
+def _scatter_reduce_nan_inf_params():
+    """Build mode/reduction pairs with the existing per-mode XFAIL policies."""
+    params = []
+    for reduce_mode in ("sum", "prod", "mean", "amax", "amin"):
+        for mode in ("eager", "compile"):
+            if mode == "eager":
+                xfail = (
+                    4361,
+                    NotImplementedError,
+                    "indexed-reduction eager dispatch is reported unsupported",
+                )
+            elif reduce_mode == "sum":
+                xfail = (
+                    6575,
+                    InductorError,
+                    "dbo-opt scheduler rejects the scatter page-size constraint",
+                )
+            else:
+                xfail = (
+                    4361,
+                    InductorError,
+                    "indexed-reduction compile path is reported unsupported",
+                )
+            params.append(
+                pytest.param(
+                    mode,
+                    reduce_mode,
+                    marks=_xfail(*xfail),
+                    id=f"{reduce_mode}-{mode}",
+                )
+            )
+    return tuple(params)
+
+
+_SCATTER_REDUCE_NAN_INF_PARAMS = _scatter_reduce_nan_inf_params()
+_MODE_PARAMS_EAGER_COMPILE = ("eager", "compile")
+# Compile-only: the eager row is dropped where upstream (TestTorch / TestIndexing /
+# TestScatterGather, run through the OOT upstream configs) already covers the same case.
+_MODE_PARAMS_COMPILE_ONLY = ("compile",)
+_REDUCE_MODES = ("prod", "mean", "amax", "amin")
+_PUT_ACCUMULATE_OPTIONS = (False, True)
+
+_INDEX_REDUCE_NARROW_CASES = tuple(
+    pytest.param(
+        reduce_mode,
+        mode,
+        marks=_xfail(issue, InductorError, reason),
+    )
+    for reduce_mode in _REDUCE_MODES
+    for mode, issue, reason in (
+        (
+            "eager",
+            6210,
+            "Indirect indexing on a sliced view with a non-zero storage offset fails OpSpec validation",
+        ),
+        (
+            "compile",
+            6707,
+            "Spyre Inductor rejects the graph because it has 3 inputs but 4 real inputs",
+        ),
+    )
+)
+
+_MODE_PARAMS_INDEX_FILL_UNSUPPORTED = _mode_params(
+    eager=(
+        4414,
+        NotImplementedError,
+        "aten::index_fill_.int_Scalar has no registered Spyre eager kernel",
+    ),
+    compile=(
+        4472,
+        InductorError,
+        "Inductor scatter/index_fill lowering rejects a Constant store value",
+    ),
+)
+_MODE_PARAMS_INDEX_FILL_NONUNIT_STRIDED_XFAIL = _mode_params(
+    eager=(
+        6587,
+        NotImplementedError,
+        "aten::index_fill_.int_Scalar has no registered Spyre eager kernel",
+    ),
+    compile=(
+        4927,
+        InductorError,
+        "Inductor does not support slice_scatter with step=2 for a strided destination view",
+    ),
+)
+_MODE_PARAMS_INDEX_REDUCE_SLICED_VIEW_DEST_XFAIL = _mode_params(
+    eager=(
+        6210,
+        InductorError,
+        "Indirect indexing on a sliced view with a non-zero storage offset fails OpSpec validation",
+    ),
+    compile=(
+        6210,
+        InductorError,
+        "Indirect indexing on a sliced view with a non-zero storage offset fails OpSpec validation",
+    ),
+)
+_MODE_PARAMS_INDEX_PUT_HALF_FORMAT_COLLISION_XFAIL = _mode_params(
+    eager=(
+        692,
+        NotImplementedError,
+        "aten::_index_put_impl_ has no registered Spyre eager kernel",
+    ),
+    compile=(
+        4411,
+        AssertionError,
+        "index_put_ accumulate with colliding indices keeps one update instead of accumulating them",
+    ),
+)
+_MODE_PARAMS_INDEX_COPY_ZERO_VOLUME_XFAIL = _mode_params(
+    eager=(
+        4474,
+        InductorError,
+        "Inductor cannot pad the sliced output in place during restickification",
+    ),
+    compile=(
+        3455,
+        InductorError,
+        "Inductor raises Unexpected stick expression for the zero-volume layout",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_UNSUPPORTED = _mode_params(
+    eager=(
+        4437,
+        NotImplementedError,
+        "Spyre eager masked_scatter_ overload has no registered kernel",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter lowering rejects unsupported mask/source indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE = _mode_params(
+    eager=(
+        4437,
+        RuntimeError,
+        "Spyre masked_scatter rejects element-level mask/source indexing",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter lowering rejects unsupported mask/source indexing",
+    ),
+)
+# Dynamic-shape masked_scatter now runs without an XFAIL in compile mode.
+# Keep the existing eager XFAIL because the eager elementwise indexing path is unsupported.
+_MODE_PARAMS_MASKED_SCATTER_DYNAMIC = _mode_params(
+    eager=(
+        4437,
+        RuntimeError,
+        "Spyre masked_scatter rejects element-level mask/source indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_COMPILE_ONLY = _mode_params(
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter lowering rejects unsupported mask/source indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_ZERO_VOLUME = _mode_params(
+    eager=(
+        4437,
+        NotImplementedError,
+        "Spyre eager masked_scatter_ overload has no registered kernel",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter lowering rejects unsupported mask/source indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_ALL_TRUE = _mode_params(
+    eager=(
+        4437,
+        Unsupported,
+        "Spyre eager masked_scatter_ overload has no registered kernel",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter requires a mask broadcast along the last dim and rejects element-level indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_SCALAR_FALSE = _mode_params(
+    eager=(
+        4437,
+        Unsupported,
+        "Spyre masked_scatter requires a mask broadcast along the last dim and rejects element-level indexing",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter requires a mask broadcast along the last dim and rejects element-level indexing",
+    ),
+)
+_MODE_PARAMS_MASKED_SCATTER_NO_SIDE_EFFECTS = _mode_params(
+    eager=(
+        4437,
+        Unsupported,
+        "Spyre masked_scatter does not support element-level mask/source indexing",
+    ),
+    compile=(
+        4437,
+        BackendCompilerFailed,
+        "Spyre masked_scatter does not support element-level mask/source indexing",
+    ),
+)
+_MODE_PARAMS_INDEX_PUT_UNSUPPORTED = _mode_params(
+    eager=(
+        692,
+        NotImplementedError,
+        "aten::_index_put_impl_ has no registered Spyre eager kernel",
+    ),
+    compile=(
+        6748,
+        InductorError,
+        "torch.index_put compilation fails due to output indexer stride assertion",
+    ),
+)
+_MODE_PARAMS_INDEX_COPY_NONCONTIG_5D = _mode_params(
+    eager=(
+        6587,
+        RuntimeError,
+        "Eager index_copy.out on a non-contiguous 5D destination re-enters the compiled Spyre kernel",
+    ),
+)
+_MODE_PARAMS_PUT_UNSUPPORTED = _mode_params(
+    eager=(692, NotImplementedError, "aten::put_ has no registered Spyre eager kernel"),
+    compile=(
+        6578,
+        InductorError,
+        "Compiled put_ fails the restickify op_spec three-argument assertion",
+    ),
+)
+_MODE_PARAMS_PUT_ALL_NONCONTIG_XFAIL = _mode_params(
+    eager=(
+        692,
+        NotImplementedError,
+        "aten::put_ has no registered Spyre eager kernel for all-noncontiguous inputs",
+    ),
+    compile=(
+        6578,
+        InductorError,
+        "Compiled put_ fails the restickify op_spec three-argument assertion",
+    ),
+)
+_MODE_PARAMS_INDEX_REDUCE_DUPLICATES_XFAIL = _mode_params(
+    eager=(
+        4411,
+        AssertionError,
+        "eager index_reduce with duplicate indices keeps one update instead of reducing them",
+    ),
+    compile=(
+        4411,
+        AssertionError,
+        "compiled index_reduce with duplicate indices keeps one update instead of reducing them",
+    ),
+)
+_MODE_PARAMS_INDEX_REDUCE_NONCONTIG_SOURCE_XFAIL = _mode_params(
+    eager=(
+        4932,
+        AssertionError,
+        "Eager index_reduce_ with a non-contiguous source returns values that differ from CPU",
+    ),
+    compile=(
+        4932,
+        AssertionError,
+        "Compiled index_reduce_ with a non-contiguous source returns values that differ from CPU",
+    ),
+)
+_MODE_PARAMS_INDEX_REDUCE_NONCONTIG_ALL_XFAIL = _mode_params(
+    eager=(
+        4932,
+        AssertionError,
+        "Eager index_reduce_ with non-contiguous dest, source, and index returns values that differ from CPU",
+    ),
+    compile=(
+        4927,
+        InductorError,
+        "Inductor does not support slice_scatter with step=2 for a strided destination view",
+    ),
+)
+
+_INDEX_REDUCE_OUTPLACE_CASES = [
+    (torch.bfloat16, reduce_mode, index_dtype, 0.005, 0.005)
+    for reduce_mode in ("prod", "mean", "amax", "amin")
+    for index_dtype in (torch.int32, torch.int64)
+] + [
+    (dtype, reduce_mode, torch.int64, tol, tol)
+    for dtype, tol in ((torch.float32, 0.0001), (torch.float16, 0.05))
+    for reduce_mode in ("mean", "amax", "amin")
+]
 
 
 def _router_index(T, E, K, seed=0):
@@ -1046,3 +1469,2036 @@ class TestScatterReduceCompileDynamic:
             dynamic=True,
         )(dst.to(DEVICE), idx.to(DEVICE), src.to(DEVICE)).cpu()
         torch.testing.assert_close(got, ref, atol=_TOL_F16, rtol=_TOL_F16)
+
+
+# ---------------------------------------------------------------------------
+# Additional indirect-write coverage (parametrized over mode: eager / compile)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestScatterEdgeCasesEagerCompile:
+    """Tensor-src scatter / scatter_ edge cases: zero-volume, strided, empty and single-element operands."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_COMPILE_ONLY)
+    def test_scatter_zero_volume_inner_dim(self, mode: str):
+        """Zero-volume inner dimension scatter — shape (8, 0, 128) must be a safe no-op.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128).
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(8, 0, 128, dtype=torch.bfloat16)
+        src_t = torch.zeros(4, 0, 128, dtype=torch.bfloat16)
+        idx_t = torch.zeros(4, 0, 128, dtype=torch.int64)
+
+        def fn(dest, index, source):
+            return dest.scatter(0, index, source)
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize(
+        "mode", _MODE_PARAMS_SCATTER_TRANSPOSED_SOURCE_STRIDED_INDEX_XFAIL
+    )
+    def test_scatter_transposed_source_strided_index(self, mode: str):
+        """Transposed (non-contiguous) source + strided index into strided destination.
+
+        Synthetic KV-cache-like shape (8, 128); exercises a strided layout, not a full
+        model configuration. Exercises the full non-contiguous path: dest is a step-2
+        strided view, src is transposed (T), index is a narrow sub-view — all three
+        inputs have non-unit strides simultaneously.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        base_dest = torch.zeros(16, 128, dtype=torch.bfloat16)
+        src_base = torch.randn(128, 8, dtype=torch.bfloat16)
+        src_t = src_base.t()
+        idx_base = torch.empty((20, 128), dtype=torch.int64)
+        idx_t = idx_base[2:18:2, :]
+        for col in range(128):
+            idx_t[:, col] = torch.randperm(8)
+
+        def fn(base, index, source):
+            out = base.clone()
+            view = out[::2, :]
+            view.scatter_(0, index, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            base_dest,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_COMPILE_ONLY)
+    @pytest.mark.parametrize("dim", [0, 1])
+    def test_scatter_empty_row_index(self, mode: str, dim: int):
+        """Zero-element index and source — safe no-op, dest returned unchanged.
+
+        Model shape: Ministral-3-14B (kv_heads=8, head_dim=128, hidden=5120).
+        dim=0: dest (8, 128), src/index (0, 128) — zero rows, empty along the scatter dim.
+        dim=1: dest (8, 128), src/index (8, 0) — zero cols, empty along the scatter dim.
+        Both cases must return dest unchanged.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.randn(8, 128, dtype=torch.bfloat16)
+        if dim == 0:
+            src_t = torch.randn(0, 128, dtype=torch.bfloat16)
+            idx_t = torch.zeros(0, 128, dtype=torch.int64)
+        else:
+            src_t = torch.randn(8, 0, dtype=torch.bfloat16)
+            idx_t = torch.zeros(8, 0, dtype=torch.int64)
+
+        def fn(dest, index, source):
+            return dest.scatter(dim, index, source)
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_1D_SINGLE_ELEMENT_XFAIL)
+    def test_scatter_1d_single_element_source(self, mode: str):
+        """Single-element source scatter — src shape (1,) writes one value into a 1D dest.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128).
+        Scatters exactly one source element to one indexed position in a 128-element
+        buffer.  This is not a broadcasting test; index and source both have shape (1,).
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(128, dtype=torch.float32)
+        src_t = torch.randn(1, dtype=torch.float32)
+        idx_t = torch.randint(0, 128, (1,), dtype=torch.int64)
+
+        def fn(dest, index, source):
+            return dest.scatter(0, index, source)
+
+        compare_with_cpu(
+            fn, self_t, idx_t, src_t, run_eager=run_eager, run_compile=run_compile
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_1D_INPLACE_SCALAR_FILL_XFAIL)
+    def test_scatter_1d_inplace_scalar_fill(self, mode: str):
+        """1D in-place scatter_ scalar fill into a head_dim vector.
+
+        Model shape: Gemma-4-26B (head_dim=256).
+        Covers 1D-IP: the only existing 1D scatter test (test_scatter_dim_broadcasting)
+        uses the out-of-place form. This exercises scatter_() on a 1D tensor by filling
+        16 randomly selected positions in a head_dim=256 buffer with a constant 1.0.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(256, dtype=torch.bfloat16)
+        idx_t = torch.randperm(256, dtype=torch.int64)[:16]
+
+        def fn(dest, index):
+            out = dest.clone()
+            out.scatter_(0, index, 1.0)
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestScatterHighRankEagerCompile:
+    """4D / 5D / 6D scatter on KV-cache geometries (out-of-place and in-place)."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_HIGH_RANK_XFAIL)
+    def test_scatter_4d_outofplace_attention_logits(self, mode: str):
+        """4D out-of-place scatter on (batch, kv_heads, seq, head_dim) attention geometry.
+
+        Model shape: Gemma-4-12B (kv_heads=10, head_dim=128).
+        Covers 4D-OOP: no existing test calls scatter() on a 4D tensor.
+        Scatters updated token logits into 4 selected sequence positions (dim=2).
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 10, 16, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 10, 4, 128, dtype=torch.bfloat16)
+        seq_idx = torch.randperm(16, dtype=torch.int64)[:4]
+        idx_t = seq_idx.view(1, 1, 4, 1).expand(2, 10, 4, 128)
+
+        def fn(dest, index, source):
+            return dest.scatter(2, index, source)
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_HIGH_RANK_XFAIL)
+    def test_scatter_4d_inplace_channel_update(self, mode: str):
+        """4D in-place scatter_ — updates selected kv_head channels in a KV-cache buffer.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128).
+        Covers 4D-IP: scatter_() on a 4D tensor. Scatters 4 source rows into selected
+        kv_heads positions (dim=1) inside a (batch, kv_heads, seq, head_dim) buffer.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 8, 16, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 4, 16, 128, dtype=torch.bfloat16)
+        kv_idx = torch.randperm(8, dtype=torch.int64)[:4]
+        idx_t = kv_idx.view(1, 4, 1, 1).expand(2, 4, 16, 128)
+
+        def fn(dest, index, source):
+            out = dest.clone()
+            out.scatter_(1, index, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_HIGH_RANK_XFAIL)
+    def test_scatter_5d_inplace_layer_cache(self, mode: str):
+        """5D in-place scatter_ on layer-KV-cache geometry (batch, layers, kv_heads, seq, head_dim).
+
+        Model shape: Ministral-3-14B (kv_heads=8, head_dim=128).
+        Covers 5D-IP: the only existing 5D scatter test (test_scatter_5d_middle_axis)
+        uses the out-of-place form. Scatters 4 updated token positions into dim=3 (seq)
+        of a full layer-cache buffer in-place.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 4, 8, 16, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 4, 8, 4, 128, dtype=torch.bfloat16)
+        seq_idx = torch.randperm(16, dtype=torch.int64)[:4]
+        idx_t = seq_idx.view(1, 1, 1, 4, 1).expand(2, 4, 8, 4, 128)
+
+        def fn(dest, index, source):
+            out = dest.clone()
+            out.scatter_(3, index, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_HIGH_RANK_XFAIL)
+    def test_scatter_6d_inplace_multi_layer_cache(self, mode: str):
+        """6D in-place scatter_ on multi-layer multi-expert cache geometry.
+
+        Layout: (experts, batch, layers, kv_heads, seq, head_dim).
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equivalent).
+        Covers 6D-IP: no existing test uses scatter_() on a 6D tensor. Scatters 2
+        updated token positions into dim=4 (seq) of a 6D expert-layer-KV-cache buffer.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 2, 2, 8, 8, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 2, 2, 8, 2, 128, dtype=torch.bfloat16)
+        seq_idx = torch.randperm(8, dtype=torch.int64)[:2]
+        idx_t = seq_idx.view(1, 1, 1, 1, 2, 1).expand(2, 2, 2, 8, 2, 128)
+
+        def fn(dest, index, source):
+            out = dest.clone()
+            out.scatter_(4, index, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestScatterAddShapesEagerCompile:
+    """scatter_add: storage offsets, bf16 subnormals, and 4D / 5D / 6D KV-cache geometries."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL)
+    def test_scatter_add_nonzero_storage_offset(self, mode: str):
+        """Non-zero storage_offset on self, index, and src simultaneously.
+
+        Synthetic KV-cache-like shape (16, 256); not a Gemma-4-26B configuration.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        base_self = torch.zeros(32, 256, dtype=torch.bfloat16)
+        base_src = torch.randn(32, 256, dtype=torch.bfloat16)
+        base_idx = torch.randint(0, 16, (32, 256), dtype=torch.int64)
+
+        def fn(dest_base, index_base, source_base):
+            out = dest_base.clone()
+            index = index_base.narrow(0, 2, 16)
+            source = source_base.narrow(0, 4, 16)
+            dest = out.narrow(0, 8, 16)
+            assert dest.storage_offset() > 0
+            assert index.storage_offset() > 0
+            assert source.storage_offset() > 0
+            dest.scatter_add_(0, index, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            base_self,
+            base_idx,
+            base_src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_BF16_SUBNORMAL_XFAIL)
+    def test_scatter_add_bf16_subnormal_accumulation(self, mode: str):
+        """BF16 subnormal/denormal accumulation using smallest_subnormal.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128).
+        Uses torch.finfo(bfloat16).smallest_subnormal to guarantee a true
+        denormal value rather than a magic constant that may flush to zero on
+        some platforms. Verifies the Spyre backend does not trap on denormals
+        or silently flush them before accumulation.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        finfo = torch.finfo(torch.bfloat16)
+        val = getattr(finfo, "smallest_subnormal", 2 ** (-133))
+        self_t = torch.zeros(8, 128, dtype=torch.bfloat16)
+        src_t = torch.full((4, 128), val, dtype=torch.bfloat16)
+        idx_t = torch.zeros(4, 128, dtype=torch.int64)
+
+        def fn(dest, index, source):
+            return torch.scatter_add(dest, 0, index, source)
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.0001,
+            rtol=0.0001,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL)
+    def test_scatter_add_4d_both(self, mode: str):
+        """4D scatter_add on (batch, kv_heads, seq, head_dim) — both OOP and IP.
+
+        Model shape: Gemma-4-12B (kv_heads=10, head_dim=128). Covers 4D-OOP and 4D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 10, 8, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 10, 4, 128, dtype=torch.bfloat16)
+        idx_t = torch.randint(0, 8, (2, 10, 4, 128), dtype=torch.int64)
+
+        def fn_oop(dest, index, source):
+            return torch.scatter_add(dest, 2, index, source)
+
+        def fn_ip(dest, index, source):
+            out = dest.clone()
+            out.scatter_add_(2, index, source)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL)
+    def test_scatter_add_5d_both(self, mode: str):
+        """5D scatter_add on (batch, layers, kv_heads, seq, head_dim) — both OOP and IP.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128). Covers 5D-OOP and 5D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 4, 8, 8, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 4, 8, 4, 128, dtype=torch.bfloat16)
+        idx_t = torch.randint(0, 8, (2, 4, 8, 4, 128), dtype=torch.int64)
+
+        def fn_oop(dest, index, source):
+            return torch.scatter_add(dest, 3, index, source)
+
+        def fn_ip(dest, index, source):
+            out = dest.clone()
+            out.scatter_add_(3, index, source)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_LAYOUT_XFAIL)
+    def test_scatter_add_6d_both(self, mode: str):
+        """6D scatter_add on (experts, batch, layers, kv_heads, seq, head_dim) — both OOP and IP.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 6D-OOP and 6D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 2, 2, 8, 4, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 2, 2, 8, 2, 128, dtype=torch.bfloat16)
+        idx_t = torch.randint(0, 4, (2, 2, 2, 8, 2, 128), dtype=torch.int64)
+
+        def fn_oop(dest, index, source):
+            return torch.scatter_add(dest, 4, index, source)
+
+        def fn_ip(dest, index, source):
+            out = dest.clone()
+            out.scatter_add_(4, index, source)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestScatterReduceModesEagerCompile:
+    """scatter_reduce across all reduction modes and with dynamic shapes."""
+
+    @pytest.mark.parametrize(("mode", "reduce_mode"), _SCATTER_REDUCE_NAN_INF_PARAMS)
+    def test_scatter_reduce_nan_inf_all_modes(self, mode: str, reduce_mode: str):
+        """NaN and Inf propagation across all 5 reduction modes (not just sum).
+
+        Model shape: Ministral-3-14B (kv_heads=8, head_dim=128).
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(8, 128, dtype=torch.float32)
+        src_t = torch.ones(4, 128, dtype=torch.float32)
+        src_t[0, 0] = float("nan")
+        src_t[1, 1] = float("inf")
+        idx_t = torch.tensor(
+            [[0] * 128, [1] * 128, [2] * 128, [3] * 128], dtype=torch.int64
+        )
+
+        def fn(dest, index, source):
+            return dest.scatter_reduce(
+                0, index, source, reduce=reduce_mode, include_self=True
+            )
+
+        compare_with_cpu(
+            fn, self_t, idx_t, src_t, run_eager=run_eager, run_compile=run_compile
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_REDUCE_DYNAMIC_SYMINT_XFAIL)
+    def test_scatter_reduce_dynamic_symint_shapes(self, mode: str):
+        """Dynamic SymInt shape tracing through scatter_reduce in TorchInductor.
+
+        Model shape: Granite-4.1-20B (hidden=8192, kv_heads=8, head_dim=128).
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        B, S, D = (2, 8, 8192)
+        max_S = 32
+        self_t = torch.zeros(B, max_S, D, dtype=torch.float32)
+        src_t = torch.randn(B, S, D, dtype=torch.float32)
+        idx_t = torch.randint(0, max_S, (B, S, D), dtype=torch.int64)
+
+        def fn(dest, index, source):
+            return dest.scatter_reduce(
+                1, index, source, reduce="sum", include_self=True
+            )
+
+        if run_compile and hasattr(torch, "_dynamo"):
+            torch._dynamo.mark_dynamic(src_t, 1)
+        compare_with_cpu(
+            fn, self_t, idx_t, src_t, run_eager=run_eager, run_compile=run_compile
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestIndexAddEagerCompile:
+    """index_add / index_add_: storage offsets, high-rank KV-cache geometries and channels-last layout."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_ADD_STORAGE_OFFSET_XFAIL)
+    def test_index_add_nonzero_storage_offset(self, mode: str):
+        """Non-zero storage_offset on sliced window inputs — pointer arithmetic correctness.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128).
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        pool_self = torch.zeros(64, 128, dtype=torch.bfloat16)
+        pool_src = torch.randn(64, 128, dtype=torch.bfloat16)
+        idx_t = torch.randperm(8)[:4]
+
+        def fn(dest_base, index, source_base):
+            dest_storage = dest_base.clone()
+            source_storage = source_base.clone()
+            dest = dest_storage.narrow(0, 16, 8)
+            source = source_storage.narrow(0, 8, 4)
+            assert dest.storage_offset() > 0
+            assert source.storage_offset() > 0
+            dest.index_add_(0, index, source)
+            return dest_storage
+
+        compare_with_cpu(
+            fn,
+            pool_self,
+            idx_t,
+            pool_src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_EAGER_ONLY_XFAIL)
+    def test_index_add_5d_both(self, mode: str):
+        """5D index_add on (batch, layers, kv_heads, seq, head_dim) — both OOP and IP.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128). Covers 5D-OOP and 5D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 4, 8, 8, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 4, 8, 4, 128, dtype=torch.bfloat16)
+        idx_t = torch.randperm(8, dtype=torch.int64)[:4]
+
+        def fn_oop(dest, index, source):
+            return torch.index_add(dest, 3, index, source)
+
+        def fn_ip(dest, index, source):
+            out = dest.clone()
+            out.index_add_(3, index, source)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_SCATTER_ADD_EAGER_ONLY_XFAIL)
+    def test_index_add_6d_both(self, mode: str):
+        """6D index_add on expert-layer-KV-cache geometry — both OOP and IP.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 6D-OOP and 6D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 2, 2, 8, 4, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 2, 2, 8, 2, 128, dtype=torch.bfloat16)
+        idx_t = torch.randperm(4, dtype=torch.int64)[:2]
+
+        def fn_oop(dest, index, source):
+            return torch.index_add(dest, 4, index, source)
+
+        def fn_ip(dest, index, source):
+            out = dest.clone()
+            out.index_add_(4, index, source)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_EAGER_COMPILE)
+    def test_index_add_channels_last_4d(self, mode: str):
+        """channels-last 4D tensor index_add along channel dimension (dim=1).
+
+        Model shape: Gemma-4-12B (kv_heads=10, head_dim=128) — channels=kv_heads=10, spatial=head_dim=128.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 10, 8, 16, dtype=torch.float32).to(
+            memory_format=torch.channels_last
+        )
+        src_shape = list(self_t.shape)
+        src_shape[1] = 4
+        src_t = torch.randn(*src_shape, dtype=torch.float32).to(
+            memory_format=torch.channels_last
+        )
+        idx_t = torch.randperm(10)[:4]
+
+        def fn(dest, index, source):
+            return torch.index_add(dest, 1, index, source)
+
+        compare_with_cpu(
+            fn, self_t, idx_t, src_t, run_eager=run_eager, run_compile=run_compile
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestIndexFillShapesEagerCompile:
+    """index_fill / index_fill_: special IEEE-754 values, 1D / 4D / 6D geometries and strided views."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_FILL_UNSUPPORTED)
+    @pytest.mark.parametrize("fill_val", [float("nan"), float("inf"), float("-inf")])
+    def test_index_fill_special_ieee754_values(self, mode: str, fill_val: float):
+        """Special IEEE-754 fills — NaN, +Inf, -Inf bit-pattern preservation.
+
+        Synthetic KV-cache-like shape (16, 256); not a Gemma-4-26B configuration.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.ones(16, 256, dtype=torch.float32)
+        idx_t = torch.tensor([0, 8], dtype=torch.int64)
+
+        def fn(dest, index):
+            return torch.index_fill(dest, 0, index, fill_val)
+
+        compare_with_cpu(
+            fn, self_t, idx_t, run_eager=run_eager, run_compile=run_compile
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_FILL_UNSUPPORTED)
+    def test_index_fill_1d_both(self, mode: str):
+        """1D index_fill — both OOP and IP on a 1D head_dim vector.
+
+        Model shape: Granite-4.1-20B (head_dim=128). Covers 1D-OOP and 1D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(128, dtype=torch.bfloat16)
+        idx_t = torch.randperm(128, dtype=torch.int64)[:8]
+
+        def fn_oop(dest, index):
+            return torch.index_fill(dest, 0, index, 99.0)
+
+        def fn_ip(dest, index):
+            out = dest.clone()
+            out.index_fill_(0, index, 99.0)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            idx_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            idx_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_FILL_UNSUPPORTED)
+    def test_index_fill_4d_both(self, mode: str):
+        """4D index_fill on (batch, kv_heads, seq, head_dim) — both OOP and IP.
+
+        Model shape: Gemma-4-12B (kv_heads=10, head_dim=128). Covers 4D-OOP and 4D-IP.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 10, 8, 128, dtype=torch.bfloat16)
+        idx_t = torch.tensor([1, 3, 5, 7], dtype=torch.int64)
+
+        def fn_oop(dest, index):
+            return torch.index_fill(dest, 2, index, 42.0)
+
+        def fn_ip(dest, index):
+            out = dest.clone()
+            out.index_fill_(2, index, 42.0)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            idx_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            idx_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_FILL_UNSUPPORTED)
+    def test_index_fill_6d_both(self, mode: str):
+        """6D index_fill on expert-layer-KV-cache geometry — both OOP and IP.
+
+        Model shape: Gemma-4-26B (kv_heads=16, head_dim=256). Covers 6D-OOP and 6D-IP.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 2, 2, 16, 4, 256, dtype=torch.float32)
+        idx_t = torch.tensor([1, 3], dtype=torch.int64)
+
+        def fn_oop(dest, index):
+            return torch.index_fill(dest, 4, index, 7.0)
+
+        def fn_ip(dest, index):
+            out = dest.clone()
+            out.index_fill_(4, index, 7.0)
+            return out
+
+        compare_with_cpu(
+            fn_oop, self_t, idx_t, run_eager=run_eager, run_compile=run_compile
+        )
+        compare_with_cpu(
+            fn_ip, self_t, idx_t, run_eager=run_eager, run_compile=run_compile
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_FILL_NONUNIT_STRIDED_XFAIL)
+    def test_index_fill_nonunit_strided_slice(self, mode: str):
+        """Non-unit strided slice fill — interleaved rows must remain unmodified.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128) — step-3 stride across kv-heads.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        base = torch.randn(24, 128, dtype=torch.bfloat16)
+        idx_t = torch.tensor([0, 1], dtype=torch.int64)
+
+        def fn(base_tensor, index):
+            out = base_tensor.clone()
+            view = out[::3, :]
+            view.index_fill_(0, index, 99.0)
+            return out
+
+        compare_with_cpu(
+            fn,
+            base,
+            idx_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestIndexSelectDynamicEagerCompile:
+    """index_select with a varying index length."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_EAGER_COMPILE)
+    def test_index_select_dynamic_index_length(self, mode: str):
+        """Dynamic index length — compiled graph must handle varying K without recompilation.
+
+        Model shape: Gemma-4-12B (kv_heads=10, head_dim=128).
+        Calls the compiled function three times with index tensors of different
+        lengths (K=2, 5, 10) to verify TorchInductor emits a kernel that
+        accepts a symbolic index size rather than specialising on a fixed K.
+        In eager mode this simply validates correctness across all three sizes.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        x = torch.randn(10, 128, dtype=torch.bfloat16)
+
+        def fn(source, index):
+            return torch.index_select(source, 0, index)
+
+        compiled_fn = (
+            torch.compile(fn) if run_compile and hasattr(torch, "compile") else None
+        )
+        for k in (2, 5, 10):
+            idx_t = torch.randperm(10)[:k]
+            if run_eager:
+                compare_with_cpu(
+                    fn,
+                    x,
+                    idx_t,
+                    run_eager=True,
+                    run_compile=False,
+                    atol=0.01,
+                    rtol=0.016,
+                )
+            if compiled_fn is not None:
+                x_dev = x.to(DEVICE)
+                idx_dev = idx_t.to(DEVICE)
+                expected = fn(x, idx_t)
+                result = compiled_fn(x_dev, idx_dev)
+                torch.testing.assert_close(
+                    result.cpu(), expected, atol=0.01, rtol=0.016
+                )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestMaskedScatterEagerCompile:
+    """masked_scatter / masked_scatter_: dynamic shapes, high-rank, contiguity and zero-volume cases."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_DYNAMIC)
+    def test_masked_scatter_dynamic_shapes_inductor(self, mode: str):
+        """Dynamic batch dimension and dynamic source length under TorchInductor.
+
+        Model shape: Ministral-3-14B (hidden=5120, kv_heads=8) — dynamic (B, S) slices.
+        masked_scatter requires a prefix-sum scan over the mask to compute per-
+        element source offsets. This test verifies TorchInductor can compile
+        that scan kernel with a symbolic batch size B and symbolic True-count K
+        rather than specialising on fixed constants.
+        The compiled function is called three times with distinct (B, S) pairs —
+        (8, 40), (4, 20), (6, 32) — varying both dimensions to exercise
+        guard-free re-use of a single compiled kernel. In eager mode the test
+        simply validates correctness across all three sizes.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+
+        def fn(dest, m, source):
+            return torch.masked_scatter(dest, m, source)
+
+        compiled_fn = (
+            torch.compile(fn) if run_compile and hasattr(torch, "compile") else None
+        )
+        torch.manual_seed(7)
+        for B, S in ((8, 40), (4, 20), (6, 32)):
+            self_t = torch.zeros(B, S, dtype=torch.bfloat16)
+            mask = torch.rand(B, S) > 0.5
+            num_true = int(mask.sum().item())
+            src_t = torch.randn(num_true, dtype=torch.bfloat16)
+            expected = fn(self_t, mask, src_t)
+            if run_eager:
+                compare_with_cpu(
+                    fn,
+                    self_t,
+                    mask,
+                    src_t,
+                    run_eager=True,
+                    run_compile=False,
+                    atol=0.01,
+                    rtol=0.016,
+                )
+            if compiled_fn is not None:
+                result = compiled_fn(self_t, mask, src_t)
+                torch.testing.assert_close(
+                    result.cpu(), expected, atol=1e-05, rtol=1e-05
+                )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_UNSUPPORTED)
+    def test_masked_scatter_0d_inplace(self, mode: str):
+        """0D in-place masked_scatter_ — scalar self with scalar True mask.
+
+        Covers 0D-IP (existing 0D test uses OOP form only).
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        x = torch.tensor(0.0, dtype=torch.float32)
+        mask = torch.tensor(True)
+        src = torch.tensor([42.0], dtype=torch.float32)
+
+        def fn(d, m, s):
+            out = d.clone()
+            out.masked_scatter_(m, s)
+            return out
+
+        compare_with_cpu(fn, x, mask, src, run_eager=run_eager, run_compile=run_compile)
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_UNSUPPORTED)
+    def test_masked_scatter_4d_inplace(self, mode: str):
+        """4D in-place masked_scatter_ — (batch, kv_heads, seq, head_dim).
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128). Covers 4D-IP.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        torch.manual_seed(5)
+        self_t = torch.zeros(2, 8, 8, 128, dtype=torch.bfloat16)
+        mask = torch.rand(2, 8, 8, 128) > 0.75
+        src_t = torch.randn(int(mask.sum().item()), dtype=torch.bfloat16)
+
+        def fn(dest, m, source):
+            out = dest.clone()
+            out.masked_scatter_(m, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            mask,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_UNSUPPORTED)
+    def test_masked_scatter_5d_inplace(self, mode: str):
+        """5D in-place masked_scatter_ — (batch, layers, kv_heads, seq, head_dim).
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 5D-IP.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        torch.manual_seed(6)
+        self_t = torch.zeros(2, 4, 8, 4, 128, dtype=torch.bfloat16)
+        mask = torch.rand(2, 4, 8, 4, 128) > 0.75
+        src_t = torch.randn(int(mask.sum().item()), dtype=torch.bfloat16)
+
+        def fn(dest, m, source):
+            out = dest.clone()
+            out.masked_scatter_(m, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            mask,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE)
+    def test_masked_scatter_6d_both(self, mode: str):
+        """6D masked_scatter — both OOP and IP on expert-layer-KV-cache geometry.
+
+        Model shape: Ministral-3-14B (kv_heads=8, head_dim=128). Covers 6D-OOP and 6D-IP.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        torch.manual_seed(7)
+        self_t = torch.zeros(2, 2, 2, 8, 4, 128, dtype=torch.bfloat16)
+        mask = torch.rand(2, 2, 2, 8, 4, 128) > 0.75
+        src_t = torch.randn(int(mask.sum().item()), dtype=torch.bfloat16)
+
+        def fn_oop(dest, m, source):
+            return torch.masked_scatter(dest, m, source)
+
+        def fn_ip(dest, m, source):
+            out = dest.clone()
+            out.masked_scatter_(m, source)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            mask,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            mask,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ALL_TRUE)
+    def test_masked_scatter_all_true_full_replacement(self, mode: str):
+        """Dense all-True mask replaces every element from the flat source."""
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(10, 128, dtype=torch.bfloat16)
+        mask = torch.ones(10, 128, dtype=torch.bool)
+        src_t = torch.arange(1280, dtype=torch.bfloat16)
+
+        def fn(dest, m, source):
+            return torch.masked_scatter(dest, m, source)
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            mask,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_NO_SIDE_EFFECTS)
+    def test_masked_scatter_no_side_effects(self, mode: str):
+        """Out-of-place masked_scatter must not mutate self, mask, or source."""
+        run_eager, run_compile = _mode_flags(mode)
+        x = torch.zeros(5, dtype=torch.float32)
+        mask = torch.tensor([True, False, True, False, True])
+        src = torch.tensor([10.0, 20.0, 30.0], dtype=torch.float32)
+        x_before = x.clone()
+        mask_before = mask.clone()
+        src_before = src.clone()
+
+        def fn(dest, m, source):
+            return dest.masked_scatter(m, source)
+
+        compare_with_cpu(fn, x, mask, src, run_eager=run_eager, run_compile=run_compile)
+        torch.testing.assert_close(x, x_before)
+        torch.testing.assert_close(src, src_before)
+        assert torch.equal(mask, mask_before)
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE)
+    def test_masked_scatter_scalar_0d_self(self, mode: str):
+        """MSK-NEW-04b: 0-dimensional scalar self with scalar True mask → value replaced, shape preserved."""
+        run_eager, run_compile = _mode_flags(mode)
+        x = torch.tensor(0, dtype=torch.float32)
+        mask = torch.tensor(True)
+        src = torch.tensor([42.0], dtype=torch.float32)
+
+        def fn(d, m, s):
+            return d.masked_scatter(m, s)
+
+        compare_with_cpu(fn, x, mask, src, run_eager=run_eager, run_compile=run_compile)
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_SCALAR_FALSE)
+    def test_masked_scatter_scalar_false_mask_noop(self, mode: str):
+        """0-dimensional scalar False mask — dest returned unchanged (no True positions)."""
+        run_eager, run_compile = _mode_flags(mode)
+        x = torch.tensor([1, 2, 3, 4], dtype=torch.float32)
+        mask = torch.tensor(0, dtype=torch.bool)
+        src = torch.tensor([99.0, 88.0], dtype=torch.float32)
+
+        def fn(d, m, s):
+            return d.masked_scatter(m, s)
+
+        compare_with_cpu(fn, x, mask, src, run_eager=run_eager, run_compile=run_compile)
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ZERO_VOLUME)
+    @pytest.mark.parametrize(
+        "dest_shape,mask_shape",
+        [
+            ((0,), (0,)),
+            ((4, 0), (4, 0)),
+            ((0, 5), (0, 5)),
+            ((5, 0, 5), (5, 0, 5)),
+            ((3, 0, 4), (3, 0, 4)),
+        ],
+    )
+    def test_masked_scatter_zero_volume_shapes(
+        self, mode: str, dest_shape: tuple, mask_shape: tuple
+    ):
+        """MSK-GAP-C: Zero-volume / empty-dimension destinations — must be a safe no-op.
+
+        When the destination (or mask) contains a zero-size dimension the total
+        number of elements is zero.  An all-False (or vacuously all-True) mask
+        over zero elements has zero True positions, so an empty source is valid
+        and the operation must return a tensor identical to the original
+        destination.
+        Mirrors the upstream empty-tensor cases in test_masked_scatter:
+            dest = torch.empty((5, 0, 5), ...)
+            mask = torch.ones_like(dest, dtype=torch.bool)
+            src  = torch.empty((0,), ...)
+            dest.masked_scatter_(mask, src)   # no-op, dest unchanged
+        Both in-place and out-of-place variants are checked.
+        compare_with_cpu is used: CPU result (unchanged dest) is the reference.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        dest = torch.randn(*dest_shape, dtype=torch.float32)
+        mask = torch.zeros(*mask_shape, dtype=torch.bool)
+        src = torch.empty(0, dtype=torch.float32)
+
+        def fn_inplace(d, m, s):
+            out = d.clone()
+            out.masked_scatter_(m, s)
+            return out
+
+        def fn_outplace(d, m, s):
+            return torch.masked_scatter(d, m, s)
+
+        compare_with_cpu(
+            fn_inplace, dest, mask, src, run_eager=run_eager, run_compile=run_compile
+        )
+        compare_with_cpu(
+            fn_outplace, dest, mask, src, run_eager=run_eager, run_compile=run_compile
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ZERO_VOLUME)
+    @pytest.mark.parametrize("dest_shape", [(5, 0, 5), (3, 0, 4), (0, 8)])
+    def test_masked_scatter_zero_volume_ones_mask(self, mode: str, dest_shape: tuple):
+        """MSK-GAP-C (ones mask): Zero-volume dest with all-True mask and empty source.
+
+        Mirrors the second upstream empty-tensor variant:
+            mask = torch.ones_like(dest, dtype=torch.bool)
+            src  = torch.empty((0,), ...)
+            dest.masked_scatter_(mask, src)
+        An all-True mask over a zero-volume tensor still has zero True elements
+        (because numel() == 0), so the empty source is valid and the call must
+        be a safe no-op.
+        compare_with_cpu validates that both eager and compile modes match CPU.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        dest = torch.empty(*dest_shape, dtype=torch.float32)
+        mask = torch.ones(*dest_shape, dtype=torch.bool)
+        src = torch.empty(0, dtype=torch.float32)
+
+        def fn_inplace(d, m, s):
+            out = d.clone()
+            out.masked_scatter_(m, s)
+            return out
+
+        def fn_outplace(d, m, s):
+            return torch.masked_scatter(d, m, s)
+
+        compare_with_cpu(
+            fn_inplace, dest, mask, src, run_eager=run_eager, run_compile=run_compile
+        )
+        compare_with_cpu(
+            fn_outplace, dest, mask, src, run_eager=run_eager, run_compile=run_compile
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE)
+    def test_masked_scatter_noncontig_dest_mask_combos(self, mode: str):
+        """All four contiguous/non-contiguous destination × mask combinations.
+
+        Each tensor has logical shape (5, 2). Non-contiguous operands are
+        transposed views with stride (1, 5), testing layout without changing
+        the logical shape.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        dest_contig = torch.zeros(5, 2, dtype=torch.float32)
+        dest_noncontig = torch.zeros(2, 5, dtype=torch.float32).transpose(0, 1)
+        mask_contig = torch.tensor(
+            [[False, True], [False, True], [False, False], [True, True], [True, True]],
+            dtype=torch.bool,
+        )
+        mask_noncontig = mask_contig.transpose(0, 1).contiguous().transpose(0, 1)
+        source = torch.arange(1, 7, dtype=torch.float32)
+        assert dest_contig.is_contiguous()
+        assert not dest_noncontig.is_contiguous()
+        assert mask_contig.is_contiguous()
+        assert not mask_noncontig.is_contiguous()
+
+        def fn(dest, mask, values):
+            out = dest.clone()
+            out.masked_scatter_(mask, values)
+            return out
+
+        for dest, mask in (
+            (dest_contig, mask_contig),
+            (dest_contig, mask_noncontig),
+            (dest_noncontig, mask_contig),
+            (dest_noncontig, mask_noncontig),
+        ):
+            compare_with_cpu(
+                fn, dest, mask, source, run_eager=run_eager, run_compile=run_compile
+            )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_MASKED_SCATTER_ELEMENTWISE)
+    def test_masked_scatter_5d_transposed_target(self, mode: str):
+        """True non-contiguous 5D target — row-major traversal of mask True bits.
+
+        Model shape: Granite-3.3-8B (batch=2, kv_heads=8, layers=4, seq=4, head_dim=128).
+        The destination is base.transpose(1, 3) with NO .contiguous() call, so
+        it is a genuinely non-contiguous tensor (strides are non-unit and not
+        in descending order).  masked_scatter must traverse both dest and mask
+        in C-contiguous logical order regardless of the physical memory layout.
+        CPU is the reference; the result is compared element-wise via
+        compare_with_cpu.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        torch.manual_seed(1)
+        base = torch.zeros(2, 8, 4, 4, 128, dtype=torch.bfloat16)
+        dest_t = base.transpose(1, 3)
+        assert not dest_t.is_contiguous(), "dest must be non-contiguous for this test"
+        mask = torch.rand(*dest_t.shape) > 0.75
+        num_true = int(mask.sum().item())
+        src_t = torch.randn(num_true, dtype=torch.bfloat16)
+
+        def fn(dest, m, source):
+            return torch.masked_scatter(dest, m, source)
+
+        compare_with_cpu(
+            fn,
+            dest_t,
+            mask,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestIndexReduceShapesEagerCompile:
+    """index_reduce / index_reduce_: views, dtypes, index dtypes, high-rank geometries and non-contiguous operands."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_REDUCE_SLICED_VIEW_DEST_XFAIL)
+    @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
+    def test_index_reduce_sliced_view_dest(self, mode: str, reduce_mode: str):
+        """IDR-GAP-F: index_reduce_ on a non-contiguous view slice of a larger tensor.
+
+        Model shape: Granite-4.1-20B (kv_heads=8, head_dim=128) — (batch=2, kv_heads+pad=11, head_dim=128).
+        Mirrors the upstream TorchInductor regression test (issue #144846):
+            x_base[:, 3:, :]  — non-contiguous slice leaving 3 padding cols behind
+        The base tensor is allocated with extra padding; index_reduce_ is
+        applied directly to the slice (non-zero storage_offset and non-default strides).
+        The result in the slice must match the CPU reference; unsliced cols remain unchanged.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        x_base = torch.rand(2, 11, 128, dtype=torch.bfloat16) + 0.5
+        idx = torch.randint(0, 8, (4,), dtype=torch.int64)
+        source = torch.rand(2, 4, 128, dtype=torch.bfloat16) + 0.5
+
+        def fn(base, i, s):
+            out = base.clone()
+            view = out[:, 3:, :]
+            view.index_reduce_(1, i, s, reduce=reduce_mode, include_self=True)
+            return out
+
+        compare_with_cpu(
+            fn,
+            x_base,
+            idx,
+            source,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize(("reduce_mode", "mode"), _INDEX_REDUCE_NARROW_CASES)
+    def test_index_reduce_narrow_view_dest(self, mode: str, reduce_mode: str):
+        """IDR-GAP-F (narrow): index_reduce_ on a narrow() view — non-zero storage_offset.
+
+        Synthetic KV-cache-like shape (16, 256) — narrow 16 of 32 rows.
+        Uses narrow() instead of slicing to produce a view with a different
+        storage_offset.  This exercises the pointer-arithmetic path through
+        the backend's DMA address computation for non-zero offsets.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        pool = torch.rand(32, 256, dtype=torch.bfloat16) + 0.5
+        src = torch.rand(4, 256, dtype=torch.bfloat16) + 0.5
+        idx = torch.randint(0, 16, (4,), dtype=torch.int64)
+
+        def fn(base, i, s):
+            out = base.clone()
+            dest = out.narrow(0, 8, 16)
+            assert dest.storage_offset() > 0
+            dest.index_reduce_(0, i, s, reduce=reduce_mode, include_self=True)
+            return out
+
+        compare_with_cpu(
+            fn,
+            pool,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_REDUCE_DUPLICATES_XFAIL)
+    @pytest.mark.parametrize(
+        "dtype, reduce_mode, index_dtype, atol, rtol", _INDEX_REDUCE_OUTPLACE_CASES
+    )
+    def test_index_reduce_outplace_dtype_and_index_variants(
+        self,
+        mode: str,
+        dtype: torch.dtype,
+        reduce_mode: str,
+        index_dtype: torch.dtype,
+        atol: float,
+        rtol: float,
+    ):
+        """Retain functional index_reduce cases; omit upstream-covered in-place cases."""
+        run_eager, run_compile = _mode_flags(mode)
+        dest = torch.rand(8, 128, dtype=dtype) + 0.5
+        source = torch.rand(4, 128, dtype=dtype) + 0.5
+
+        def fn_out(d, i, s):
+            return d.index_reduce(0, i, s, reduce=reduce_mode, include_self=True)
+
+        for index in (
+            torch.tensor([0, 2, 4, 6], dtype=index_dtype),
+            torch.tensor([0, 0, 2, 4], dtype=index_dtype),
+        ):
+            compare_with_cpu(
+                fn_out,
+                dest,
+                index,
+                source,
+                run_eager=run_eager,
+                run_compile=run_compile,
+                atol=atol,
+                rtol=rtol,
+            )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_EAGER_COMPILE)
+    @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
+    def test_index_reduce_4d_both(self, mode: str, reduce_mode: str):
+        """4D index_reduce on (batch, kv_heads, seq, head_dim) — both OOP and IP.
+
+        Model shape: Gemma-4-26B (kv_heads=16, head_dim=256). Covers 4D-OOP and 4D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        dest = torch.rand(2, 16, 8, 256, dtype=torch.float32) + 0.5
+        src = torch.rand(2, 16, 4, 256, dtype=torch.float32) + 0.5
+        idx = torch.randint(0, 8, (4,), dtype=torch.int64)
+
+        def fn_oop(d, i, s):
+            return d.index_reduce(2, i, s, reduce=reduce_mode, include_self=True)
+
+        def fn_ip(d, i, s):
+            out = d.clone()
+            out.index_reduce_(2, i, s, reduce=reduce_mode, include_self=True)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            dest,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            dest,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_EAGER_COMPILE)
+    @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
+    def test_index_reduce_5d_both(self, mode: str, reduce_mode: str):
+        """5D index_reduce on (batch, layers, kv_heads, seq, head_dim) — both OOP and IP.
+
+        Model shape: Gemma-4-12B (kv_heads=10, head_dim=128). Covers 5D-OOP and 5D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        dest = torch.rand(2, 4, 10, 8, 128, dtype=torch.float32) + 0.5
+        src = torch.rand(2, 4, 10, 4, 128, dtype=torch.float32) + 0.5
+        idx = torch.randint(0, 8, (4,), dtype=torch.int64)
+
+        def fn_oop(d, i, s):
+            return d.index_reduce(3, i, s, reduce=reduce_mode, include_self=True)
+
+        def fn_ip(d, i, s):
+            out = d.clone()
+            out.index_reduce_(3, i, s, reduce=reduce_mode, include_self=True)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            dest,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            dest,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_EAGER_COMPILE)
+    @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
+    def test_index_reduce_6d_both(self, mode: str, reduce_mode: str):
+        """6D index_reduce on expert-layer-KV-cache geometry — both OOP and IP.
+
+        Model shape: Ministral-3-14B (kv_heads=8, head_dim=128). Covers 6D-OOP and 6D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        dest = torch.rand(2, 2, 2, 8, 4, 128, dtype=torch.float32) + 0.5
+        src = torch.rand(2, 2, 2, 8, 2, 128, dtype=torch.float32) + 0.5
+        idx = torch.randint(0, 4, (2,), dtype=torch.int64)
+
+        def fn_oop(d, i, s):
+            return d.index_reduce(4, i, s, reduce=reduce_mode, include_self=True)
+
+        def fn_ip(d, i, s):
+            out = d.clone()
+            out.index_reduce_(4, i, s, reduce=reduce_mode, include_self=True)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            dest,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            dest,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_REDUCE_NONCONTIG_SOURCE_XFAIL)
+    @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
+    def test_index_reduce_noncontig_source(self, mode: str, reduce_mode: str):
+        """IDR-GAP-B (ii): Non-contiguous source — transposed 2D tensor.
+
+        Model shape: Granite-4.1-20B (kv_heads=8, head_dim=128) — transposed (128, 8) → (8, 128).
+        src is a transposed view (non-contiguous strides).  dest and idx are
+        contiguous.  index_reduce_ must read src through its logical strides.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        dest = torch.rand(8, 128, dtype=torch.bfloat16) + 0.5
+        src_base = torch.rand(128, 4, dtype=torch.bfloat16) + 0.5
+        src = src_base.t()
+        assert not src.is_contiguous()
+
+        def fn(d, i, s):
+            out = d.clone()
+            out.index_reduce_(0, i, s, reduce=reduce_mode, include_self=True)
+            return out
+
+        idx_unique = torch.tensor([0, 2, 4, 6], dtype=torch.int64)
+        compare_with_cpu(
+            fn,
+            dest,
+            idx_unique,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        idx_dup = torch.tensor([0, 0, 2, 4], dtype=torch.int64)
+        compare_with_cpu(
+            fn,
+            dest,
+            idx_dup,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_REDUCE_NONCONTIG_ALL_XFAIL)
+    @pytest.mark.parametrize("reduce_mode", _REDUCE_MODES)
+    def test_index_reduce_all_three_noncontig(self, mode: str, reduce_mode: str):
+        """IDR-GAP-B (iv): dest, src, and index all non-contiguous simultaneously.
+
+        Model shape: Gemma-4-12B (kv_heads=10, head_dim=128) — all-noncontig 2D kv cache.
+        Corresponds to the upstream (dest_noncontig, src_noncontig, index_noncontig)
+        = (True, True, True) parametrize combination.  All three tensors have
+        non-unit strides; index_reduce_ must correctly resolve addresses for each.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        base_dest = torch.rand(20, 128, dtype=torch.bfloat16) + 0.5
+        dest = base_dest[::2, :]
+        src_base = torch.rand(128, 4, dtype=torch.bfloat16) + 0.5
+        src = src_base.t()
+        assert not dest.is_contiguous()
+        assert not src.is_contiguous()
+
+        def fn(backing, i, s):
+            out = backing.clone()
+            dest_view = out[::2, :]
+            assert not dest_view.is_contiguous()
+            dest_view.index_reduce_(0, i, s, reduce=reduce_mode, include_self=True)
+            return out
+
+        idx_base_unique = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int64)
+        idx_unique = idx_base_unique[::2]
+        assert not idx_unique.is_contiguous()
+        compare_with_cpu(
+            fn,
+            base_dest,
+            idx_unique,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        idx_base_dup = torch.tensor([0, 1, 0, 1, 2, 3, 2, 3], dtype=torch.int64)
+        idx_dup = idx_base_dup[::2]
+        assert not idx_dup.is_contiguous()
+        compare_with_cpu(
+            fn,
+            base_dest,
+            idx_dup,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestIndexPutShapesEagerCompile:
+    """index_put / index_put_ and slice assignment: collisions, high-rank geometries, boolean masks."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_PUT_HALF_FORMAT_COLLISION_XFAIL)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_index_put_half_format_heavy_collision(self, mode: str, dtype: torch.dtype):
+        """5000 low-precision updates collide on 8 rows (625 updates per row)."""
+        run_eager, run_compile = _mode_flags(mode)
+        num_bins, updates_per_bin = (8, 625)
+        num_updates = num_bins * updates_per_bin
+        self_t = torch.zeros(num_bins, 128, dtype=dtype)
+        idx_t = torch.arange(num_updates, dtype=torch.int64) % num_bins
+        vals = torch.ones(num_updates, 128, dtype=dtype)
+
+        def fn(dest, index, values):
+            out = dest.clone()
+            out.index_put_((index,), values, accumulate=True)
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            vals,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=1.0,
+            rtol=0.01,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_EAGER_COMPILE)
+    def test_full_tensor_slice_assignment(self, mode: str):
+        """Full-tensor slice assignment out[:] = v — broadcasts scalar-filled tensor to all positions.
+
+        Uses a synthetic (16, 256) tensor shape; it is not an exact Gemma-4-26B KV-cache shape.
+        This is not an index_put test.  index_put_((), v) is the semantic equivalent
+        but crashes with an internal assert on CPU in PyTorch 2.13 (IndexKernelUtils.h:8).
+        This test documents the workaround (out[:] = v) and validates the slice-assignment
+        path on Spyre for full-tensor overwrites.
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(16, 256, dtype=torch.bfloat16)
+        vals = torch.ones(16, 256, dtype=torch.bfloat16) * 7.0
+
+        def fn(dest, v):
+            out = dest.clone()
+            out[:] = v
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            vals,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_PUT_UNSUPPORTED)
+    def test_index_put_4d_both(self, mode: str):
+        """4D index_put on (batch, kv_heads, seq, head_dim) — both OOP and IP.
+
+        Model shape: Granite-4.1-20B (kv_heads=8, head_dim=128). Covers 4D-OOP and 4D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 8, 8, 128, dtype=torch.bfloat16)
+        n = 4
+        flat = torch.randperm(2 * 8 * 8, dtype=torch.int64)[:n]
+        i0 = flat // (8 * 8)
+        i1 = flat // 8 % 8
+        i2 = flat % 8
+        vals = torch.randn(n, 128, dtype=torch.bfloat16)
+
+        def fn_oop(dest, a, b, c, v):
+            return torch.index_put(dest, (a, b, c), v, accumulate=False)
+
+        def fn_ip(dest, a, b, c, v):
+            out = dest.clone()
+            out.index_put_((a, b, c), v, accumulate=False)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            i0,
+            i1,
+            i2,
+            vals,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            i0,
+            i1,
+            i2,
+            vals,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_PUT_UNSUPPORTED)
+    def test_index_put_6d_both(self, mode: str):
+        """6D index_put on expert-layer-KV-cache geometry — both OOP and IP.
+
+        Model shape: Gemma-4-26B (kv_heads=16, head_dim=256). Covers 6D-OOP and 6D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 2, 2, 16, 4, 256, dtype=torch.bfloat16)
+        n = 8
+        flat = torch.randperm(2 * 2 * 2 * 16 * 4, dtype=torch.int64)[:n]
+        i0 = flat // (2 * 2 * 16 * 4)
+        i1 = flat // (2 * 16 * 4) % 2
+        i2 = flat // (16 * 4) % 2
+        i3 = flat // 4 % 16
+        i4 = flat % 4
+        vals = torch.randn(n, 256, dtype=torch.bfloat16)
+
+        def fn_oop(dest, a, b, c, d, e, v):
+            return torch.index_put(dest, (a, b, c, d, e), v, accumulate=False)
+
+        def fn_ip(dest, a, b, c, d, e, v):
+            out = dest.clone()
+            out.index_put_((a, b, c, d, e), v, accumulate=False)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            i0,
+            i1,
+            i2,
+            i3,
+            i4,
+            vals,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            i0,
+            i1,
+            i2,
+            i3,
+            i4,
+            vals,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_PUT_UNSUPPORTED)
+    def test_index_put_sparse_3d_bool_mask_transposed(self, mode: str):
+        """Sparse 3D boolean mask on a transposed (non-contiguous) tensor.
+
+        Model shape: Ministral-3-14B (kv_heads=8, seq=4, head_dim=128).
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        torch.manual_seed(0)
+        base = torch.zeros(4, 8, 128, dtype=torch.bfloat16)
+        dest_t = base.transpose(0, 1)
+        mask = torch.rand(8, 4, 128) > 0.85
+        num_true = int(mask.sum().item())
+        vals = torch.randn(num_true, dtype=torch.bfloat16)
+
+        def fn(dest, m, v):
+            out = dest.clone()
+            out.index_put_((m,), v, accumulate=False)
+            return out
+
+        compare_with_cpu(
+            fn,
+            dest_t,
+            mask,
+            vals,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestIndexCopyEagerCompile:
+    """index_copy / index_copy_: non-contiguous 5D destination, zero-volume trailing dim and 6D geometry."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_COPY_NONCONTIG_5D)
+    def test_index_copy_5d_noncontiguous_strided(self, mode: str):
+        """Non-contiguous 5D transposed destination — strided DMA coordinate correctness.
+
+        Model shape: Granite-3.3-8B (batch=2, kv_heads=8, layers=4, seq=4, head_dim=128).
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        base = torch.zeros(2, 8, 4, 4, 128, dtype=torch.bfloat16)
+        dest_t = base.transpose(1, 3)
+        num_slices = 2
+        src_shape = list(dest_t.shape)
+        src_shape[2] = num_slices
+        src_t = torch.randn(*src_shape, dtype=torch.bfloat16)
+        idx_t = torch.tensor([0, 3], dtype=torch.int64)
+
+        def fn(dest, index, source):
+            out = dest.clone()
+            out.index_copy_(2, index, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            dest_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_INDEX_COPY_ZERO_VOLUME_XFAIL)
+    def test_index_copy_zero_volume_trailing_dim(self, mode: str):
+        """Zero-volume trailing dimension — index_copy must be a safe no-op.
+
+        Model shape: Ministral-3-14B (kv_heads=8, seq=4, head_dim=0 zero-volume).
+        """
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(8, 4, 0, dtype=torch.bfloat16)
+        src_t = torch.zeros(8, 2, 0, dtype=torch.bfloat16)
+        idx_t = torch.tensor([1, 3], dtype=torch.int64)
+
+        def fn(dest, index, source):
+            out = dest.clone()
+            out.index_copy_(1, index, source)
+            return out
+
+        compare_with_cpu(
+            fn,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_EAGER_COMPILE)
+    def test_index_copy_6d_both(self, mode: str):
+        """6D index_copy on expert-layer-KV-cache geometry — both OOP and IP.
+
+        Model shape: Ministral-3-14B (kv_heads=8, head_dim=128). Covers 6D-OOP and 6D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        self_t = torch.zeros(2, 2, 2, 8, 4, 128, dtype=torch.bfloat16)
+        src_t = torch.randn(2, 2, 2, 8, 2, 128, dtype=torch.bfloat16)
+        idx_t = torch.randperm(4, dtype=torch.int64)[:2]
+
+        def fn_oop(dest, index, source):
+            return torch.index_copy(dest, 4, index, source)
+
+        def fn_ip(dest, index, source):
+            out = dest.clone()
+            out.index_copy_(4, index, source)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+        compare_with_cpu(
+            fn_ip,
+            self_t,
+            idx_t,
+            src_t,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+class TestPutNonContigEagerCompile:
+    """torch.put / put_: non-contiguous destination, source and index, and 5D / 6D geometries."""
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_PUT_ALL_NONCONTIG_XFAIL)
+    @pytest.mark.parametrize("accumulate", _PUT_ACCUMULATE_OPTIONS)
+    def test_put_all_three_noncontig(self, mode: str, accumulate: bool):
+        """PUT-GAP-B (iii): dst, src, and index all non-contiguous simultaneously.
+
+        Model shape: Gemma-4-12B (kv_heads=10, head_dim=128) — 2D kv cache, all non-contig.
+        This is the hardest non-contiguous path: torch.put must convert the
+        destination to a flattened contiguous view and read both src and index
+        through their respective non-unit strides.  Corresponds directly to the
+        upstream parametrize over (dst_contig, src_contig, idx_contig) = (F,F,F).
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        base_dst = torch.zeros(20, 128, dtype=torch.bfloat16)
+        dst = base_dst[::2, :]
+        src_base = torch.randn(16, dtype=torch.bfloat16)
+        src = src_base[::2]
+        if accumulate:
+            idx_raw = torch.randint(0, dst.numel(), (16,), dtype=torch.int64)
+        else:
+            selected = torch.randperm(dst.numel(), dtype=torch.int64)[:8]
+            idx_raw = torch.empty(16, dtype=torch.int64)
+            idx_raw[::2] = selected
+            idx_raw[1::2] = 0
+        idx = idx_raw[::2]
+        assert not dst.is_contiguous()
+        assert not src.is_contiguous()
+        assert not idx.is_contiguous()
+
+        def fn(d, i, s):
+            return torch.put(d, i, s, accumulate=accumulate)
+
+        compare_with_cpu(
+            fn,
+            dst,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_PUT_UNSUPPORTED)
+    @pytest.mark.parametrize("accumulate", _PUT_ACCUMULATE_OPTIONS)
+    def test_put_5d_both(self, mode: str, accumulate: bool):
+        """5D torch.put and put_ — both OOP and IP on layer-KV-cache geometry.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128). Covers 5D-OOP and 5D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        dst = torch.zeros(2, 4, 8, 4, 128, dtype=torch.bfloat16)
+        src = torch.randn(8, dtype=torch.bfloat16)
+        if accumulate:
+            idx = torch.randint(0, dst.numel(), (8,), dtype=torch.int64)
+        else:
+            idx = torch.randperm(dst.numel(), dtype=torch.int64)[:8]
+
+        def fn_oop(d, i, s):
+            return torch.put(d, i, s, accumulate=accumulate)
+
+        def fn_ip(d, i, s):
+            out = d.clone()
+            out.put_(i, s, accumulate=accumulate)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            dst,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+        compare_with_cpu(
+            fn_ip,
+            dst,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+
+    @pytest.mark.parametrize("mode", _MODE_PARAMS_PUT_UNSUPPORTED)
+    @pytest.mark.parametrize("accumulate", _PUT_ACCUMULATE_OPTIONS)
+    def test_put_6d_both(self, mode: str, accumulate: bool):
+        """6D torch.put and put_ on expert-layer-KV-cache geometry — both OOP and IP.
+
+        Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 6D-OOP and 6D-IP.
+        """
+        torch.manual_seed(0)
+        run_eager, run_compile = _mode_flags(mode)
+        dst = torch.zeros(2, 2, 2, 8, 4, 128, dtype=torch.bfloat16)
+        src = torch.randn(8, dtype=torch.bfloat16)
+        if accumulate:
+            idx = torch.randint(0, dst.numel(), (8,), dtype=torch.int64)
+        else:
+            idx = torch.randperm(dst.numel(), dtype=torch.int64)[:8]
+
+        def fn_oop(d, i, s):
+            return torch.put(d, i, s, accumulate=accumulate)
+
+        def fn_ip(d, i, s):
+            out = d.clone()
+            out.put_(i, s, accumulate=accumulate)
+            return out
+
+        compare_with_cpu(
+            fn_oop,
+            dst,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
+        compare_with_cpu(
+            fn_ip,
+            dst,
+            idx,
+            src,
+            run_eager=run_eager,
+            run_compile=run_compile,
+            atol=0.01,
+            rtol=0.016,
+        )
