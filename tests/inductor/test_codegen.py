@@ -16,10 +16,11 @@ import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import regex as re
 import sympy
 import torch
-from torch._inductor.exc import InductorError
+from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import (
     run_and_get_code,
@@ -52,7 +53,7 @@ from torch_spyre._inductor.codegen.superdsc import (
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
-from utils_inductor import mock_backend_compiler
+from utils_inductor import expects_raise, mock_backend_compiler
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
@@ -101,16 +102,20 @@ class TestSpyreConfig(InductorTestCase):
         self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
 
     @config.patch({"sencores": 64})
+    @expects_raise
     def test_config_too_many_sencores(self):
         fn = torch.abs
         x = torch.randn((256, 128, 512)).to("spyre")
 
         with self.assertRaisesRegex(
-            InductorError,
-            "Unsupported: Spyre backend does not support: invalid SENCORES value 64",
-        ):
+            BackendCompilerFailed,
+            "Spyre backend does not support: "
+            "SENCORES must be between 1 and SENCORES_PHYSICAL, "
+            "got SENCORES=64, SENCORES_PHYSICAL=32",
+        ) as caught:
             comp_fn = torch.compile(fn)
             comp_fn(x)
+        self.assertIsInstance(caught.exception.inner_exception, Unsupported)
 
     @config.patch({"sencores": 16})
     def test_sencores_16(self):
@@ -355,6 +360,227 @@ class TestSpyreConfig(InductorTestCase):
             resolved_rev,
             [addr[sa.tensor_id] for sa in payload_reversed],
         )
+
+
+@pytest.mark.parametrize(
+    "logical,mode,expected",
+    [
+        (8, "dense", tuple(range(8))),
+        (8, "clamshell", (28, 29, 30, 31, 0, 1, 2, 3)),
+        (24, "clamshell", tuple(range(20, 32)) + tuple(range(12))),
+        (32, "clamshell", tuple(range(32))),
+    ],
+    ids=["dense-eight", "clamshell-eight", "clamshell-twenty-four", "clamshell-full"],
+)
+def test_sdsc_dispatch_respects_physical_core_placement(logical, mode, expected):
+    row, lane = sympy.symbols("row lane")
+    space = {row: (sympy.Integer(logical), logical), lane: (sympy.Integer(64), 1)}
+    coordinates = [sympy.Integer(0), row, lane]
+    spec = OpSpec(
+        "add",
+        False,
+        space,
+        [
+            TensorArg(
+                True,
+                0,
+                DataFormats.SEN169_FP16,
+                [1, logical, 64],
+                coordinates,
+                {"hbm": 0},
+            ),
+            TensorArg(
+                True,
+                1,
+                DataFormats.SEN169_FP16,
+                [1, logical, 64],
+                coordinates,
+                {"hbm": 4096},
+            ),
+            TensorArg(
+                False,
+                2,
+                DataFormats.SEN169_FP16,
+                [1, logical, 64],
+                coordinates,
+                {"hbm": 8192},
+            ),
+        ],
+        {},
+        core_id_to_work_slice=derive_operation_mapping(space),
+    )
+    with config.patch(sencores=logical, sencores_physical=32, core_placement_mode=mode):
+        placement = superdsc._core_placement(logical)
+        assert placement.physical_ids == expected
+        payload, *_ = compile_op_spec(0, spec, [])
+    root = next(iter(payload.values()))
+    assert root["coreFoldProp_"]["factor_"] == placement.physical_span
+    assert root["numCoresUsed_"] == placement.physical_span
+    assert next(iter(root["dscs_"][0].values()))["numCoresUsed_"] == logical
+    assert set(root["coreIdToDsc_"]) == {str(core) for core in placement.active_ids}
+    assert len(root["coreIdToWkSlice_"]) == logical
+    for logical_id, physical in enumerate(expected):
+        assert root["coreIdToWkSlice_"][str(physical)]["mb"] == logical_id
+    output_arg = next(iter(root["dscs_"][0].values()))["scheduleTree_"][-1]
+    addresses = output_arg["startAddressCoreCorelet_"]["data_"]
+    assert output_arg["isStartAddrSymbolic_"] == 1
+    assert len(addresses) == placement.physical_span
+    assert (
+        len({addresses[f"[{physical}, 0, 0]"] for physical in placement.active_ids})
+        == logical
+    )
+
+
+@pytest.mark.parametrize(
+    "logical,physical,mode",
+    [(8, 4, "clamshell"), (8, 0, "dense"), (8, 33, "clamshell")],
+    ids=["too-few-physical", "empty-card", "card-overflow"],
+)
+def test_sdsc_rejects_noninjective_or_out_of_range_placement(logical, physical, mode):
+    row, lane = sympy.symbols("row lane")
+    space = {row: (sympy.Integer(logical), logical), lane: (sympy.Integer(64), 1)}
+    coordinates = [sympy.Integer(0), row, lane]
+    spec = OpSpec(
+        "neg",
+        False,
+        space,
+        [
+            TensorArg(
+                True,
+                0,
+                DataFormats.SEN169_FP16,
+                [1, logical, 64],
+                coordinates,
+                {"hbm": 0},
+            ),
+            TensorArg(
+                False,
+                1,
+                DataFormats.SEN169_FP16,
+                [1, logical, 64],
+                coordinates,
+                {"hbm": 4096},
+            ),
+        ],
+        {},
+        core_id_to_work_slice=derive_operation_mapping(space),
+    )
+    with (
+        config.patch(
+            sencores=logical, sencores_physical=physical, core_placement_mode=mode
+        ),
+        pytest.raises(ValueError),
+    ):
+        compile_op_spec(0, spec, [])
+
+
+def test_non_unified_shards_stay_on_matching_dense_cores_with_clamshell_enabled():
+    row, lane = sympy.symbols("row lane")
+    space = {row: (sympy.Integer(8), 8), lane: (sympy.Integer(64), 1)}
+    coords = [sympy.Integer(0), row, lane]
+    args = [
+        TensorArg(
+            is_input,
+            index,
+            DataFormats.SEN169_FP16,
+            [1, 8, 64],
+            coords,
+            {"hbm": 0},
+            non_unified_shard_bytes=128,
+        )
+        for is_input, index in ((True, 0), (True, 1), (False, 2))
+    ]
+    spec = OpSpec(
+        "add",
+        False,
+        space,
+        args,
+        {},
+        core_id_to_work_slice=derive_operation_mapping(space),
+    )
+    with config.patch(
+        sencores=8, sencores_physical=32, core_placement_mode="clamshell"
+    ):
+        payload, *_ = compile_op_spec(0, spec, [])
+    root = next(iter(payload.values()))
+    assert root["coreFoldProp_"]["factor_"] == 8
+    assert root["numCoresUsed_"] == 8
+    assert set(root["coreIdToDsc_"]) == {str(core) for core in range(8)}
+    assert [root["coreIdToWkSlice_"][str(core)]["mb"] for core in range(8)] == list(
+        range(8)
+    )
+    nodes = next(iter(root["dscs_"][0].values()))["scheduleTree_"]
+    assert len(nodes) == 3
+    for node in nodes:
+        assert node["nonUnifiedAllocInHBM_"] is True
+        assert set(node["startAddressCoreCorelet_"]["data_"]) == {
+            f"[{core}, 0, 0]" for core in range(8)
+        }
+
+
+@pytest.mark.parametrize(
+    "k_splits,mode",
+    [
+        (32, "dense"),
+        (32, "clamshell"),
+        (30, "clamshell"),
+        (24, "clamshell"),
+        (8, "clamshell"),
+        (2, "clamshell"),
+    ],
+)
+def test_split_k_physical_chains_preserve_logical_slice_order(k_splits, mode):
+    row, column, reduction = sympy.symbols("row column reduction")
+    row_splits = 32 // k_splits
+    space = {
+        row: (sympy.Integer(512), row_splits),
+        column: (sympy.Integer(128), 1),
+        reduction: (sympy.Integer(2048), k_splits),
+    }
+    spec = OpSpec(
+        "batchmatmul",
+        True,
+        space,
+        [
+            TensorArg(
+                True,
+                0,
+                DataFormats.SEN169_FP16,
+                [32, 512, 64],
+                [sympy.floor(reduction / 64), row, sympy.Mod(reduction, 64)],
+                {"hbm": 0},
+            ),
+            TensorArg(
+                True,
+                1,
+                DataFormats.SEN169_FP16,
+                [2, 2048, 64],
+                [sympy.floor(column / 64), reduction, sympy.Mod(column, 64)],
+                {"hbm": 1},
+            ),
+            TensorArg(
+                False,
+                2,
+                DataFormats.SEN169_FP16,
+                [2, 512, 64],
+                [sympy.floor(column / 64), row, sympy.Mod(column, 64)],
+                {"hbm": 2},
+            ),
+        ],
+        {},
+        core_id_to_work_slice=derive_operation_mapping(space, contiguous_dim=reduction),
+    )
+    with config.patch(sencores=32, sencores_physical=32, core_placement_mode=mode):
+        placement = superdsc._core_placement(k_splits * row_splits)
+        payload, *_ = compile_op_spec(0, spec, [])
+        root = next(iter(payload.values()))
+        assert set(root["coreIdToDsc_"]) == {str(core) for core in placement.active_ids}
+        for group in range(row_splits):
+            for k_slice in range(k_splits):
+                logical = group * k_splits + k_slice
+                physical = str(placement.physical_ids[logical])
+                assert root["coreIdToWkSlice_"][physical]["in"] == k_slice
+                assert root["coreIdToWkSlice_"][physical]["mb"] == group
 
 
 class TestResolveSdscSize(InductorTestCase):

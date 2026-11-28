@@ -553,6 +553,31 @@ violates the span limit, so the op has no span floors. Pass 1 enumerates
 divisors of `M = 8`, `n_sticks`, and `k_sticks`, prices each feasible
 combination, and commits the argmin. Pass 2 skips the op.
 
+### Physical core placement
+
+Work division assigns **logical** core IDs and work slices. The
+`SPYRE_CORE_PLACEMENT` mode resolves a shift and step for each operation's
+logical core count `n`. Each logical ID `i` maps to
+`(shift + i * step) % P`, where `P` is `SENCORES_PHYSICAL` (default 32).
+`dense` (default) uses shift 0 and step 1. `clamshell` uses shift
+`-(n // 2)` and step 1. For example, 24 logical cores on 32 physical
+cores map to 20–31 and 0–11; eight logical cores map to 28–31 and 0–3.
+An operation that uses all physical cores uses dense placement.
+The logical budget must not exceed the physical core count.
+
+The SDSC backend process receives `SENCORES_PHYSICAL` as its `SENCORES`
+topology; the frontend keeps `SENCORES` as the logical planning budget.
+
+Non-unified sharded kernels continue to use dense physical IDs. The
+source and destination of a cross-core copy resolve their placement
+separately from their logical core counts. A completed producer route
+uses the same placement as its source operation.
+
+Cross-core reductions use the selected physical core placement. Keep
+the physical topology consistent with `SENCORES_PHYSICAL` when compiling
+clamshell work. Wrapped reductions require a recent backend build.
+The KTIR emitter does not support clamshell placement.
+
 ## Interaction with SDSC and scratchpad planning
 
 ### Codegen pairing for K-splits
@@ -623,6 +648,15 @@ records only the finished producer cores, here `(3, 7)`, and exposes only
 those cores as holders of the input. The existing backend derives the
 connections and byte ranges from the producer and consumer placements.
 There is no separate producer-consumer list stored or emitted by the frontend.
+
+The source and destination have separate roles in a shuffle. A source
+**holder** is a physical core that owns input data. A destination
+**work slice** describes an output piece; it does not specify one
+physical core. A 12×2 source has 24 holders. A replicated 4×1
+destination has four work slices on 24 holders. The shuffle dispatches
+the union of the placed source and destination holders. It does not
+add one core for each of the four work slices. Completed producer
+routes use the same physical placement as the source operation.
 
 Different dimensions can require different movements in one copy. For an
 8×8 tensor, a 2×4 producer partition holds 4×2 pieces; a 4×2 consumer partition

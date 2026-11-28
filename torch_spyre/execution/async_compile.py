@@ -485,6 +485,11 @@ class SpyreAsyncCompile(AsyncCompile):
         assert not _spyre_config.frontend_only, (
             "frontend-only must stop before the backend is submitted"
         )
+        # The backend process receives the card's physical core count as
+        # its SENCORES topology; the frontend's SENCORES stays a logical
+        # planner budget.
+        backend_env = dict(os.environ)
+        backend_env["SENCORES"] = str(_spyre_config.sencores_physical)
         if get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
@@ -495,7 +500,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     _run_backend_compiler,
                     kernel_name,
                     compile_dir,
-                    dict(os.environ),
+                    backend_env,
                     backend_loop_unroll,
                     ktir_device_mlir,
                     timeout,
@@ -505,7 +510,7 @@ class SpyreAsyncCompile(AsyncCompile):
             _run_backend_compiler(
                 kernel_name,
                 compile_dir,
-                dict(os.environ),
+                backend_env,
                 backend_loop_unroll,
                 ktir_device_mlir,
                 timeout,

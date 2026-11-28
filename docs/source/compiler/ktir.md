@@ -24,11 +24,12 @@ The torch-spyre production path still goes through SuperDSC. KTIR
 adoption is incremental: the spec is stable, the reference interpreter
 is up, and the backend lowering path is in development.
 
-Concretely: `TORCH_SPYRE_KTIR=1` plus `KTIR_DEVICE_MLIR=<path>` routes
-compilation through `async_compile.ktir()` (see
-`torch_spyre/execution/async_compile.py`), which emits KTIR and hands it
-to `dbo-opt --from-ktir` for backend lowering. That path is real and
-device-executable, but it is opt-in and off by default. In the test
+Set `TORCH_SPYRE_KTIR=1` to use `async_compile.ktir()` (see
+`torch_spyre/execution/async_compile.py`). This path emits KTIR and passes it
+to `dbo-opt --from-ktir` for backend compilation. `KTIR_DEVICE_MLIR=<path>`
+selects a device specification. If this variable is not set, `dbo-opt` uses
+its default specification. Device execution is available, but this path is
+optional and disabled by default. In the test
 suite it is covered by three files: `tests/inductor/test_ktir_compile.py`
 mocks `subprocess.run` and `shutil.which` rather than running `dbo-opt`
 or touching hardware; `tests/inductor/test_ktir_validate.py` is a
@@ -67,6 +68,25 @@ hardware binaries
 For the current production path see [Inductor Frontend](inductor_frontend.md)
 (emits SuperDSC) and [Backend Compiler](backend.md) (consumes
 SuperDSC).
+
+### Core placement limits
+
+`SENCORES` sets the logical core budget. `SENCORES_PHYSICAL` sets the
+physical core count, from 1 to 32. The logical budget must be from 1 to
+`SENCORES_PHYSICAL`. Configuration import checks environment settings.
+The Spyre compilation entry also checks `config.patch` overrides before
+device initialization and graph compilation.
+
+KTIR grids use logical core IDs. The emitter does not apply physical core
+placement. Thus, KTIR emission requires `SPYRE_CORE_PLACEMENT=dense`.
+If you select `clamshell` with `TORCH_SPYRE_KTIR=1`, compilation fails.
+The same restriction applies when you set `ktir_emitter=True` and
+`core_placement_mode="clamshell"` through `config.patch`, including
+full-card operations.
+
+`KTIR_DEVICE_MLIR` alone does not enable KTIR emission. You can use this
+device specification override with `clamshell` on the SuperDSC bundle
+path when the KTIR emitter is disabled.
 
 ## Three-step memory access pattern
 

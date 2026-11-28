@@ -76,6 +76,11 @@ sink_collective_waits: bool = os.getenv("SPYRE_SINK_COLLECTIVE_WAITS", "0").lowe
     "yes",
 )
 
+
+core_placement_mode: Literal["dense", "clamshell"] = os.getenv(
+    "SPYRE_CORE_PLACEMENT", "dense"
+)  # type: ignore[assignment]
+
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
 # sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
@@ -229,7 +234,54 @@ allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
-sencores: int = int(os.getenv("SENCORES", "32"))
+
+def _core_count_from_env(name: str) -> int:
+    value = os.getenv(name, "32")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
+sencores: int = _core_count_from_env("SENCORES")
+
+# Physical placement is independent of any per-compile logical SENCORES cap.
+sencores_physical: int = _core_count_from_env("SENCORES_PHYSICAL")
+
+
+def validate_core_placement(*, from_env: bool = False) -> None:
+    """Check placement before compilation, including ``config.patch`` overrides."""
+    # The installer moves settings out of globals. Read the active module so
+    # import-time defaults and per-compile patches use the same checks.
+    cfg = sys.modules[__name__]
+    if not 1 <= cfg.sencores_physical <= 32:
+        problem = (
+            f"SENCORES_PHYSICAL must be between 1 and 32, got {cfg.sencores_physical}"
+        )
+    elif not 1 <= cfg.sencores <= cfg.sencores_physical:
+        problem = (
+            "SENCORES must be between 1 and SENCORES_PHYSICAL, "
+            f"got SENCORES={cfg.sencores}, "
+            f"SENCORES_PHYSICAL={cfg.sencores_physical}"
+        )
+    elif cfg.core_placement_mode not in ("dense", "clamshell"):
+        problem = (
+            "SPYRE_CORE_PLACEMENT must be dense or clamshell, "
+            f"got {cfg.core_placement_mode!r}"
+        )
+    elif cfg.ktir_emitter and cfg.core_placement_mode == "clamshell":
+        problem = (
+            "KTIR emission with SPYRE_CORE_PLACEMENT=clamshell; "
+            "KTIR grids use logical core IDs and do not apply physical placement"
+        )
+    else:
+        return
+    if from_env:
+        raise ValueError(problem)
+    from torch_spyre._inductor.errors import Unsupported
+
+    raise Unsupported(problem)
+
 
 # Compiling for Spyre 1p5 (the backend compiler reads the same SENARCH). Its
 # matmul takes BFLOAT16 inputs only, so a matmul input must already be BFLOAT16
@@ -668,3 +720,4 @@ if TYPE_CHECKING:
 
 
 install_config_module(sys.modules[__name__])
+validate_core_placement(from_env=True)

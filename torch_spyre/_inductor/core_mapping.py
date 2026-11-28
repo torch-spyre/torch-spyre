@@ -24,7 +24,7 @@ from itertools import permutations, product
 from typing import Any, Callable
 
 import sympy
-from sympy import Expr, Integer, Mod, Symbol, floor, sympify
+from sympy import Eq, Expr, Integer, Mod, Piecewise, Symbol, floor, sympify
 from sympy.utilities.misc import as_int
 
 from torch_spyre._C import DataFormats, get_device_size_in_bytes
@@ -621,6 +621,85 @@ def core_to_slice_mapping(
         result[dims[dim]] = coordinate
         stride *= split
     return result
+
+
+@dataclass(frozen=True)
+class CorePlacement:
+    """Map logical core IDs to unique physical IDs on a card."""
+
+    logical_cores: int
+    physical_cores: int
+    shift: int
+    step: int
+
+    def __post_init__(self) -> None:
+        if self.physical_cores <= 0 or self.logical_cores <= 0:
+            raise ValueError(
+                "core placement needs positive logical and physical counts"
+            )
+        period = self.physical_cores // math.gcd(self.step, self.physical_cores)
+        if self.logical_cores > period:
+            raise ValueError(
+                f"{self.logical_cores} logical cores cannot occupy distinct physical "
+                f"IDs with step {self.step} on {self.physical_cores} cores"
+            )
+
+    @property
+    def physical_ids(self) -> tuple[int, ...]:
+        """Physical IDs in logical-core order."""
+        return tuple(
+            (self.shift + i * self.step) % self.physical_cores
+            for i in range(self.logical_cores)
+        )
+
+    @property
+    def active_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self.physical_ids))
+
+    @property
+    def physical_span(self) -> int:
+        if self.shift == 0 and self.step == 1:
+            return self.logical_cores
+        return self.physical_cores
+
+    def remap_ids(self, logical_ids: tuple[int, ...]) -> tuple[int, ...]:
+        """Remap an existing producer route without changing its members."""
+        ids = self.physical_ids
+        if any(not 0 <= core < self.logical_cores for core in logical_ids):
+            raise ValueError("producer route names a core outside its logical domain")
+        return tuple(sorted(ids[core] for core in logical_ids))
+
+    def logical_index(self, physical_id: Symbol) -> Expr:
+        """Inverse owner index; inactive fold positions map to slice zero."""
+        if self.shift == 0 and self.step == 1:
+            return physical_id
+        modulus = self.physical_cores
+        divisor = math.gcd(self.step, modulus)
+        period = modulus // divisor
+        remainder = Mod(physical_id - self.shift, modulus)
+        inverse = pow(self.step // divisor, -1, period) if period > 1 else 0
+        logical = (
+            Mod(floor(remainder / divisor) * inverse, period)
+            if period > 1
+            else Integer(0)
+        )
+        # Use a conditional rather than a product of Mod/Max terms: SymPy
+        # simplifies floor(product) in owner expressions as product squared.
+        valid = logical < self.logical_cores
+        if divisor > 1:
+            valid &= Eq(Mod(remainder, divisor), 0)
+        return Piecewise((logical, valid), (Integer(0), True))
+
+
+def place_core_map(
+    core_map: Mapping[Symbol, Expr], placement: CorePlacement
+) -> dict[Symbol, Expr]:
+    """Evaluate logical work ownership at the placement's physical IDs."""
+    if placement.shift == 0 and placement.step == 1:
+        return dict(core_map)
+    core_id = Symbol("core_id")
+    logical = placement.logical_index(core_id)
+    return {dim: owner.xreplace({core_id: logical}) for dim, owner in core_map.items()}
 
 
 def matmul_reduction_dim(
