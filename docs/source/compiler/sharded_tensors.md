@@ -51,11 +51,30 @@ everything outside it fails at compile time with a specific message:
   graph input of the op's shape or broadcast to it, such as a bias along the
   non-shard dims. Every core reads it with ordinary unified addressing;
   the result takes the sharded operand's placement. An unsharded operand
-  computed inside the graph, or read by a reduction, is rejected. The
+  computed inside the graph, or read by a reduction, is rejected, and so is
+  one mutated in place from a sharded value (for now: the sharded
+  intermediate that mutation produces is not supported). The
   one-dtype rule below applies to replicas too, so an fp16 sharded tensor
   times an fp32 scale (including a 0-d one) is rejected: cast the scale to
-  fp16 first. There is no `Replicate()` placement for `to_sharded` yet: a
-  plain `.to("spyre")` tensor is the replica.
+  fp16 first.
+  `to_sharded(x, Replicate())` declares such an operand explicitly: one
+  unified copy, tagged `Replicate()` on its storage (see
+  [`to_sharded`](#to_sharded)). A plain `.to("spyre")` tensor is accepted
+  the same way. Placements combine in a pointwise op as follows:
+
+  | Operands | Result |
+  | --- | --- |
+  | `Shard(d)` with `Shard(d)` (same dim and shard count) | `Shard(d)` |
+  | `Shard(d)` with `Replicate()`, a plain tensor, or a scalar | `Shard(d)` |
+  | `Replicate()` with `Replicate()`, a plain tensor, or a scalar | an ordinary unified tensor; no sharded kernel is involved |
+  | `Shard(d1)` with `Shard(d2)` | rejected, naming both placements: it needs data movement between shards |
+
+  `combine_placements` (`_inductor/sharded_hbm.py`) is the single place this
+  table is implemented; a plain tensor or scalar is `None` there. The compiler
+  records a `Replicate()` tag from the real graph input as a
+  `ReplicatedPlacement(copies=1)`. Only the one-copy read path exists, so a
+  replica with any other copy count fails closed instead of compiling as a
+  unified operand.
 * Each shard must be a whole device dim of whole sticks: the shard keeps
   the global device layout's dim structure, the shard boundary falls on
   whole sticks for a last-dim shard (a stick cannot be split between
@@ -123,7 +142,8 @@ Copies a CPU tensor into a sharded Spyre tensor. Arguments:
 * **`placement`** — a `torch.distributed.tensor.Shard(dim)` naming the
   dimension to split, or the single-element list `[Shard(dim)]`. Exactly one
   placement is admitted (there is no multi-dimensional mesh); `dim` may be
-  negative. The named dimension must divide into `num_shards` equal,
+  negative. `Replicate()` (or `[Replicate()]`) is also accepted; see below.
+  The named dimension must divide into `num_shards` equal,
   non-empty shards: its size must be a multiple of `num_shards`. The shard
   count is never reduced to fit; an unshardable dimension is rejected before
   any allocation, and the error lists the dimensions that would divide.
@@ -140,14 +160,51 @@ shape; its storage holds `num_shards` placement slots with shard *i*
 (the *i*-th equal slice along `placement`'s dimension) in slot *i*, bound
 to core *i*.
 
+**`Replicate()`.** `to_sharded(x, Replicate())` returns one unified copy that
+every core reads, with a `Replicate()` tag on its storage. Replication is
+recorded as a tag rather than as per-core copies: the tensor keeps its
+ordinary layout and addressing, so no extra device memory is used and a
+kernel compiled for a plain unified operand is unchanged. The tag is part of
+the compile guards and cache key (address-free), so a replicated tensor never
+shares a compiled entry with a plain or sharded one. It takes no
+`num_shards` (that raises `ValueError`), needs no divisible dimension, and
+is not sharded: `is_sharded` is `False` and `sharding_info` raises
+`TypeError`. Use `torch.spyre.is_replicated(tensor)` to query the tag. There is
+exactly one copy; its compile signature is
+`("replicate", 1)`, where the second field is the copy count, so a later
+per-core replica (a different copy count) can never share a compiled entry with
+it.
+
+The tag costs compiles today: the same bias used once as a plain tensor and
+once as `Replicate()` compiles twice, to a bit-identical kernel. That
+separation has no behavioral benefit now. It is kept deliberately, as
+forward-compatibility, so that per-core replicas (`copies != 1`) can never hit
+a cache entry compiled for the one-copy path. The tag marks the storage, not
+the tensor, so it is only applied to a whole, contiguous base tensor.
+Per-HBM-group copies for locality are
+not provided: they need a receipt that can describe a whole-tensor replica per
+core, and are deferred until broadcasting (#5821) defines how a replica is
+read per core.
+
 The whole request is validated before the runtime is touched: the placement
-must be exactly `torch.distributed.tensor.Shard` (or a single-element list
-of one), the shard count must be 8 or 16 and match `SENCORES`, and the
+must be exactly `torch.distributed.tensor.Shard` or `Replicate` (or a
+single-element list of one), a `Shard` request's shard count must be 8 or 16
+and match `SENCORES`, and the
 source must be a contiguous, base-like, gradient-free CPU tensor of a
 supported dtype with compact storage. Degenerate shapes and out-of-range
 placement dims are rejected by the planner before allocation. If validation
 passes but allocation or any shard copy fails, no tensor is returned — the
 result is dropped and freed; nothing falls back to unified storage.
+
+### `is_replicated`
+
+```python
+torch.spyre.is_replicated(tensor) -> bool
+```
+
+Returns whether `tensor` carries the `Replicate()` tag from
+`to_sharded(x, Replicate())` — `False` for any other value, including
+non-Spyre tensors and sharded tensors; never raises.
 
 ### `is_sharded`
 
@@ -297,8 +354,9 @@ whose `plan_sharded_hbm` admits a graph for sharded compilation or raises
 2. Every sharded input must agree with the others on placement (shard dim,
    count) — an operand-vs-operand check; each operand's own storage was
    already validated against its receipt when the tensor was created.
-   Unsharded operands of a pointwise op are admitted when they are a scalar
-   constant or a graph input (`_require_replica_source`) of the op's shape
+   Operand placements combine through `combine_placements` (the table
+   above). Unsharded operands of a pointwise op are admitted when they are a
+   scalar constant or a graph input (`_require_replica_source`) of the op's shape
    or broadcast to it (`_require_replica_read`); they keep ordinary unified
    addressing, and only the sharded arguments get per-core shard addresses
    (`verify_mixed_args`).

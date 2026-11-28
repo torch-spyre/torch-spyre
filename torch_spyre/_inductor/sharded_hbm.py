@@ -24,10 +24,12 @@ Two op kinds are admitted:
 - same-shape pointwise ops: the result has the sharded operands' placement.
   Such an op may also read *unsharded* operands, which act as read-only
   replicas: a scalar constant, or a plain unified graph input (a bias, or a
-  full-size tensor). Every core reads the replica through the ordinary
-  unified addressing, so no shard table is involved. Sharded operands must
-  still agree on one placement; two different placements need data movement
-  between chunks and are rejected;
+  full-size tensor), or one tagged ``Replicate()`` (``to_sharded``): the
+  same single unified copy, so no shard table is involved. Every core reads
+  it through the ordinary unified addressing. How operand placements combine
+  is ``combine_placements``: sharded operands must still agree on one
+  placement; two different placements need data movement between chunks and
+  are rejected;
 - shard-local reductions: a reduction over dims that do not include the
   shard dim. Each core reduces its own shard and writes its own output
   shard, so no data crosses shards. The result is sharded along the
@@ -42,6 +44,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Sequence
 
 import sympy
 import torch
@@ -72,6 +75,21 @@ class ShardedPlacement:
     shard_device_bytes: int
 
 
+@dataclasses.dataclass(frozen=True)
+class ReplicatedPlacement:
+    """Address-free ``Replicate()`` tag of one buffer.
+
+    ``copies`` is the number of device copies behind the tag. ``1`` is the
+    only value the planner admits today: one unified copy that every core
+    reads with ordinary unified addressing, so a replicated operand compiles
+    exactly as a plain one. A per-core replica (one whole-tensor copy per
+    core) is a different read path and is a different value here, so it
+    cannot be mistaken for the single-copy path.
+    """
+
+    copies: int = 1
+
+
 def placement_from_tensor(tensor: torch.Tensor) -> ShardedPlacement | None:
     """The sharding of a real (non-fake) Spyre tensor, or None if unsharded."""
     from torch_spyre import _C
@@ -88,18 +106,78 @@ def placement_from_tensor(tensor: torch.Tensor) -> ShardedPlacement | None:
     )
 
 
+def replica_from_tensor(tensor: torch.Tensor) -> ReplicatedPlacement | None:
+    """The ``Replicate()`` tag of a real Spyre tensor, or None if untagged."""
+    from torch_spyre import _C
+
+    if not _C._spyre_is_replicated(tensor):
+        return None
+    return ReplicatedPlacement()
+
+
+def _graph_registry(graph: GraphLowering | None, attr: str) -> dict:
+    graph = graph if graph is not None else V.graph
+    registry = getattr(graph, attr, None)
+    if registry is None:
+        registry = {}
+        setattr(graph, attr, registry)
+    return registry
+
+
 def graph_placements(graph: GraphLowering | None = None) -> dict[str, ShardedPlacement]:
     """Buffer name -> placement for the graph being compiled."""
-    graph = graph if graph is not None else V.graph
-    placements = getattr(graph, "_spyre_sharded_placements", None)
-    if placements is None:
-        placements = {}
-        graph._spyre_sharded_placements = placements
-    return placements
+    return _graph_registry(graph, "_spyre_sharded_placements")
+
+
+def graph_replicas(
+    graph: GraphLowering | None = None,
+) -> dict[str, ReplicatedPlacement]:
+    """Graph-input name -> ``Replicate()`` tag for the graph being compiled."""
+    return _graph_registry(graph, "_spyre_replicated_placements")
 
 
 def placement_of(name: str) -> ShardedPlacement | None:
     return graph_placements().get(name)
+
+
+Placement = ShardedPlacement | ReplicatedPlacement | None
+
+
+def combine_placements(
+    name: str, operands: Sequence[Placement]
+) -> ShardedPlacement | None:
+    """Placement of an op's result from the placements of its operands.
+
+    ``None`` stands for a plain unified tensor or a scalar. The rules:
+
+    ===========================================  ==============================
+    operands                                     result
+    ===========================================  ==============================
+    ``Shard(d)`` with the same ``Shard(d)``      ``Shard(d)``
+    ``Shard(d)`` with ``Replicate()``/plain      ``Shard(d)``
+    no sharded operand                           ``None`` (an ordinary unified
+                                                 op; no sharded kernel)
+    ``Shard(d1)`` with ``Shard(d2)``             rejected: needs data movement
+    ``Shard(d)`` with a per-core replica         rejected: only the one-copy
+                                                 replica read path exists
+    ===========================================  ==============================
+    """
+    sharded = {op for op in operands if isinstance(op, ShardedPlacement)}
+    if not sharded:
+        return None
+    if len(sharded) > 1:
+        raise Unsupported(
+            f"{name}: non-unified kernels cannot combine operands sharded "
+            f"differently ({_describe_placements(sharded)}); moving "
+            "data between placements is not supported"
+        )
+    for op in operands:
+        if isinstance(op, ReplicatedPlacement) and op.copies != 1:
+            raise Unsupported(
+                f"{name}: non-unified kernels read a Replicate() operand only "
+                f"as one unified copy; got {op.copies} copies"
+            )
+    return next(iter(sharded))
 
 
 def _local_layout(size: list[int], dtype: torch.dtype, placement: ShardedPlacement):
@@ -574,8 +652,10 @@ def _require_replica_read(
     What is admitted: right-aligned dims equal to the op's or 1, and an index
     built from the write's own iteration variables. Indirect reads (an index
     with a variable the write does not have) fail closed; affine reads over
-    the write's own variables, including a permuted or flipped graph input of
-    the op's shape, use ordinary unified addressing.
+    the write's own variables use ordinary unified addressing. A permuted
+    read of a graph input does not get here: layout propagation turns it into
+    a restickify buffer, which ``_require_replica_source`` rejects as computed
+    in the graph (test_permuted_unsharded_operand_fails_at_compile).
     """
     buf = graph.get_buffer(dep.name)
     shape = [int(s) for s in buf.get_size()] if buf is not None else None
@@ -616,6 +696,7 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
     placements = graph_placements(graph)
     if not placements:
         return
+    replicas = graph_replicas(graph)
     outputs = set(graph.get_output_names())
     # Cross-shard reductions planned for the ring: they read sharded storage
     # but produce an ordinary (unsharded) result.
@@ -636,8 +717,11 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
         # functional intermediate is never a graph output). A change that
         # admits sharded intermediates inherits the obligation to keep that
         # case failing closed.
-        sharded = [placements[d.name] for d in reads if d.name in placements]
-        if not sharded:
+        operand_placements: list[Placement] = [
+            placements.get(d.name) or replicas.get(d.name) for d in reads
+        ]
+        placement = combine_placements(op.get_name(), operand_placements)
+        if placement is None:
             continue
         name = op.get_name()
         is_reduction = isinstance(op.data, Reduction)
@@ -650,13 +734,6 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
             raise Unsupported(
                 f"{name}: non-unified kernels need static shapes; compile with "
                 "dynamic=False"
-            )
-        placement = sharded[0]
-        if len(set(sharded)) > 1:
-            raise Unsupported(
-                f"{name}: non-unified kernels cannot combine operands sharded "
-                f"differently ({_describe_placements(set(sharded))}); moving "
-                "data between placements is not supported"
             )
         unsharded = [dep for dep in reads if dep.name not in placements]
         if unsharded and is_reduction:

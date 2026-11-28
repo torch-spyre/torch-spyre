@@ -65,7 +65,13 @@ from .dtype_ops import (
     DtypeOpTable,
 )
 from .errors import Unsupported
-from .sharded_hbm import check_sharded_input, graph_placements, placement_from_tensor
+from .sharded_hbm import (
+    check_sharded_input,
+    graph_placements,
+    graph_replicas,
+    placement_from_tensor,
+    replica_from_tensor,
+)
 from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
@@ -3826,6 +3832,12 @@ def propagate_spyre_tensor_layouts(
                             list(real_input.shape), real_input.dtype
                         )
                         graph_placements(graph)[name] = placement
+                    elif stl is not None:
+                        # A Replicate()-tagged input keeps its unified layout;
+                        # only its tag is recorded, for the placement algebra.
+                        replica = replica_from_tensor(real_input)
+                        if replica is not None:
+                            graph_replicas(graph)[name] = replica
                     if stl is None:
                         # A CPU tensor lifted as a graph input, or a host tensor
                         # feeding a FallbackKernel has no Spyre layout;

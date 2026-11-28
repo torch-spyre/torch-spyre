@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from torch.distributed.tensor import Shard
+    from torch.distributed.tensor import Replicate, Shard
 
 from torch_spyre._sharded_api import ShardedTensorInfo
 
@@ -35,9 +35,10 @@ def set_rng_state(
 def initial_seed(device: int | str | torch.device = "spyre") -> int: ...
 def to_sharded(
     tensor: torch.Tensor | torch.nn.Parameter,
-    placement: Shard | list[Shard] | tuple[Shard],
+    placement: Shard | Replicate | list[Shard | Replicate] | tuple[Shard | Replicate],
     *,
     num_shards: int | None = None,
 ) -> torch.Tensor: ...
 def is_sharded(tensor: object) -> bool: ...
+def is_replicated(tensor: object) -> bool: ...
 def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo: ...
