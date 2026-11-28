@@ -304,6 +304,7 @@ def _patch_tensor_for_spyre():
     if getattr(torch.Tensor, "_spyre_tensor_patched", False):
         return
 
+    from torch._subclasses.functional_tensor import FunctionalTensor
     from torch.utils._device import _device_constructors
 
     _device_constructors()  # warm the cache with the original torch.empty
@@ -364,10 +365,13 @@ def _patch_tensor_for_spyre():
             # the operation device-local so Inductor sees and lowers the dtype
             # conversion. The host-staged path below is only for real eager
             # tensors; introducing CPU copies while tracing would put
-            # DeviceCopy nodes into the compiled graph.
+            # DeviceCopy nodes into the compiled graph. A FunctionalTensor is
+            # AOTAutograd tracing outside Dynamo: aot_compile runs the backend
+            # after the Dynamo trace has ended, so is_compiling() is False there.
             if (
                 torch.compiler.is_compiling()
                 or isinstance(self, torch._subclasses.FakeTensor)
+                or isinstance(self, FunctionalTensor)
                 or torch._is_functional_tensor(self)
             ):
                 return orig_to(self, *args, **kwargs)

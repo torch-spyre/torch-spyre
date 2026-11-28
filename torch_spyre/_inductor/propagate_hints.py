@@ -98,8 +98,14 @@ def get_id():
     local.
     """
 
-    tx = InstructionTranslator.current_tx()
-    assert tx is not None
+    try:
+        tx = InstructionTranslator.current_tx()
+    except AttributeError:  # no Dynamo trace ever started on this thread
+        tx = None
+    if tx is None:
+        # The graph's own call of this leaf, run after the trace (aot_compile calls
+        # the backend then). The id was taken during the trace; this one is unused.
+        return 0, torch.empty(0, device="cpu")
 
     counter = getattr(tx, "__spyre_hint_counter", 0)
     setattr(tx, "__spyre_hint_counter", counter + 1)
