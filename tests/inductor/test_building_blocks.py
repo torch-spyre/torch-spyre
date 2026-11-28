@@ -22,9 +22,10 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch._dynamo.utils import counters
 
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import fresh_cache, run_and_get_code
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor import spyre_hint  # noqa: F401
 from torch_spyre._inductor import config
@@ -396,6 +397,46 @@ class TestBuildingBlocks(unittest.TestCase):
         torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
         self.assertNotIn("while_loop_carry_snapshot", "\n".join(sources))
+
+    def test_chained_matched_attention_compiles(self):
+        """Two attentions fused post-grad compile and match CPU (#6418).
+
+        Upstream fuse_attention rewrites each bmm -> softmax -> bmm into
+        _scaled_dot_product_fused_attention_overrideable after AOT decomposition,
+        and fallback_random chains the second behind the first with control_deps.
+        The chain names the first one's unread logsumexp and other seed buffers,
+        which deadcode_elimination removed; the scheduler then raised KeyError.
+        A direct F.scaled_dot_product_attention is decomposed during AOT tracing
+        and never takes this path.
+        """
+
+        def attn(q, k, v):
+            return torch.bmm(torch.bmm(q, k.transpose(1, 2)).softmax(-1), v)
+
+        def fn(q, k, v):
+            a1 = attn(q, k, v)
+            return a1, attn(a1, k, v)
+
+        # Only q is scaled, by 1/sqrt(64).
+        # logits are ~N(0, 1), so neither softmax is near uniform and 
+        # a wrong first attention moves both outputs by up to ~|a1| ~ 1,
+        # far above the tolerance.
+        q = torch.randn(2, 64, 64, dtype=torch.float16) * 0.125
+        k = torch.randn(2, 64, 64, dtype=torch.float16)
+        v = torch.randn(2, 64, 64, dtype=torch.float16)
+        expected = fn(q.float(), k.float(), v.float())
+        # fuse_attention runs in the joint graph, which a warm AOT/FX cache skips.
+        # start cold so the pattern match (and the chain) always happen.
+        torch._dynamo.reset()
+        counters.clear()
+        with fresh_cache():
+            actual = torch.compile(fn, dynamic=False)(
+                q.to(DEVICE), k.to(DEVICE), v.to(DEVICE)
+            )
+        # Both must be pattern-matched, or the test no longer covers the chain.
+        self.assertEqual(counters["inductor"]["fuse_attention"], 2)
+        for got, ref in zip(actual, expected):
+            torch.testing.assert_close(got.cpu().float(), ref, atol=3e-2, rtol=1e-2)
 
     def test_causal_sdpa_unpadded_kv_no_inf(self):
         """Regression: causal SDPA must not produce inf when seqlen_kv % 64 != 0.

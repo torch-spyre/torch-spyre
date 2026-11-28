@@ -33,6 +33,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre.constants import DEVICE_NAME
 
@@ -266,6 +267,43 @@ class TestMutatingFallbackElimination(unittest.TestCase):
         survivors = self._run([target, *ops], output_names=[])
 
         self.assertLessEqual({op.get_name() for op in ops}, survivors)
+
+
+class TestDanglingOrderingDepIsPruned(unittest.TestCase):
+    """A weak ordering dep on a buffer the pass removes is dropped with it.
+
+    ``control_deps`` lowering currently saves every buffer of its predecessor in
+    ``additional_buffer_deps``, redundant/unused ones included (an SDPA's logsumexp and
+    philox seeds). Once the pass removes such a buffer, a leftover buffer name in
+    the table reaches ``Scheduler.compute_ancestors`` leading to KeyError (#6418).
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+        self.addCleanup(self._graph_ctx.__exit__, None, None, None)
+        make = TestDeadMutationElimination._make_buffer
+        self.producer = make("producer")
+        self.live = make("live", reads="producer")
+        self.dead = make("dead_empty")
+        V.graph.graph_inputs["in_producer"] = V.graph.name_to_buffer["in_producer"]
+        V.graph.operations = [self.producer, self.dead, self.live]
+        V.graph.get_output_names = lambda: ["live"]
+
+    def test_weak_ordering_dep_on_removed_buffer_is_pruned(self):
+        """The removed name goes; a surviving op's buffer and an input stay."""
+        V.graph.additional_buffer_deps["live"] = OrderedSet(
+            ["dead_empty", "producer", "in_producer"]
+        )
+
+        deadcode_elimination(V.graph)
+
+        self.assertIn("dead_empty", V.graph.removed_buffers, "fixture drifted")
+        self.assertEqual(
+            list(V.graph.additional_buffer_deps["live"]),
+            ["producer", "in_producer"],
+        )
 
 
 class TestUnusedCollectiveIsKept(unittest.TestCase):

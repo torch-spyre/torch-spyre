@@ -185,6 +185,7 @@ def deadcode_elimination(graph: GraphLowering) -> None:
             continue
         dead.append(op)
 
+    deleted: set[str] = set()
     for op in dead:
         # A dead LoopNode takes its whole body with it; record each leaf's own
         # writes, as removing those leaves one by one would (the node's
@@ -193,4 +194,26 @@ def deadcode_elimination(graph: GraphLowering) -> None:
             rw = leaf.get_read_writes()
             for dep in rw.writes:
                 graph.removed_buffers.add(dep.name)
+                deleted.add(dep.name)
         remove_op(operations, op)
+
+    _prune_dangling_ordering_deps(graph, deleted)
+
+
+def _prune_dangling_ordering_deps(graph: GraphLowering, deleted: set[str]) -> None:
+    """Forget ordering rules that point at buffers this pass deleted.
+
+    An op can be told to run after every output of an earlier op, unused ones
+    included (eg., an SDPA's logsumexp and philox seeds). Once those unused
+    buffers are deleted, the scheduler can't find them and fails (issue #6418).
+
+    Upstream does the similar cleanup after its own dead-code pass.
+    This ``BaseSchedulerNode.prune_weak_deps`` drops an ordering dep whose producer
+    was deleted. It can only do that because upstream keeps deleted buffers in
+    ``name_to_buf``, ours never get there, so we clean the source table ourself.
+    Like upstream, only names/deps on what this pass deleted are dropped.
+    ``additional_star_deps`` is left untouched.
+    """
+    for deps in graph.additional_buffer_deps.values():
+        for name in [name for name in deps if name in deleted]:
+            deps.discard(name)
