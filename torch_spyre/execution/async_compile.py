@@ -53,6 +53,8 @@ from .kernel_cache import (
     get_cached_kernel_dir,
     get_kernel_registry,
     load_symbol_kinds,
+    log_stale_key_counts,
+    lookup_stale_precomputed_key,
     record_kernel_name,
     register_precomputed_key,
     resolve_precomputed_key,
@@ -551,9 +553,14 @@ class SpyreAsyncCompile(AsyncCompile):
         since it is the value compute_specs_hash() returns for these specs.
         Otherwise the key is computed; with "verify" both are and a difference
         raises PrecomputedKernelKeyMismatch.
+
+        A stored key whose fingerprint is stale (an upgrade that kept the FX
+        graph cache) is looked up in the refresh table first; on a miss the
+        computed key is recorded there, so the next start does not compute it.
         """
         mode = _spyre_config.precomputed_kernel_key
         trusted_key = None
+        refresh = None
         if mode in ("1", "verify"):
             trusted_key = resolve_precomputed_key(
                 precomputed_key,
@@ -561,6 +568,16 @@ class SpyreAsyncCompile(AsyncCompile):
                 backend_loop_unroll=backend_loop_unroll,
                 ktir_device_mlir=ktir_device_mlir,
             )
+            if trusted_key is None:
+                refresh = lookup_stale_precomputed_key(
+                    precomputed_key,
+                    specs,
+                    pool_size,
+                    backend_loop_unroll=backend_loop_unroll,
+                    ktir_device_mlir=ktir_device_mlir,
+                )
+                if refresh is not None:
+                    trusted_key = refresh.key
         if trusted_key is not None and mode == "1":
             register_precomputed_key(trusted_key, kernel_name, specs)
             return trusted_key
@@ -587,6 +604,8 @@ class SpyreAsyncCompile(AsyncCompile):
                 kernel_name,
                 e,
             )
+        if refresh is not None and refresh.key is None and cache_key is not None:
+            refresh.record(cache_key)
         # A key that could not be computed (warned above) leaves nothing to
         # compare with; that is not a mismatch.
         if trusted_key is not None and cache_key is not None:
@@ -964,3 +983,4 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
             self._provenance_attempt_count = 0
             self._provenance_failure_count = 0
+            log_stale_key_counts()
