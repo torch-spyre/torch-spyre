@@ -24,6 +24,7 @@ test_suite_config:
             # variant was collected in the reductions shard via substring match.
             - TestOps::test_mean_3d_dim0_keepdim
             - TestOps::test_index_copy_.*
+            - TestOps::test_index_fill_.*
             - TestOps::test_index_put_.*
             - TestOps::test_index_reduce_.*
             - TestOps::test_scatter_reduce_.*

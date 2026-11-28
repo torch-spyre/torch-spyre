@@ -4278,6 +4278,92 @@ def spyre_index_add(
     return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
 
 
+@register_spyre_decompositions(
+    [torch.ops.aten.index_fill.int_Scalar, torch.ops.aten.index_fill.int_Tensor]
+)
+def spyre_index_fill(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: Union[int, float, bool, torch.Tensor],
+) -> torch.Tensor:
+    """`index_fill` as an overwrite-scatter of a materialized fill block.
+
+    The upstream reference broadcasts the value with `expand` (a
+    `scalar_tensor(value)` for the scalar overload) and scatters it via
+    `index_copy`. The store then reads a stride-0 view with no buffer behind
+    it, which reaches codegen as a bare `Constant` ("store value of unexpected
+    type"). Building the block with `torch.full` (or `zeros + value` for a
+    tensor value) gives the scatter a real source buffer, the shape
+    `index_copy` already handles.
+
+    The `_out` overloads need no entry: functionalization rewrites them to
+    these functional overloads plus a copy, so the eager `index_fill_` kernel
+    (routed through `index_fill.out(out=self)`) is covered too.
+    """
+    torch._check(
+        index.dim() <= 1,
+        lambda: f"Index should have dimension 1 or 0 (got {index.dim()})",
+    )
+    if isinstance(value, torch.Tensor):
+        torch._check(
+            value.dim() == 0,
+            lambda: "Only supports 0-dimensional value tensor. "
+            f"Got a tensor with {value.dim()} dimensions.",
+        )
+    # Treat a 0-d self as shape [1], as the upstream reference does.
+    y = self.unsqueeze(0) if self.dim() == 0 else self
+    dim = dim % y.dim()
+    index = index.reshape(-1)
+    shape = list(y.shape)
+    shape[dim] = index.numel()
+    if isinstance(value, torch.Tensor):
+        block = torch.zeros(shape, dtype=y.dtype, device=y.device) + value.to(y.dtype)
+    else:
+        block = torch.full(shape, value, dtype=y.dtype, device=y.device)
+    out = torch.index_copy(y, dim, index, block)
+    return out.squeeze(0) if self.dim() == 0 else out
+
+
+# -- Scalar-valued stores ------------------------------------------------
+#
+# A write whose value is a bare number reaches ``SpyreKernel.store`` as an
+# ``ops.constant`` and is rejected ("store value of unexpected type Constant"):
+# codegen can only store from an allocated buffer. The fix is always to
+# materialize the number into a real tensor first, with a decomposition of the
+# op that carries it:
+#
+#   * ``index_fill`` -- :func:`spyre_index_fill` above builds a ``full`` block.
+#   * ``scatter.value`` -- no decomposition exists upstream, so the number stays
+#     an argument of the op; this rewrites it to ``scatter.src``.
+#
+# ``masked_fill`` needs no entry: it decomposes to ``where``, handled by the
+# ``where.Scalar*`` decompositions above.
+
+
+@register_spyre_decompositions([torch.ops.aten.scatter.value])
+def spyre_scatter_value(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: Union[int, float, bool],
+) -> torch.Tensor:
+    """`scatter.value` as `scatter.src` with the scalar materialized.
+
+    ``scatter.src`` takes its written values from a tensor shaped like ``index``
+    -- one value per index entry -- so the block is built to that shape and
+    forwarded. ``new_full`` carries ``self``'s dtype and device, so no promotion
+    is introduced, and it allocates: an ``expand`` of the scalar would put the
+    constant straight back into the store it is being materialized out of.
+
+    Duplicate entries in ``index`` are safe here: every writer to a slot stores
+    the same value, so the surviving writer does not matter.
+    """
+    dim = dim % self.dim()
+    src = self.new_full(list(index.shape), value)
+    return torch.ops.aten.scatter.src(self, dim, index, src)
+
+
 _INDEX_REDUCE_TYPES = ("prod", "mean", "amax", "amin")
 _INDEX_REDUCE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 

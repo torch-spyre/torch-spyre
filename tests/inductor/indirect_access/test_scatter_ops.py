@@ -246,21 +246,6 @@ class TestIndexFillEagerCompile:
 
     def test_index_fill_dim0_float16(self, execution_mode):
         """index_fill_ on dim=0 with float16; fills rows [0, 2] with 3.0."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4414
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4472
-        _xfail_existing(
-            execution_mode,
-            eager=rejection(
-                4414,
-                "aten::index_fill_.int_Scalar is not registered on Spyre.",
-                r"Could not run 'aten::index_fill_.int_Scalar'",
-            ),
-            compiled=rejection(
-                4472,
-                "compile index_fill_ stores a rank-0 Constant.",
-                r"store value of unexpected type <class '[\w.]*Constant'>",
-            ),
-        )
         x = cached_randn((4, 16), differentiation="ifill_f16_01", dtype=torch.float16)
         idx = torch.tensor([0, 2], dtype=torch.int64)
         compare_mode(
@@ -273,15 +258,18 @@ class TestIndexFillEagerCompile:
         )
 
     def test_index_fill_dim1_float16(self, execution_mode):
-        """index_fill_ on dim=1 with float16; fills columns [1, 3] with -1.0."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4414
+        """index_fill_ on dim=1 with float16; fills columns [1, 3] with -1.0.
+
+        dim 1 is the stick dim. Eager runs the compiled index_fill.out kernel
+        (#4414), so both modes reach the stick-dim scatter limit (#4399).
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
             eager=rejection(
-                4414,
-                "aten::index_fill_.int_Scalar is not registered on Spyre.",
-                r"Could not run 'aten::index_fill_.int_Scalar'",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
+                r"cannot re-tile \S+: no size-1 stick target",
             ),
             compiled=rejection(
                 4399,
@@ -301,15 +289,18 @@ class TestIndexFillEagerCompile:
         )
 
     def test_index_fill_1d_dest_length_8(self, execution_mode):
-        """index_fill_ 1-D dest length 8 — compile leftover (#4399)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4414
+        """index_fill_ 1-D dest length 8 — the only dim is the stick dim.
+
+        Eager runs the compiled index_fill.out kernel (#4414), so both modes
+        fail to re-tile the stick-dim scatter (#4399).
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
             eager=rejection(
-                4414,
-                "aten::index_fill_.int_Scalar is not registered on Spyre.",
-                r"Could not run 'aten::index_fill_.int_Scalar'",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
+                r"cannot re-tile \S+: no size-1 stick target",
             ),
             compiled=rejection(
                 4399,
@@ -672,12 +663,12 @@ class TestScatterValueStamp:
     def test_scatter_value_grouped_mm_offs(self, execution_mode):
         """scatter_(0, idx, 1.0) onto fp16 dest [128], T=192 — leftover extra (#4436 Python).
 
-        Eager is aten::scatter.value_out (#4473). Compiled fails in
-        insert_restickify_padding (#6163): the restickify is written into a
-        slice of another buffer, which cannot be padded in place.
+        Eager is aten::scatter.value_out (#4473). Compiled, scatter.value is
+        rewritten to scatter.src, whose restickify of the 1-D dest aborts in
+        codegen (#4327).
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4473
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -686,9 +677,9 @@ class TestScatterValueStamp:
                 r"Could not run 'aten::scatter.value_out'",
             ),
             compiled=rejection(
-                6163,
-                "compile scatter_(value=) on an fp16 dest [128]: insert_restickify_padding cannot pad a restickify written into a slice of another buffer.",
-                r"insert_restickify_padding: restickify written into a slice of another buffer",
+                4327,
+                "compile scatter_(value=) on an fp16 dest [128]: restickify op_spec has 3 args.",
+                r"restickify op_spec has 3 args",
             ),
         )
         G, T = 128, 192
@@ -704,9 +695,14 @@ class TestScatterValueStamp:
 
     @gap_one_core
     def test_scatter_value_kv_cache_slots(self, execution_mode):
-        """scatter_ stamp 0.0 into bf16 dest (256, 8, 128) at slots [3, 17] (#4436)."""
+        """scatter_ stamp 0.0 into bf16 dest (256, 8, 128) at slots [3, 17] (#4436).
+
+        Compiled, scatter.value is rewritten to scatter.src, and the backend
+        scheduler rejects the dim-0 scatter bundle (#4409), as for
+        torch.scatter on dim 0.
+        """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4473
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4472
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4409
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -715,9 +711,9 @@ class TestScatterValueStamp:
                 r"Could not run 'aten::scatter.value_out'",
             ),
             compiled=rejection(
-                4472,
-                "compile scatter_(value=) stores a rank-0 Constant.",
-                r"store value of unexpected type <class '[\w.]*Constant'>",
+                4409,
+                "compile scatter_(value=) on dim 0: the backend scheduler rejects the scatter bundle.",
+                r"Expect index stick dim to be innermost in chunk loop order",
             ),
         )
         dst = cached_randn((256, 8, 128), differentiation="sc_kv", dtype=torch.bfloat16)
