@@ -20,28 +20,6 @@ import torch
 from utils_inductor import cached_randn, compare_with_cpu, strict_xfail
 
 
-def _xfail_var_unsupported(request, execution_mode):
-    """Strict xfail for a body that calls ``Tensor.var`` (#1688).
-
-    Eager has no ``aten::var.correction`` kernel; compiled fails in lowering.
-    Every dtype fails here first, so the older limits that were recorded per
-    dtype (FP32 reductions on padded sticks, #2534) cannot be seen until ``var``
-    works.
-    """
-    if execution_mode == "eager":
-        strict_xfail(
-            request,
-            NotImplementedError,
-            "aten::var.correction has no Spyre kernel (#1688)",
-        )
-    else:
-        strict_xfail(
-            request,
-            torch._inductor.exc.InductorError,
-            "compiling Tensor.var fails with KeyError 'No FX node for buf' (#1688)",
-        )
-
-
 def _xfail_round_unsupported(request, execution_mode):
     """Strict xfail for a body that calls ``torch.round`` (#1723).
 
@@ -61,6 +39,26 @@ def _xfail_round_unsupported(request, execution_mode):
             "the compiled kernel raises 'unimplemented operation', because round "
             "has no lowering (#1723)",
         )
+
+
+def _xfail_cpsat_tie(request, observed):
+    """Non-strict xfail for an fp16 compiled case decided by a CP-SAT tie.
+
+    The work division picks one of several equal-cost plans, and which one
+    CP-SAT returns depends on its worker count (``SPYRE_NUM_CPUS``; CI runner
+    pods are limited to 10 CPUs). One plan passes and another misses the fp16
+    tolerance, so the outcome differs between machines (#5561, #6102). Any
+    failure other than an ``AssertionError`` still fails.
+    """
+    request.applymarker(
+        pytest.mark.xfail(
+            raises=AssertionError,
+            strict=False,
+            reason="fp16 compiled result depends on an equal-cost CP-SAT "
+            f"tie-break whose outcome varies with the solver worker count: "
+            f"{observed} (#5561, #6102)",
+        )
+    )
 
 
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
@@ -96,7 +94,6 @@ class TestNormalizationScalarOperations:
     )
     def test_layernorm(self, request, execution_mode, eps, dtype, batch, seq, hidden):
         """Last-dim normalization (mean/var), not ``nn.LayerNorm``; various ``eps`` and shapes."""
-        _xfail_var_unsupported(request, execution_mode)
 
         def layernorm(x):
             mean = x.mean(dim=-1, keepdim=True)
@@ -109,8 +106,6 @@ class TestNormalizationScalarOperations:
 
     def test_layernorm_affine(self, request, execution_mode):
         """Last-dim layernorm with gamma/beta (affine)."""
-        _xfail_var_unsupported(request, execution_mode)
-
         eps = 1e-5
         hidden_size = 768
 
@@ -350,7 +345,29 @@ class TestNormalizationScalarOperations:
     )
     def test_groupnorm(self, request, execution_mode, num_groups, dtype):
         """Test GroupNorm with various group counts and dtypes."""
-        _xfail_var_unsupported(request, execution_mode)
+        if num_groups == 8 and dtype == torch.float16:
+            if execution_mode == "eager":
+                strict_xfail(
+                    request,
+                    AssertionError,
+                    "var now decomposes (two-pass, no fp32 upcast); fp16 over "
+                    "N=401408 misses atol=1e-3/rtol=1e-2: max abs diff 0.0547, "
+                    "max rel diff 0.0128, 0.3% of elements",
+                )
+            else:
+                _xfail_cpsat_tie(
+                    request,
+                    "fails with max abs diff 0.0547 vs atol 1e-3 at 72 and 1 "
+                    "workers, passes on CI (10 workers)",
+                )
+        elif (
+            num_groups == 32 and dtype == torch.float16 and execution_mode == "compiled"
+        ):
+            _xfail_cpsat_tie(
+                request,
+                "split 8x4 gives 93/102760448 mismatched elements (max abs "
+                "0.0273 vs atol 1e-3), split 32x1 passes",
+            )
 
         eps = 1e-5
 
@@ -370,8 +387,6 @@ class TestNormalizationScalarOperations:
 
     def test_groupnorm_affine(self, request, execution_mode):
         """Test GroupNorm with affine transformation."""
-        _xfail_var_unsupported(request, execution_mode)
-
         eps = 1e-5
         num_groups = 32
         num_channels = 64
@@ -396,8 +411,13 @@ class TestNormalizationScalarOperations:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
     def test_instancenorm_2d(self, request, execution_mode, dtype):
         """Test 2D InstanceNorm with epsilon constant."""
-        _xfail_var_unsupported(request, execution_mode)
-
+        if dtype == torch.float16 and execution_mode == "compiled":
+            _xfail_cpsat_tie(
+                request,
+                "passes at 72 and 1 workers, fails on CI (10 workers) with "
+                "115524/102760448 mismatched elements (max abs 0.0586 vs atol "
+                "1e-3)",
+            )
         eps = 1e-5
 
         def instancenorm(x):
@@ -411,8 +431,6 @@ class TestNormalizationScalarOperations:
 
     def test_instancenorm_1d(self, request, execution_mode):
         """Test 1D InstanceNorm variant."""
-        _xfail_var_unsupported(request, execution_mode)
-
         eps = 1e-5
 
         def instancenorm_1d(x):
@@ -425,8 +443,6 @@ class TestNormalizationScalarOperations:
 
     def test_instancenorm_3d(self, request, execution_mode):
         """Test 3D InstanceNorm variant."""
-        _xfail_var_unsupported(request, execution_mode)
-
         eps = 1e-5
 
         def instancenorm_3d(x):
@@ -439,8 +455,6 @@ class TestNormalizationScalarOperations:
 
     def test_instancenorm_affine(self, request, execution_mode):
         """Test InstanceNorm with affine transformation."""
-        _xfail_var_unsupported(request, execution_mode)
-
         eps = 1e-5
         num_channels = 64
 
@@ -495,8 +509,6 @@ class TestModelScalarOperations:
 
     def test_layernorm_last_dim_eps1e12(self, request, execution_mode):
         """Last-dim layernorm with ``eps=1e-12`` (BERT-like 3D shape); not ``nn.LayerNorm``."""
-        _xfail_var_unsupported(request, execution_mode)
-
         eps = 1e-12
 
         def bert_layernorm(x):
