@@ -53,6 +53,15 @@ void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
  */
 at::Tensor spyre_fill_tensor(const at::Tensor& self, double value);
 
+// The SpyreTensorImpl behind a Spyre tensor, or an error for a tensor without
+// one. A view(dtype) of a Spyre tensor (t.view(torch.uint8)) shares the
+// storage but not the device layout: it is not a tracked view and its
+// TensorImpl is a plain TensorImpl, so a static_cast would read past it.
+// `op` names the operation ("copies", "fill_/zero_") and `advice` ends the
+// message with what to do instead.
+SpyreTensorImpl* spyre_impl_or_reject(const at::TensorBase& tensor,
+                                      const char* op, const char* advice);
+
 class SpyreTensorLayout;
 at::Tensor spyre_empty_with_layout(
     c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,

@@ -1161,6 +1161,20 @@ def test_dtype_view_of_sharded_fails_closed():
 
 @requires_emulation
 @expects_raise
+def test_uint8_view_of_sharded_fails_closed():
+    """A byte view changes the sizes, so it is not the base's shape either;
+    the copy must name the dtype view and leave the tensor unchanged."""
+    n = num_shards()
+    cpu = (torch.arange(4 * n * 64) % 1024).reshape(4 * n, 64).to(torch.float16)
+    a = _sharded(cpu, 0, n)
+
+    with pytest.raises(RuntimeError, match="dtype view of a sharded Spyre tensor"):
+        a.view(torch.uint8).cpu()
+    assert torch.equal(a.cpu(), cpu)
+
+
+@requires_emulation
+@expects_raise
 def test_resize_and_set_of_sharded_tensor_fail_closed():
     """resize_/set_ must not silently corrupt or un-shard sharded storage.
 
