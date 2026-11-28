@@ -314,7 +314,10 @@ module {
 
     def test_two_divided_symbols_read_the_id_as_mixed_radix(self):
         """``d0`` takes ``id // 4`` and ``d1`` takes ``id % 4`` of an 8-core grid,
-        from the one tile id -- the plan's ``inner`` and ``div`` spelled out."""
+        from the one tile id -- the plan's ``inner`` and ``div`` spelled out.
+
+        Signed, because dbo-opt cannot work out a core's offset into a symbolic
+        start address through ``divui`` or ``remui``."""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir(
@@ -322,8 +325,10 @@ module {
         )
         self.assertIn("attributes {grid = [8]}", emitted)
         self.assertEqual(emitted.count("get_compute_tile_id"), 1)
-        self.assertIn("arith.divui", emitted)
-        self.assertIn("arith.remui", emitted)
+        self.assertRegex(emitted, r"arith\.divsi %0, %c4\b")
+        self.assertRegex(emitted, r"arith\.remsi %0, %c4_0\b")
+        self.assertNotIn("arith.divui", emitted)
+        self.assertNotIn("arith.remui", emitted)
 
 
 @unittest.skipUnless(
