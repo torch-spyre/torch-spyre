@@ -330,6 +330,11 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
                 "live across multi-output extern kernel",
             ),
             (
+                "collective",
+                "_collective_accesses_buffer",
+                "read by a collective",
+            ),
+            (
                 "indirect",
                 "_is_index_or_indirectly_accessed",
                 "index tensor or indirectly accessed",
@@ -363,7 +368,8 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
                 stack.enter_context(
                     allocator_module.config.patch(
                         lx_planner_relayout=False,
-                        enable_lx_context_switching=rule == "multi_output_extern",
+                        enable_lx_context_switching=rule
+                        in ("multi_output_extern", "collective"),
                     )
                 )
                 for name in (
@@ -372,6 +378,7 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
                     "_is_read_advancing_anywhere",
                     "_extern_kernel_in_live_range",
                     "_multi_output_extern_kernel_in_live_range",
+                    "_collective_accesses_buffer",
                     "buffer_not_read_in_full",
                     "_would_produce_lx_back_gap",
                 ):
@@ -443,6 +450,67 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
                 )
                 if rule != "back_gap":
                     late.assert_not_called()
+
+    def test_a_collective_input_stays_in_hbm_under_lx_context_switching(self):
+        """torch-spyre#6563: the wrapper calls the collective on its operand's HBM
+        storage, so an LX plan for that operand leaves the name unallocated."""
+        from torch_spyre._inductor.ir import AllReduceKernel, WaitKernel
+
+        op = _computed_buffer((64, 64), name="buf")
+        graph = _residency_graph(op)
+        common = {
+            "graph": graph,
+            "name": "buf",
+            "uses": [0, 1],
+            "op": op,
+            "mutated_buffers": set(),
+            "graph_output_names": set(),
+            "reinterpret_output_names": set(),
+            "ncores": {"buf": 32},
+            "ncores_reasons": {},
+            "division_is_fixed": False,
+            "buf_user_deps": {},
+        }
+        for cls in (AllReduceKernel, WaitKernel):
+            with self.subTest(reader=cls.__name__):
+                graph.operations[1] = MagicMock(spec=cls)
+                self.assertTrue(
+                    allocator_module._collective_accesses_buffer(graph, [0, 1])
+                )
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    allocator_module, "clone_at_graph_boundaries", return_value=True
+                )
+            )
+            for name in (
+                "_is_tiled_advancing",
+                "_is_read_advancing_anywhere",
+                "buffer_not_read_in_full",
+                "_would_produce_lx_back_gap",
+            ):
+                stack.enter_context(
+                    patch.object(allocator_module, name, return_value=False)
+                )
+            for name, value in (
+                ("_op_output_good_for_lx_reuse", True),
+                ("_is_index_or_indirectly_accessed", False),
+                ("_restickify_barrier", None),
+            ):
+                stack.enter_context(
+                    patch.object(self.allocator, name, return_value=value)
+                )
+            reason = self.allocator._buffer_residency_reason
+            with allocator_module.config.patch(enable_lx_context_switching=True):
+                self.assertEqual(reason(**common), "read by a collective")
+                # A validated drain plan repoints the collective at an HBM copy.
+                self.assertIsNone(reason(**common, drain_plans={"buf"}))
+            with allocator_module.config.patch(enable_lx_context_switching=False):
+                # The extern guard covers it when the flag is off.
+                self.assertEqual(
+                    reason(**common),
+                    "extern kernel user or live across extern kernel",
+                )
 
     @staticmethod
     def _tagged_carry(name="carry"):

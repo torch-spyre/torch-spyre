@@ -35,6 +35,7 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
     ReinterpretView,
+    _CollectiveKernel,
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -314,6 +315,23 @@ def _multi_output_extern_kernel_in_live_range(
         if outputs is not None and len(outputs) > 1:
             return True
     return False
+
+
+def _collective_accesses_buffer(graph: GraphLowering, uses: list[int]) -> bool:
+    """True if a collective or a wait reads or reduces the buffer in place.
+
+    Collectives run in spyre-comms on the buffer's HBM storage. With
+    config.enable_lx_context_switching on, the extern guard is off and
+    ``LxContextSwitchingPass`` skips collectives, so nothing else keeps such a
+    buffer out of LX: the wrapper then names a buffer it never allocated
+    (torch-spyre#6563). A validated drain plan, which repoints the collective at
+    an HBM copy, is the one exception (see the residency rule).
+
+    Only the ops that access the buffer matter, not its whole live range as in
+    :func:`_extern_kernel_in_live_range`: a collective never uses LX, so one that
+    runs while the buffer is resident cannot overwrite it.
+    """
+    return any(isinstance(graph.operations[i], _CollectiveKernel) for i in uses)
 
 
 def _loop_carry_mutation_target(
@@ -978,6 +996,13 @@ class _BufferResidencyChecks:
             and _multi_output_extern_kernel_in_live_range(self.graph, self.uses)
         ):
             return "live across multi-output extern kernel"
+        return None
+
+    def collective(self) -> Optional[str]:
+        if config.enable_lx_context_switching and _collective_accesses_buffer(
+            self.graph, self.uses
+        ):
+            return "read by a collective"
         return None
 
     def indirect(self) -> Optional[str]:

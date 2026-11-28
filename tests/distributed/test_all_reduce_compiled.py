@@ -169,6 +169,12 @@ def _split_k_then_squeezed_allreduce(x: torch.Tensor, y: torch.Tensor) -> torch.
     return torch.ops._c10d_functional.wait_tensor(reduced) * 2.0
 
 
+def _matmul_then_allreduce(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A TP row-parallel linear: the matmul output is the all_reduce_ operand."""
+    reduced = torch.ops._c10d_functional.all_reduce(x @ w, "sum", _GROUP_NAME)
+    return torch.ops._c10d_functional.wait_tensor(reduced) * 2.0
+
+
 def _loop_update_allocations(source: str) -> list[str]:
     """Allocation kinds of the carry update, the first ``add`` in the LoopSpec."""
     loop = source[source.index("LoopSpec(") :]
@@ -456,6 +462,57 @@ class TestAllReduceCompiled(TestCase):
                 f"Rank {self.comm_rank}: iteration {iteration} incorrect. "
                 f"Expected {expected_val}, got {result[0].to('cpu').item()}",
             )
+
+    def test_allreduce_operand_stays_in_hbm_under_lx_context_switching(self):
+        """The residency check keeps a collective's operand out of LX.
+
+        With context switching on, the extern guard is off and the switching pass
+        skips collectives. Without the collective rule the check cleared the
+        operand for LX, and a plan that kept it there left the wrapper calling
+        ``allreduce_run`` on a buffer it never allocated (#6563).
+        """
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+
+        g = torch.Generator().manual_seed(0)
+        x = torch.randint(0, 2, (64, 256), generator=g).half()
+        w = torch.randint(0, 2, (256, 128), generator=g).half()
+        scale = self.comm_rank + 1
+        rank_sum = self.comm_size * (self.comm_size + 1) / 2
+        expected = (x.float() @ w.float()) * rank_sum * 2.0
+
+        reasons = []
+        check = ScratchpadAllocator._buffer_residency_reason
+
+        def record(allocator, graph, name, *args, **kwargs):
+            reason = check(allocator, graph, name, *args, **kwargs)
+            reasons.append((name, reason))
+            return reason
+
+        compiled = torch.compile(_matmul_then_allreduce, fullgraph=True)
+        with (
+            spyre_config.patch(
+                {
+                    "lx_planning": True,
+                    "co_optimizing_lx_planning": True,
+                    "enable_lx_context_switching": True,
+                }
+            ),
+            patch.object(ScratchpadAllocator, "_buffer_residency_reason", record),
+        ):
+            result, sources = run_and_get_code(
+                compiled, (x * scale).to(DEVICE), w.to(DEVICE)
+            )
+
+        torch.testing.assert_close(result.cpu().float(), expected, atol=0, rtol=0)
+        source = "\n".join(sources)
+        operands = re.findall(r"allreduce_run\((buf\d+)", source)
+        self.assertEqual(len(operands), 1, source)
+        (operand,) = operands
+        self.assertRegex(source, rf"(?m)^\s*{operand} = spyre_empty")
+        self.assertEqual(
+            {reason for name, reason in reasons if name == operand},
+            {"read by a collective"},
+        )
 
     def test_allreduce_of_loop_carry_keeps_carry_in_lx(self):
         """A loop accumulator reduced across ranks stays in LX while it accumulates.
