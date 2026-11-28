@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <flex/flex.hpp>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -536,6 +537,85 @@ flex::HostComputeBuffer* SpyreStream::launchHostCompute(
   return resolveRuntimeHandle()->launchOperation(params);
 }
 
+std::shared_ptr<flex::CorrectionReservation> SpyreStream::reserveCorrections(
+    const std::vector<size_t>& sizes) const {
+  RECORD_FUNCTION("launch::ReserveCorrections", {});
+  return resolveRuntimeHandle()->reserveCorrections(sizes);
+}
+
+size_t SpyreStream::correctionArenaCapacity() const {
+  return resolveRuntimeHandle()->correctionArenaCapacity();
+}
+
+void SpyreStream::validateCorrectionSizes(const std::vector<size_t>& sizes) const {
+  resolveRuntimeHandle()->validateCorrectionSizes(sizes);
+}
+
+flex::PerStreamCorrectionArena::Usage SpyreStream::correctionArenaUsage() const {
+  return resolveRuntimeHandle()->correctionArenaUsage();
+}
+
+namespace {
+
+using CorrectionKey = std::pair<uint64_t, uint64_t>;
+
+// Launches that share a correction destination write the same device storage,
+// so they must not interleave their upload and consumer admission. One mutex
+// per destination (region id, offset). Entries live for the process.
+std::shared_ptr<std::mutex> correctionDestinationMutex(
+    const CorrectionKey& key) {
+  static std::mutex registry_mutex;
+  static std::map<CorrectionKey, std::shared_ptr<std::mutex>> registry;
+  std::lock_guard<std::mutex> lock(registry_mutex);
+  auto& entry = registry[key];
+  if (!entry) {
+    entry = std::make_shared<std::mutex>();
+  }
+  return entry;
+}
+
+// Holds the destination mutexes of one run of HostCompute steps until the
+// consuming compute has been admitted. Mutexes are taken in key order, so two
+// launches with overlapping destinations cannot deadlock.
+// Lifetime: the caller calls release() explicitly right after the Compute step
+// that consumes the corrections has been admitted. If anything throws before
+// that point, the destructor releases the mutexes, so they are never leaked.
+class CorrectionDestinationLock {
+ public:
+  void acquire(const JobPlan& plan, size_t begin, size_t end) {
+    release();
+    std::map<CorrectionKey, std::shared_ptr<std::mutex>> mutexes;
+    for (size_t i = begin; i < end; ++i) {
+      const auto key =
+          static_cast<const JobPlanStepHostCompute&>(*plan.steps[i])
+              .destinationKey();
+      mutexes.emplace(key, correctionDestinationMutex(key));
+    }
+    // Recording a successfully acquired mutex must not allocate and throw.
+    held_.reserve(mutexes.size());
+    for (auto& [key, mutex] : mutexes) {
+      mutex->lock();
+      held_.push_back(mutex);
+    }
+  }
+
+  void release() {
+    for (auto it = held_.rbegin(); it != held_.rend(); ++it) {
+      (*it)->unlock();
+    }
+    held_.clear();
+  }
+
+  ~CorrectionDestinationLock() {
+    release();
+  }
+
+ private:
+  std::vector<std::shared_ptr<std::mutex>> held_;
+};
+
+}  // namespace
+
 void SpyreStream::launch(const JobPlan& plan,
                          const std::vector<at::Tensor>& args,
                          std::vector<SymbolicArg> symbolic_args) const {
@@ -572,6 +652,7 @@ void SpyreStream::launch(const JobPlan& plan,
   // This switch controls stream splitting only: eligible correction batching is
   // enabled in both topologies, including the single-stream path.
   const bool should_split = get_hazard_tracker_enabled();
+  CorrectionDestinationLock destination_lock;
   for (size_t i = 0; i < plan.steps.size(); ++i) {
     const auto& step = plan.steps[i];
     const auto kind = classifyStep(*step);
@@ -582,22 +663,51 @@ void SpyreStream::launch(const JobPlan& plan,
                                      step->role() == StreamRole::Prep);
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(kind != StepKind::Compute ||
                                      step->role() == StreamRole::Dev);
-    if (max_corrections > 0 && kind == StepKind::HostCompute &&
+    const SpyreStream& target =
+        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+    if (kind == StepKind::HostCompute &&
         (i == 0 || classifyStep(*plan.steps[i - 1]) != StepKind::HostCompute)) {
       size_t end = i + 1;
       while (end < plan.steps.size() &&
              classifyStep(*plan.steps[end]) == StepKind::HostCompute) {
         ++end;
       }
-      // Flex reports the supported correction count for the consuming stream.
-      // Keep the whole group on separate uploads when it cannot be batched.
-      ctx.batch_program_corrections =
-          end - i <= max_corrections && end < plan.steps.size() &&
-          classifyStep(*plan.steps[end]) == StepKind::Compute;
+      // Preflight the entire group, including the separate-upload fallback,
+      // before any producer can reserve storage or submit an upload.
+      std::vector<size_t> sizes;
+      sizes.reserve(end - i);
+      for (size_t j = i; j < end; ++j) {
+        const auto& host_compute =
+            static_cast<const JobPlanStepHostCompute&>(*plan.steps[j]);
+        host_compute.validateDestination();
+        sizes.push_back(host_compute.correctionSize());
+      }
+      target.validateCorrectionSizes(sizes);
+
+      // Hold the destinations until the consuming compute is admitted.
+      destination_lock.acquire(plan, i, end);
+
+      // Reserve the whole group at once, but only if it can be batched and fits
+      // in the arena. Otherwise each step reserves its own buffer and uploads
+      // before the next reservation, so no partial group is ever held while
+      // waiting.
+      ctx.batch_program_corrections = false;
+      ctx.correction_reservation.reset();
+      ctx.next_correction = 0;
+      const size_t count = end - i;
+      const size_t batch_limit =
+          std::min(max_corrections, target.correctionArenaCapacity());
+      if (max_corrections > 0 && end < plan.steps.size() &&
+          classifyStep(*plan.steps[end]) == StepKind::Compute &&
+          count <= batch_limit) {
+        ctx.correction_reservation = target.reserveCorrections(sizes);
+        ctx.batch_program_corrections = true;
+      }
     }
-    const SpyreStream& target =
-        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
     step->construct(ctx, target);
+    if (kind == StepKind::Compute) {
+      destination_lock.release();
+    }
   }
   TORCH_CHECK(ctx.program_corrections.empty(),
               "Program correction has no consuming compute step");
