@@ -47,6 +47,7 @@ from .padding import (
     insert_bmm_padding,
     insert_restickify_padding,
     insert_staggered_ea_padding,
+    track_padding_value,
 )
 from .reserved_dims_contract import apply_reserved_dims_contract
 from .temp_passes import (
@@ -617,6 +618,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             reorder_nonstick_dims,
             finalize_layouts,
+            track_padding_value,
             # insert_restickify's advance-transfer logic (see its own
             # docstring) branches on whether old_name is already in a loop
             # (`is_looped`), to decide whether the per-trip advance belongs

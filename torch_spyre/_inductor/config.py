@@ -626,6 +626,10 @@ _cache_config_ignore_prefix: list[str] = [
     "precomputed_kernel_key",
 ]
 
+# Strict mode assumes that a block of uninitialized memory contains NaN
+# values, that will corrupt matmuls and potentially other operations
+padding_strict_mode: bool = os.environ.get("PADDING_STRICT_MODE", "0") == "1"
+
 
 def _precomputed_kernel_key_from_env() -> str:
     value = os.environ.get("TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY", "0")

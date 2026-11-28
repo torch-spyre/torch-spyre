@@ -89,6 +89,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "non_unified_shard_bytes": "int",
     "non_unified_shard_dim": "Symbol | None",
     "stride_map": "list[int] | None",
+    "mask_value": "float | None",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",

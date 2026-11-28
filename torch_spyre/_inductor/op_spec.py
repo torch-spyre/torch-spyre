@@ -334,6 +334,7 @@ class TensorArg:
             symbol captured at planning time can be renamed by scheduling);
             the SDSC layer maps it to the emitted dim label alongside every
             other symbol.
+        mask_value: value to be used to for coordinate masking, if not None
     """
 
     is_input: bool
@@ -353,6 +354,7 @@ class TensorArg:
     non_unified_shard_bytes: int = 0
     non_unified_shard_dim: Symbol | None = None
     stride_map: list[int] | None = None
+    mask_value: float | None = None
 
     @property
     def non_unified(self) -> bool:

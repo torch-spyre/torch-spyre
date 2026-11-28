@@ -14,6 +14,7 @@ __all__: list[str] = [
     "ElementArrangement",
     "SpyreStreamError",
     "SpyreDeviceState",
+    "PADDING",
     "SpyreTensorLayout",
     "SymbolicArg",
     "SymbolicArgKind",
@@ -56,6 +57,7 @@ __all__: list[str] = [
     "set_downcast_warning",
     "set_spyre_tensor_layout",
     "spyre_empty_reserved",
+    "set_tensor_padding_value",
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
@@ -211,6 +213,22 @@ class ElementArrangement:
     @property
     def value(self) -> int: ...
 
+class PADDING:
+    """
+    Members:
+
+      UNINITIALIZED
+
+      CONSTANT
+    """
+
+    CONSTANT: typing.ClassVar[PADDING]  # value = <PADDING.CONSTANT: 1>
+    UNINITIALIZED: typing.ClassVar[PADDING]  # value = <PADDING.UNINITIALIZED: 0>
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
 class SpyreTensorLayout:
     def __hash__(self) -> int: ...
     def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore[override]
@@ -254,6 +272,15 @@ class SpyreTensorLayout:
     def stride_map(self) -> list[int]: ...
     @property
     def valid_elements(self) -> dict[tuple[int, ...], int]: ...
+    @property
+    def padding(self) -> PADDING: ...
+    # The constant padding value, or None when the padding is uninitialized.
+    # Any device_dtype and element arrangement can record one; fp16 and fp32
+    # round it to device_dtype. Assigning None resets it to uninitialized.
+    @property
+    def padding_value(self) -> float | None: ...
+    @padding_value.setter
+    def padding_value(self, value: float | None) -> None: ...
 
 class _SpyreStreamBase:
     """
@@ -586,6 +613,7 @@ def set_downcast_warning(arg0: bool) -> None:
     """
 
 def set_spyre_tensor_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None: ...
+def set_tensor_padding_value(tensor: torch.Tensor, value: float | None) -> None: ...
 def spyre_empty_reserved(
     size: tuple[int, ...],
     stride: tuple[int, ...],
@@ -602,6 +630,7 @@ def spyre_empty_reserved(
     stored on the tensor for the runtime resize_ guard to check. Backs
     tensor.to("spyre", dynamic={dim: {min, max, granularity}}).
     """
+    ...
 
 def spyre_empty_reserved_with_layout(
     size: tuple[int, ...],

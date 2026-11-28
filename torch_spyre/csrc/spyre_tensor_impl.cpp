@@ -20,8 +20,13 @@
 #include <c10/core/DispatchKeySet.h>
 #include <c10/util/safe_numerics.h>
 #include <util/sendefs/dataType.h>
+#include <util/sendefs/numeric_convert.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -204,8 +209,48 @@ std::string SpyreTensorLayout::toString() const {
     ss << "): " << size;
   }
   ss << "}";
+  // Emitted as a constructor keyword so that repr() round-trips through eval()
+  // in generated wrapper code.
+  if (auto value = this->constant_padding_value(); value.has_value()) {
+    ss << ", padding_value=";
+    if (std::isnan(*value)) {
+      ss << "float('nan')";
+    } else if (std::isinf(*value)) {
+      ss << (*value > 0 ? "float('inf')" : "float('-inf')");
+    } else {
+      ss << std::setprecision(std::numeric_limits<double>::max_digits10)
+         << *value;
+    }
+  }
   ss << ")";
   return ss.str();
+}
+
+void SpyreTensorLayout::set_constant_padding(double value) {
+  // Any element arrangement and device_dtype can record a constant: every
+  // padding lane holds the same value, so neither the lane order nor the
+  // element encoding changes it. Ops that change the arrangement (dl16->fp32)
+  // forward the padding as it is.
+  switch (this->device_dtype) {
+    case DataFormats::SEN169_FP16:
+      value = deeptools::Fp16BinToFloat(
+          deeptools::FloatToFp16Bin(static_cast<float>(value)));
+      break;
+    case DataFormats::IEEE_FP32:
+      value = static_cast<float>(value);
+      break;
+    default:
+      break;
+  }
+  this->padding = PADDING::CONSTANT;
+  this->padding_value = value;
+}
+
+std::optional<double> SpyreTensorLayout::constant_padding_value() const {
+  if (this->padding != PADDING::CONSTANT) {
+    return std::nullopt;
+  }
+  return this->padding_value;
 }
 
 SpyreTensorImpl::SpyreTensorImpl(c10::Storage&& storage,
@@ -252,8 +297,9 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
       return r;
     }
   }
-  auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
-                                                   data_type_, spyre_layout);
+  // A detached tensor aliases this storage: see without_padding().
+  auto impl = c10::make_intrusive<SpyreTensorImpl>(
+      storage_, key_set_, data_type_, spyre_layout.without_padding());
   impl->dma_sizes = this->dma_sizes;
   impl->dma_strides = this->dma_strides;
   impl->reserved_dims = this->reserved_dims;
@@ -341,6 +387,28 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
     TORCH_CHECK(false,
                 "Error: Attempting to set a STL for a device tensor that does "
                 "not have SpyreTensorImpl");
+  }
+}
+
+void set_tensor_padding_value(const at::Tensor& tensor,
+                              std::optional<double> value) {
+  TORCH_CHECK(tensor.is_privateuseone());
+  auto* impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  TORCH_CHECK(impl != nullptr,
+              "set_tensor_padding_value: device tensor has no SpyreTensorImpl");
+  if (tensor.is_view()) {
+    const at::TensorBase& base = tensor._base();
+    if (base.defined() && base.is_privateuseone()) {
+      if (auto* base_impl =
+              dynamic_cast<SpyreTensorImpl*>(base.unsafeGetTensorImpl())) {
+        base_impl->spyre_layout.clear_padding();
+      }
+    }
+  }
+  if (value.has_value()) {
+    impl->spyre_layout.set_constant_padding(*value);
+  } else {
+    impl->spyre_layout.clear_padding();
   }
 }
 
