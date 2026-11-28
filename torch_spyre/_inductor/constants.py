@@ -132,6 +132,11 @@ COPY_BACK_CANDIDATE_ATTR = "_spyre_copy_back_candidate"
 # compute mutation op from a pure-copy mutation op.
 ELIDED_COPY_BACK_ATTR = "_spyre_writes_copy_back_target"
 
+# Set on the relayout copy enforce_indirect_access_layout inserts ahead of a
+# gather. The copy touches the whole value tensor, so for a large table it is
+# the copy, not the gather, whose per-core span overflows.
+INDIRECT_RELAYOUT_ATTR = "_spyre_indirect_access_relayout"
+
 SEGMENT_OFFSETS = [
     0x0,
     0x400000000,

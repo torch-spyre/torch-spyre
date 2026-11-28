@@ -80,6 +80,7 @@ from .core_mapping import (
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
     INDEX_MASKING_OPS,
+    INDIRECT_RELAYOUT_ATTR,
     MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
@@ -137,6 +138,9 @@ _SPYRE_METADATA_ATTRS = (
     # passes find them by this tag, and must still see it after any
     # rebuild of the buffer (e.g. when its input is redirected).
     "ea_shuffle",
+    # Marks the relayout copy that feeds a gather; span-overflow planning finds
+    # the copy by this tag, so a rebuild of it must keep the tag.
+    INDIRECT_RELAYOUT_ATTR,
 )
 
 
@@ -1749,6 +1753,10 @@ def _build_indirect_load_subs(
         return {}, None
     indirect_index_buf_map, indirect_index_size_map = _find_indirect_index_bufs(op)
     dep_by_name = {d.name: d for d in reads}
+    # A loop var is folded into the index without being a ``ranges`` key, so it
+    # looks exactly like an indirect symbol. Exclude it the same way
+    # ``_build_indirect_store_subs`` does for the write side.
+    loop_vars = set(loop_var_ranges_from_dim_hints(op))
     subs = {}
     sizes = {}
     for d in reads:
@@ -1759,7 +1767,9 @@ def _build_indirect_load_subs(
             continue
         indirect_index_dep = dep_by_name[indirect_index_buf]
         size = indirect_index_size_map.get(d.name)
-        indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
+        indirect_syms = [
+            s for s in d.index.free_symbols if s not in d.ranges and s not in loop_vars
+        ]
         if len(indirect_syms) > 1:
             raise Unsupported(f"multiple indirect symbols in {d.name}: {indirect_syms}")
         for sym in indirect_syms:
@@ -2329,7 +2339,10 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
         for d in op_read_writes(op).reads:
             if isinstance(d, MemoryDep) and d.is_indirect():
                 layout = _fixed_read_layout(V.graph.get_buffer(d.name))
-                coords = device_coordinates(layout.device_layout, d, ind_sizes)
+                # Which dims may be split is a per-trip question, so pass ``op``
+                # and read the base index: a tiled table's loop term is an
+                # advance between trips, not a coordinate of its own.
+                coords = device_coordinates(layout.device_layout, d, ind_sizes, op=op)
                 coords_lists.append([c.xreplace(subs) for c in coords])
 
     # Scatter destination: the write, with its runtime-chosen row marked the same

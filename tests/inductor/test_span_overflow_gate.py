@@ -278,6 +278,53 @@ def test_the_current_lowering_on_a_compiled_span_overflow_graph(case):
     assert _relative_error(compiled.outputs, reference) < 2e-2
 
 
+def _seeded_ids(high, shape, seed):
+    """Index values, seeded so the plan and the result do not vary by run."""
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randint(0, high, shape, generator=generator, dtype=torch.int64)
+
+
+def test_a_gather_is_tiled_on_a_data_dim():
+    """A gather no core split can place tiles on the table's data dim.
+
+    44 entries is not a whole number of index sticks, so work division leaves the
+    gather on one core and only a tile brings the span down. One level, and a
+    ``coarse_tile_copy_*`` writes each trip into the full output.
+
+    A gather is a pure copy, so the result is exact against the table as the
+    device holds it; the host tensor differs by the fp16 transfer, which happens
+    before the gather.
+    """
+    table = _shaped((8, 256, 256), 0)
+    idx = _seeded_ids(8, (44,), 7)
+    compiled = compile_span_overflow(lambda t, i: t[i], [table, idx], 2 * MB)
+
+    assert compiled.groups == [(1, ["Pointwise"], [4])], compiled.groups
+    assert _matches(compiled.added, ["op", r"coarse_tile_copy_"]), compiled.added
+    expected = table.to(DEVICE_NAME).cpu().float()[idx]
+    assert (compiled.outputs[0] == expected).all()
+
+
+def test_an_embedding_over_a_plain_tensor_table_is_tiled():
+    """The same, for the relayout copy a plain-tensor table needs.
+
+    A gather reads the indexed dim outermost. A plain tensor arrives in the
+    default layout, so a copy of the whole table is inserted ahead of the gather,
+    and for a large table that copy is what overflows -- the gather itself is
+    tiny. It tiles at one level like any other copy.
+    """
+    weight = _shaped((1024, 2816), 1)
+    ids = _seeded_ids(1024, (1, 8), 9)
+    compiled = compile_span_overflow(
+        lambda i, w: torch.nn.functional.embedding(i, w), [ids, weight], 1 * MB
+    )
+
+    assert compiled.groups == [(1, ["Pointwise"], [8])], compiled.groups
+    assert _matches(compiled.added, ["op", r"coarse_tile_copy_"]), compiled.added
+    on_device = weight.to(DEVICE_NAME).cpu().float()
+    assert (compiled.outputs[0] == torch.nn.functional.embedding(ids, on_device)).all()
+
+
 @expects_raise
 def test_a_two_level_group_is_rejected():
     """A matmul too large for one level nests two (``[4, 4]``). The lowering builds

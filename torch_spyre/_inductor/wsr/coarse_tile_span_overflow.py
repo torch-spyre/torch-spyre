@@ -39,6 +39,7 @@ from .coarse_tile import _loop_var_to_reduction_ranges_pos
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
     _bmm_k_symbol,
+    _is_indirect_access_related,
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
@@ -440,12 +441,9 @@ def span_overflow_groups(
     """
     from .. import config
 
-    if config.ignore_span_overflow_hints:
-        logger.debug(
-            "[span-overflow groups] disabled ignore_span_overflow_hints=%s",
-            config.ignore_span_overflow_hints,
-        )
-        return [], []
+    # Indirect access is considered even with hints off: work division cannot
+    # bring a large one under the span limit. Every other op waits for the opt-in.
+    indirect_only = config.ignore_span_overflow_hints
 
     logger.debug(
         "[span-overflow groups] begin ops=%d sencores=%s",
@@ -546,6 +544,9 @@ def span_overflow_groups(
             flush_current_group()
             continue
         if getattr(op, "dim_hints", []):
+            flush_current_group()
+            continue
+        if indirect_only and not _is_indirect_access_related(op):
             flush_current_group()
             continue
 
