@@ -30,6 +30,11 @@ from torch.fx.experimental.symbolic_shapes import ConstraintViolationError
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
+from torch_spyre._inductor.constants import (
+    FP8_E4M3FN_MAX,
+    FP8_E4M3FN_MIN,
+    QUANTSCALEPERTOKENFP8_CLIP_MIN,
+)
 from torch_spyre.ops.eager import (
     _DYNAMO_DYNAMIC_MARKS,
     _has_dynamo_marks,
@@ -193,6 +198,77 @@ class TestOtherEagerOpsOnDeclaredTensor(TestCase):
                     F.gelu(x).cpu(), F.gelu(cpu), rtol=1e-2, atol=1e-2
                 )
                 self.assertIn(0, x._dynamo_dynamic_indices)
+
+
+class TestFp8OpsOnDeclaredTensor(TestCase):
+    """The fp8 custom ops (#6490). Their ``compile_once`` did not pass
+    ``dynamic=False``, so they compiled with plain ``torch.compile``, which
+    keeps the marks: on a declared input, quantscalepertokenfp8 and
+    dequantize_fp8_with_scale failed with ``InductorError: ... iteration space
+    has size s33``, and both quantize ops with ``InductorError: ... symbolic
+    stick dim d0 is not supported yet``.
+
+    The rows are 128 wide, one full fp8 stick: a narrower fp8 row is
+    stick-unaligned, which is not supported yet (#3999).
+    """
+
+    DECLARATION = {0: {"min": 16, "max": 64, "granularity": 16}}
+    COLS = 128
+    SIZES = [64, 32, 16, 64]
+
+    def _declared(self, rows):
+        cpu = torch.randn(rows, self.COLS, dtype=torch.float16)
+        return cpu, cpu.to(DEVICE, dynamic=self.DECLARATION)
+
+    def test_quantscalepertokenfp8_matches_cpu(self) -> None:
+        for rows in self.SIZES:
+            with self.subTest(rows=rows):
+                cpu, x = self._declared(rows)
+                scale = torch.ops.spyre.quantscalepertokenfp8(x)
+                self.assertIn(0, x._dynamo_dynamic_indices)
+                self.assertFalse(_is_marked(scale))
+                expected = (
+                    cpu.abs().amax(dim=-1, keepdim=True) / FP8_E4M3FN_MAX
+                ).clamp(min=QUANTSCALEPERTOKENFP8_CLIP_MIN)
+                # The device FP16-encodes mulConst = 1 / 448: up to one ULP
+                # (as in test_quantscalepertokenfp8_eager_mode).
+                torch.testing.assert_close(scale.cpu(), expected, atol=1e-3, rtol=0)
+
+    def test_quantize_dequantize_roundtrip_matches_cpu(self) -> None:
+        # Read back through dequantize on the device: an fp8 result has no
+        # direct host check (test_fp8_operations.py does the same). The fp8
+        # tensor that dequantize gets is marked by hand, as .to(dynamic=) would.
+        scale_cpu = torch.ones(1, dtype=torch.float16)
+        scale = scale_cpu.to(DEVICE)
+        for rows in self.SIZES:
+            with self.subTest(rows=rows):
+                cpu, x = self._declared(rows)
+                q = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+                self.assertIn(0, x._dynamo_dynamic_indices)
+                self.assertFalse(_is_marked(q))
+                torch._dynamo.mark_dynamic(q, 0, min=16, max=64)
+                out = torch.ops.spyre.dequantize_fp8_with_scale(q, scale)
+                self.assertIn(0, q._dynamo_dynamic_indices)
+                expected = (cpu / scale_cpu).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
+                    torch.float8_e4m3fn
+                ).to(torch.float16) * scale_cpu
+                # The device rounds to DLFloat16 before FP8, so a value next to
+                # a midpoint can land one E4M3 step (12.5%) away, and FP8
+                # subnormals (below 2**-6) differ (test_qfp8ch_basic_conversion).
+                torch.testing.assert_close(out.cpu(), expected, atol=2**-6, rtol=0.125)
+
+    def test_quantize_weight_returns_fp8(self) -> None:
+        # The qfp8wt layout cannot be read back for a value check, see
+        # test_quantize_weight_fp8_with_scale_eager_mode_dtype_only.
+        scale = torch.ones(1, dtype=torch.float16).to(DEVICE)
+        for rows in self.SIZES:
+            with self.subTest(rows=rows):
+                _, w = self._declared(rows)
+                q = torch.ops.spyre.quantize_weight_fp8_with_scale(w, scale)
+                self.assertEqual(q.dtype, torch.float8_e4m3fn)
+                self.assertEqual(tuple(q.shape), (rows, self.COLS))
+                self.assertIn(0, w._dynamo_dynamic_indices)
+                self.assertFalse(_is_marked(q))
 
 
 class TestUserCompileStaysStrict(TestCase):

@@ -971,7 +971,7 @@ def _(input: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre"
 )
-@compile_once("spyre.quantscalepertokenfp8")
+@compile_once("spyre.quantscalepertokenfp8", dynamic=False)
 def quantscalepertokenfp8(
     input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX, compiled=None
 ) -> torch.Tensor:
@@ -1032,7 +1032,7 @@ def _(input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-@compile_once("spyre.quantize_fp8_with_scale")
+@compile_once("spyre.quantize_fp8_with_scale", dynamic=False)
 def quantize_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor, compiled
 ) -> torch.Tensor:
@@ -1066,7 +1066,7 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-@compile_once("spyre.quantize_weight_fp8_with_scale")
+@compile_once("spyre.quantize_weight_fp8_with_scale", dynamic=False)
 def quantize_weight_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor, compiled
 ) -> torch.Tensor:
@@ -1097,7 +1097,7 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::dequantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-@compile_once("spyre.dequantize_fp8_with_scale")
+@compile_once("spyre.dequantize_fp8_with_scale", dynamic=False)
 def dequantize_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor, compiled
 ) -> torch.Tensor:
