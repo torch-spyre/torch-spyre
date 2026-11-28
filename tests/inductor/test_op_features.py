@@ -283,19 +283,28 @@ class SymbolicTiledFeatureTest(TestCase):
         self.assertGreater(checked, 10)
 
     def test_the_tiled_cost_expression_stays_linearizable(self):
-        """``_SympyExprToCpSat`` handles Add/Mul/Min/Max and ``symbol**-1`` only.
+        """``_SympyExprToCpSat`` linearizes Add/Mul/Min/Max, ``symbol**-1``, and a
+        ``Piecewise`` whose arms are linear and whose conditions it can turn into
+        literals.
 
         A symbolic derate would be a ``Piecewise`` over a fractional ``Pow``,
         which does not linearize -- CP-SAT then discards the WHOLE cost
         objective and falls back to its lexicographic solve, so neutralising the
-        derate is what keeps the objective usable, not a shortcut around it.
+        derate is what keeps the objective usable, not a shortcut around it. The
+        one ``Piecewise`` allowed here branches on residency alone: an op's
+        effective bandwidth can depend on which of its args are in HBM.
         """
         for _, _, b in _entries():
             raw = next((f for f in b["features"] if f is not None), None)
             if raw is None:
                 continue
             expr = sympy.sympify(predict_ops([self._symbolize(op_from_dict(raw))]))
-            self.assertFalse(expr.atoms(sympy.Piecewise))
+            for piecewise in expr.atoms(sympy.Piecewise):
+                for _, cond in piecewise.args:
+                    self.assertFalse(
+                        self._leaked_symbols(cond),
+                        f"a Piecewise branches on more than residency: {cond}",
+                    )
             for pow_ in expr.atoms(sympy.Pow):
                 self.assertEqual(pow_.exp, -1, f"non-invertible power {pow_}")
 
