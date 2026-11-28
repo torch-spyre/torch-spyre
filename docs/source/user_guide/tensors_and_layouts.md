@@ -665,6 +665,15 @@ What is refused, with an error naming `for_each_tile`:
   itself. Such a kernel can only be built for one size, so instead of running
   and returning wrong values at every other size it does not compile. Tile it
   with `for_each_tile` as above.
+- A start position computed from the declared size, such as
+  `y.narrow(0, y.shape[0] - 64, 64)` or `y[-1]`, inside a loop body or not. The
+  binary is built once, so the start would stay where it was at the compile
+  size and read the wrong rows at every other size; instead it does not
+  compile. Reach that part of the tensor through a `for_each_tile` over the
+  declared dimension and carry what you need out of the loop. For example, a
+  body that returns `carry * 0 + tile` as its carry ends holding the last
+  tile. An `inf` in an earlier tile turns that result into NaN, because
+  `inf * 0` is NaN.
 - A `for_each_tile` loop over a dimension that only `torch._dynamo.mark_dynamic`
   made dynamic, with no `dynamic=` declaration. Without the reservation each
   size is a new allocation and a new layout, so there is no one binary to build,

@@ -332,5 +332,150 @@ class TestOneBinaryServesTheRange(unittest.TestCase):
         )
 
 
+def _bounded(rows):
+    torch._check(rows >= MIN_ROWS)
+    torch._check(rows <= MAX_ROWS)
+    torch._check(rows % TILE == 0)
+
+
+def _add_last_tile(q_host, x_host, rows):
+    """Every tile of ``q`` plus the last ``TILE`` rows of ``x``, on the host."""
+    last = x_host[rows - TILE : rows]
+    return torch.cat(
+        [q_host[i : i + TILE] + last for i in range(0, rows, TILE)]
+    ).float()
+
+
+class TestAStartOffsetOnTheDeclaredDim(unittest.TestCase):
+    """A read whose start is computed from the declared size.
+
+    A declared size may only set a loop's trip count, so ``x.narrow(0, n - TILE,
+    TILE)`` has no one-binary build. Before the refusal it compiled at the
+    warm-up size's start and read those rows at every other size: compiled at
+    256 rows, the read at 128 and 192 rows returned rows 192 to 255, with one
+    graph and no error. The refusal is in ``concretize_index``, so it holds with
+    or without a ``for_each_tile`` around the read.
+    """
+
+    def setUp(self):
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+
+    @expects_raise
+    def test_a_tail_read_in_a_loop_body_is_refused(self):
+        """The issue's reproducer: the whole operand read at its own extent.
+
+        TODO: this becomes a positive test if a start that follows a declared
+        size is ever supported. That capability is deferred by design, so the
+        refusal is the decided behaviour until then.
+        """
+
+        def tail(q, x):
+            rows = q.shape[0]
+            _bounded(rows)
+            torch._check(x.shape[0] == rows)
+
+            def body(_carry, tiles):
+                tq, whole = tiles
+                return None, tq + whole.narrow(0, whole.shape[0] - TILE, TILE)
+
+            return for_each_tile(
+                body, (q, x), dims=(0, None), tile_size=TILE, out_dim=0
+            )[1]
+
+        q = _declare(torch.randn(MAX_ROWS, COLS, dtype=torch.float16))
+        x = _declare(torch.randn(MAX_ROWS, COLS, dtype=torch.float16))
+        q.resize_((ROWS, COLS))
+        x.resize_((ROWS, COLS))
+
+        compiled = torch.compile(tail, backend="inductor", fullgraph=True)
+        with pytest.raises(
+            (InductorError, BackendCompilerFailed),
+            match="depends on the declared dimension",
+        ):
+            compiled(q, x)
+
+    @expects_raise
+    def test_a_tail_slice_without_a_loop_is_refused(self):
+        """The same start with no loop at all was stale the same way."""
+
+        def tail(x):
+            rows = x.shape[0]
+            _bounded(rows)
+            return x.narrow(0, rows - TILE, TILE) * 2
+
+        x = _declare(torch.randn(MAX_ROWS, COLS, dtype=torch.float16))
+        x.resize_((ROWS, COLS))
+
+        compiled = torch.compile(tail, backend="inductor", fullgraph=True)
+        with pytest.raises(
+            (InductorError, BackendCompilerFailed),
+            match="depends on the declared dimension",
+        ):
+            compiled(x)
+
+    @expects_raise
+    def test_the_last_row_by_negative_index_is_refused(self):
+        """``x[-1]`` starts at row ``n - 1``, a start that follows the size."""
+
+        def last_row(x):
+            _bounded(x.shape[0])
+            return x[-1] * 2
+
+        x = _declare(torch.randn(MAX_ROWS, COLS, dtype=torch.float16))
+        x.resize_((ROWS, COLS))
+
+        compiled = torch.compile(last_row, backend="inductor", fullgraph=True)
+        with pytest.raises(
+            (InductorError, BackendCompilerFailed),
+            match="depends on the declared dimension",
+        ):
+            compiled(x)
+
+    def test_the_last_tile_carried_out_of_a_loop_serves_the_range(self):
+        """The way to read the last tile without a start offset: a loop over
+        ``x`` whose carry is each tile in turn ends holding the last one, and
+        only the trip count followed the size. ``carry * 0 + tile`` rather than
+        ``tile.clone()``, which does not lower today."""
+
+        def carried(q, x, init):
+            rows = q.shape[0]
+            _bounded(rows)
+            torch._check(x.shape[0] == rows)
+
+            def keep_last(carry, tiles):
+                return carry * 0 + tiles[0], None
+
+            def add(_carry, tiles):
+                tq, last = tiles
+                return None, tq + last
+
+            last, _ = for_each_tile(
+                keep_last, (x,), dims=(0,), tile_size=TILE, init=init
+            )
+            return for_each_tile(
+                add, (q, last), dims=(0, None), tile_size=TILE, out_dim=0
+            )[1]
+
+        counters.clear()
+        q_host = torch.randn(MAX_ROWS, COLS, dtype=torch.float16) / 8
+        x_host = torch.randn(MAX_ROWS, COLS, dtype=torch.float16) / 8
+        q, x = _declare(q_host), _declare(x_host)
+        init = torch.zeros(TILE, COLS, dtype=torch.float16).to(DEVICE_NAME)
+
+        compiled = torch.compile(carried, backend="inductor", fullgraph=True)
+        for rows in SIZES:
+            q.resize_((rows, COLS))
+            x.resize_((rows, COLS))
+            torch.testing.assert_close(
+                compiled(q, x, init).cpu().float(),
+                _add_last_tile(q_host, x_host, rows),
+                atol=ATOL,
+                rtol=RTOL,
+                msg=f"at {rows} rows",
+            )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

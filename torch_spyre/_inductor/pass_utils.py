@@ -1088,6 +1088,42 @@ def loop_induction_symbols(
     )
 
 
+def _refuse_declared_start_offset(index: sympy.Expr, size_syms: set) -> None:
+    """Refuse an index whose start offset follows a declared dimension.
+
+    One binary serves every size in a declared range because the size reaches
+    only a loop's trip count; every address is built once (see
+    :func:`concretize_expr`). A read that starts at ``n - 64`` of a declared
+    ``n`` has no such build: ``concretize_index`` would bake the warm-up call's
+    start into the binary, and the declared maximum is no better, so every other
+    size reads the wrong rows with no error and no recompile. Measured on
+    device: compiled at 256 rows, a read of the last 64 rows at 128 and 192 rows
+    returned rows 192 to 255.
+
+    The start offset is the index with every non-size symbol (loop variables,
+    loop induction and indirect symbols) at zero. A stride that carries the
+    symbol, ``s0 * x0``, has a loop variable in its term and vanishes there, so
+    only a start position is refused. An undeclared symbol keeps the hint, as
+    before: its layout guard recompiles every size.
+
+    Raises:
+        Unsupported: the start offset depends on a declared dimension.
+    """
+    offset = index.xreplace(dict.fromkeys(index.free_symbols - size_syms, 0))
+    declared = declared_dims_in(offset)
+    if declared:
+        names = ", ".join(sorted(map(str, declared)))
+        raise Unsupported(
+            "A start position computed from a declared size is not supported. "
+            f"This access starts at {offset}, which depends on the declared "
+            f'dimension {names} (set by tensor.to("spyre", dynamic=...)). For '
+            "example, x.narrow(0, n - 64, 64) or x[-1] does this. A declared size "
+            "may only set a for_each_tile loop's trip count, so reach that part "
+            "of the tensor through a for_each_tile over the declared dimension "
+            "instead."
+        )
+
+
 def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
@@ -1097,6 +1133,12 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     is also zeroed.  This function replaces size symbols with their concrete
     hints so that coordinate expressions are structurally identical to static-shape
     compilation while loop variable symbols are preserved.
+
+    Raises:
+        Unsupported: the index's start offset, the part left when every loop
+            variable is zero, depends on a dimension declared with
+            ``tensor.to("spyre", dynamic=...)``. See
+            :func:`_refuse_declared_start_offset`.
     """
 
     # Handle non-symbolic index (e.g., scalar tensors with index=0)
@@ -1129,6 +1171,7 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     }
     if not size_syms:
         return index
+    _refuse_declared_start_offset(index, size_syms)
     # Try each symbol individually
     subs = {}
     for s in size_syms:
