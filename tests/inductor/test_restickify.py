@@ -3424,3 +3424,44 @@ def test_compute_restickify_target_layout_factorized_new_sd():
     assert list(result.stride_map) == [1024, 64, 64, 1], (
         f"Unexpected stride_map: {list(result.stride_map)}"
     )
+
+
+class _LoopStub:
+    """A stub op carrying only a ``loop_member``."""
+
+    def __init__(self, gid, counts):
+        from torch_spyre._inductor.loop_node import LoopMember
+
+        self.loop_member = LoopMember(
+            loop_group_id=tuple(gid),
+            loop_count=list(counts),
+            loop_tiled_dims=[[] for _ in gid],
+            loop_tiled_reduction_dims=[[] for _ in gid],
+        )
+
+
+def _make_extern(gid, counts):
+    from torch._inductor.ir import ExternKernel
+
+    class _Extern(_LoopStub, ExternKernel):
+        def get_device(self):  # a Spyre extern: runs once, outside the loop
+            return torch.device("spyre")
+
+    stub = _Extern.__new__(_Extern)
+    _LoopStub.__init__(stub, gid, counts)
+    return stub
+
+
+def test_an_extern_source_shares_no_loop_with_its_consumer():
+    from torch_spyre._inductor.insert_restickify import _shared_loop_depth
+
+    consumer = _LoopStub((0,), [4])
+    extern = _make_extern((0,), [4])
+    assert _shared_loop_depth(extern, consumer) == 0
+
+
+def test_a_kernel_source_shares_its_common_loop_prefix():
+    from torch_spyre._inductor.insert_restickify import _shared_loop_depth
+
+    assert _shared_loop_depth(_LoopStub((0, 1), [2, 3]), _LoopStub((0, 2), [2, 3])) == 1
+    assert _shared_loop_depth(_LoopStub((0,), [4]), _LoopStub((0,), [4])) == 1

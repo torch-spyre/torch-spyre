@@ -96,7 +96,22 @@ class _LoopOp(_Op):
 class _ExternLoopOp(_LoopOp, ExternKernel):
     """Like ``_LoopOp`` but an ``ExternKernel``: it keeps its ``loop_member`` and
     runs once, so it has no loop path. Only the base class matters to the checker;
-    ``ExternKernel.__init__`` is not run."""
+    ``ExternKernel.__init__`` is not run. It reports the Spyre device: only a
+    Spyre extern kernel must run outside counted loops."""
+
+    def is_no_op(self):
+        return False
+
+    def get_device(self):
+        return torch.device("spyre")
+
+
+class _AllocationLoopOp(_ExternLoopOp):
+    """Stands for the defensive ``is_no_op()`` clause, not for a production kind:
+    real allocations are zero-element ``ComputedBuffer``s, not extern kernels."""
+
+    def is_no_op(self):
+        return True
 
 
 class _SpyreLoopOp(_LoopOp, _SpyreOp):
@@ -237,26 +252,48 @@ class TestMembership(unittest.TestCase):
         self.assertIn("head is in the body of n0", problems[0])
         self.assertIn("tail is in the body of n0", problems[1])
 
-    def test_an_extern_kernel_at_the_head_or_tail_is_allowed(self):
+    def test_an_extern_kernel_in_a_body_is_a_violation(self):
+        """An extern kernel runs once, before the loop: in a body it is wrong at
+        the head, between two members and at the tail alike."""
+        for label, body in (
+            ("head", [_ExternLoopOp("x", (0,)), _LoopOp("a", (0,))]),
+            (
+                "middle",
+                [_LoopOp("a", (0,)), _ExternLoopOp("x", (0,)), _LoopOp("b", (0,))],
+            ),
+            ("tail", [_LoopOp("a", (0,)), _ExternLoopOp("x", (0,))]),
+        ):
+            with self.subTest(label):
+                problems = find_violations([_node("n0", body)])
+                self.assertEqual(
+                    problems,
+                    [
+                        "x is an extern kernel in the body of n0; "
+                        "it runs once, before the loop"
+                    ],
+                )
+
+    def test_an_allocation_in_a_body_is_allowed(self):
         tree = [
             _node(
                 "n0",
                 [
-                    _ExternLoopOp("head", (0,)),
                     _LoopOp("a", (0,)),
-                    _ExternLoopOp("t", (0,)),
+                    _AllocationLoopOp("buf", (0,)),
+                    _LoopOp("b", (0,)),
                 ],
             )
         ]
         self.assertEqual(find_violations(tree), [])
 
-    def test_an_extern_kernel_between_two_members_is_allowed(self):
-        tree = [
-            _node(
-                "n0",
-                [_LoopOp("a", (0,)), _ExternLoopOp("const", (0,)), _LoopOp("b", (0,))],
-            )
-        ]
+    def test_an_extern_on_another_device_in_a_body_is_allowed(self):
+        """Rule 7 is Spyre's: ``runs_once_outside_loops`` is false on the CPU."""
+
+        class _CpuExtern(_ExternLoopOp):
+            def get_device(self):
+                return torch.device("cpu")
+
+        tree = [_node("n0", [_LoopOp("a", (0,)), _CpuExtern("x", (0,))])]
         self.assertEqual(find_violations(tree), [])
 
     def test_a_node_with_no_member_is_not_checked(self):

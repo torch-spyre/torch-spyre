@@ -323,8 +323,18 @@ node is not registered in `graph.name_to_op`. Each leaf op in a built node has
 `_wrap` groups runs of ops that share a `loop_group_id` prefix of length
 `depth + 1` into a node, recursively, so a longer path yields a nested node. A
 node's body is the span from its first member to its last. An op that sits between
-two members without being one (an op of no loop, or an `ExternKernel`) stays in
-the span where it is, since moving it would change program order. `collapse`
+two members without being one (an op of no loop, or an allocation) stays in the
+span where it is. A Spyre extern kernel (one that `runs_once_outside_loops`)
+cannot run inside a counted loop, so `_wrap` moves it, from any depth, to
+immediately before the outermost node, keeping the order of the ops it moves. One
+that reads a buffer the loop writes, or writes (mutates) a buffer the loop reads or
+writes, is refused (`Unsupported`): before the loop it would read a value not yet
+produced, or change what the body reads. The refusal set also includes a body
+allocation and a non-member output the extern reads: the old scheduler hoisted
+both, and refusing them is harmless. An extern kernel on another device is not
+moved. An extern with a `loop_member` that sits just before the first member or
+after the last is in no span, so node build leaves it where it is. `expand` leaves a
+moved op where it was moved. `collapse`
 (called at the end of `splice_while_loops`) and `build_pending_loop_nodes` (for
 the loop-tiling lowering) call `_wrap` and then `_record_node_facts`, which:
 
@@ -332,7 +342,8 @@ the loop-tiling lowering) call `_wrap` and then `_record_node_facts`, which:
    `_loop_chain`;
 2. sets `node.strict_loop_vars` from the members' records, and raises if the
    members of one node disagree (a loop is made by one lowering);
-3. deletes `loop_member` from every op the node holds.
+3. deletes `loop_member` from every op the node holds, and from every op moved
+   before it.
 
 ### What a member is
 
@@ -355,7 +366,7 @@ the lowering's `loop_member`.
 |---|---|
 | `enclosing_loops(op)` | the `LoopLevel`s around `op`, outermost first: `group_path`, `trip_count`, `induction`, `tiled_dims`, `tiled_reduction_dims` |
 | `loop_depth(op)` | the number of levels |
-| `counted_loop_path(op, include_extern=False)` | the group path `op` runs in; `()` for an `ExternKernel` unless `include_extern` is set (it runs once, outside the loop) |
+| `counted_loop_path(op, include_extern=False)` | the group path `op` runs in; `()` for an op that `runs_once_outside_loops` (a Spyre extern kernel, which runs once, outside the loop) unless `include_extern` is set |
 | `is_looped(op)` | whether `op` is a member of a counted loop |
 | `strict_loop_vars(op)` | whether the loop-tiling lowering made the op's loops |
 | `read_advance(op, dep)`, `output_advance(op)` | the per-trip advance of a read or of the write, one entry per level, in host elements |
@@ -409,6 +420,18 @@ body op keeps the op in that body (it runs every trip). Each helper keeps the op
 `_loop_chain` and the nodes' `tiling` right, and each accepts the `OpsView` or the
 real nested list.
 
+A Spyre extern kernel (one that `runs_once_outside_loops`) never goes in a body;
+one on another device is placed like any op. `insert_before`, `insert_after`,
+`move_before` and `move_after` put one next to a body anchor before the anchor's
+outermost loop (or raise `Unsupported` if it reads what the loop writes, or writes
+what the loop reads or writes). The refusal comes from the graph's content, an
+extern that needs data from inside the loop, which Spyre cannot run there: a limit,
+not an API misuse. The redirect is sound because it succeeds only when the extern
+reads nothing the loop writes, and the anchor's output is among those, so before
+the loop is equivalent to after the anchor. `insert_at_start`,
+`insert_on_back_edge` and `replace_op` name a body position, so they raise
+`ValueError` for one. An allocation (a no-op) can still go in a body.
+
 ### Telling the nodes what a new op is
 
 An op placed in a body has a chain but is not yet a member. A pass that creates an
@@ -451,9 +474,13 @@ otherwise; `building_loop()` suspends it while a loop is half built. The rules:
 4. An op that runs in a counted loop a node covers sits inside that node, not
    outside it and not in the body of another loop's node.
 5. A node's body holds no op that is not a member of the loop (an `ExternKernel`
-   is allowed: the scheduler hoists a once-op out).
+   is reported by rule 7 instead).
 6. An op in nodes the pipeline built points at exactly those nodes
    (`_loop_chain`) and carries no `loop_member`.
+7. No body holds an extern kernel that `runs_once_outside_loops` (a Spyre extern
+   kernel): Spyre cannot run one inside a counted loop, so it runs once, before the
+   loop. An allocation (a zero-element `ComputedBuffer`) is not an extern kernel and
+   may stay in a body, and so may an extern kernel on another device.
 
 ## Carries
 
@@ -501,9 +528,15 @@ reads `min_order` and `max_order` before `compute_ancestors` has set them, and
 leaves `node` unset where `compute_dependencies` expects one. It carries the
 `LoopNode` as `node`, and `loop_count` is the node's `trip_count`.
 
-- **Hoisting.** A no-op or extern body op becomes an ordinary scheduler node placed
-  immediately before the outermost loop, since it runs once. One that reads a
-  buffer the loop writes is refused with `Unsupported`.
+- **Allocations.** The IR guarantees that no Spyre extern kernel (one that
+  `runs_once_outside_loops`) is in a body: node build and the edit helpers place it
+  before the loop. One that reaches the scheduler is a bug in a pass that bypassed
+  them, and raises `RuntimeError`. An extern kernel on another device is not
+  covered by that guarantee, and the scheduler still hoists it. A no-op body op (an allocation) becomes an ordinary scheduler node
+  emitted once, immediately before the outermost loop's kernel. This is a
+  code-generation detail and is equivalent, because a pooled allocation is static
+  and has no data effect. One that reads a buffer the loop writes is refused with
+  `Unsupported`.
 - **Membership.** Every kernel op directly in a body must be a member of that
   loop, with one group path (`_check_members`). An op without membership would run
   every trip, so it is refused rather than run wrongly.

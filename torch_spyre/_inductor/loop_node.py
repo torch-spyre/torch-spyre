@@ -24,6 +24,15 @@ around each leaf op (``_loop_chain``).  The record is then deleted from every op
 node holds: after the build the nodes are the only owner of the facts, and a pass
 that adds an op to a loop says what it tiles with :func:`record_member`.
 
+A node's body is the span from the loop's first member to its last.  An op that
+sits in that span but is not a member is kept there, in place, with one exception:
+a Spyre extern kernel (:func:`runs_once_outside_loops`) cannot run inside
+a counted loop, so node build moves it immediately before the outermost node of its
+loop, keeping the program order of the ops it moves.  Where an op is placed then
+says how it runs.  One that reads a buffer the loop writes cannot go before the
+loop, and node build refuses it (``Unsupported``); so does one that writes a
+buffer the loop reads or writes.
+
 Passes that read the graph flat run against :class:`OpsView`, which iterates
 the leaf ops in program order and refuses edits: a pass that changes the graph
 names the position with the helpers below (``insert_before``, ``move_after``,
@@ -46,7 +55,8 @@ import sympy
 from torch._inductor import dependencies, ir
 from torch.utils._ordered_set import OrderedSet
 
-from .loop_facts import counted_loop_path
+from .errors import Unsupported
+from .loop_facts import counted_loop_path, runs_once_outside_loops
 
 if TYPE_CHECKING:
     import torch.fx
@@ -591,6 +601,30 @@ def _take_donor_tiling(entry: ir.Operation) -> None:
                 node.tiling[leaf.get_name()] = node.tiling[donor.get_name()]
 
 
+def _extern_entry(
+    real: list[ir.Operation], anchor: ir.Operation, op: ir.Operation
+) -> ir.Operation | None:
+    """The top-level entry ``op`` must go before, when ``op`` runs once and
+    ``anchor`` sits in a loop body; ``None`` when ``op`` goes next to ``anchor``.
+    Raises ``Unsupported`` if ``op`` reads what that loop writes."""
+    if not runs_once_outside_loops(op):
+        return None
+    entry = top_level_entry(real, anchor)
+    if entry is anchor:
+        return None
+    assert isinstance(entry, LoopNode)
+    _refuse_before_loop(entry, [op])
+    return entry
+
+
+def _refuse_extern_in_body(op: ir.Operation) -> None:
+    if runs_once_outside_loops(op):
+        raise ValueError(
+            f"{type(op).__name__} {op.get_name()} is an extern kernel; an extern "
+            "kernel cannot run in a loop body"
+        )
+
+
 def insert_before(
     operations: "list[ir.Operation] | OpsView",
     anchor: ir.Operation,
@@ -604,9 +638,26 @@ def insert_before(
     ``operations`` may be the flat :class:`OpsView` a pass is handed. Unlike
     ``view.insert(view.index(x), op)``, naming a node puts the op outside it even
     when the node's first member is the next flat op.
+
+    An extern kernel (:func:`runs_once_outside_loops`) never goes in a body: next
+    to a body op it goes before the anchor's outermost loop, or ``Unsupported``
+    is raised if it reads what that loop writes. That refusal comes from the
+    graph's content (an extern that needs data from inside the loop, which Spyre
+    cannot run there), a limit and not an API misuse; a misuse, such as naming a
+    body position, raises ``ValueError``.
     """
     real = _real_list(operations)
-    lst, i = _holder(real, anchor)
+    _insert_before(real, anchor, op, _extern_entry(real, anchor, op))
+
+
+def _insert_before(
+    real: list[ir.Operation],
+    anchor: ir.Operation,
+    op: ir.Operation,
+    entry: ir.Operation | None,
+) -> None:
+    """:func:`insert_before` with ``entry`` (:func:`_extern_entry`) already computed."""
+    lst, i = _holder(real, anchor if entry is None else entry)
     lst.insert(i, op)
     _adopt(real, op)
 
@@ -625,8 +676,28 @@ def insert_after(
     goes next to its anchor in the nested list. ``view.insert`` cannot say that, and
     puts an op inserted past the last flat position at the top level, outside the
     loop it was meant for.
+
+    An extern kernel never goes in a body: next to a body op it goes before the
+    anchor's outermost loop (see :func:`insert_before`), not after the anchor.
+    The redirect is sound because it succeeds only when the extern reads nothing
+    the loop writes, and the anchor's output is among those: so before the loop is
+    equivalent to after the anchor. A pass (padding's fill constant, via
+    ``move_before``) relies on it.
     """
     real = _real_list(operations)
+    _insert_after(real, anchor, op, _extern_entry(real, anchor, op))
+
+
+def _insert_after(
+    real: list[ir.Operation],
+    anchor: ir.Operation,
+    op: ir.Operation,
+    entry: ir.Operation | None,
+) -> None:
+    """:func:`insert_after` with ``entry`` (:func:`_extern_entry`) already computed."""
+    if entry is not None:
+        _insert_before(real, anchor, op, entry)
+        return
     lst, i = _holder(real, anchor)
     lst.insert(i + 1, op)
     _adopt(real, op)
@@ -658,10 +729,13 @@ def replace_op(
 ) -> None:
     """Put ``new`` where ``old`` is, in whichever list holds ``old``.
 
-    Raises ``ValueError`` if ``old`` is not in ``operations``.
+    Raises ``ValueError`` if ``old`` is not in ``operations``, or if ``new`` is an
+    extern kernel and ``old`` is in a loop body (an extern cannot run there).
     """
     real = _real_list(operations)
     lst, i = _holder(real, old)
+    if lst is not real:
+        _refuse_extern_in_body(new)
     lst[i] = new
     _set_chain(new, tuple(getattr(old, "_loop_chain", ())))
     # ``new`` may reuse ``old``'s name (replace_computed_buffer_body does) with a
@@ -703,11 +777,12 @@ def _move(
     # Find both before touching either list, so a missing one changes nothing.
     _holder(real, op)
     _holder(real, anchor)
+    entry = _extern_entry(real, anchor, op)  # refuse before anything is detached
     if isinstance(op, LoopNode) and owning_list(op.body, anchor) is not None:
         # Taking the node out would take the anchor with it.
         raise ValueError(f"cannot move {op!r} relative to {anchor!r}, which it holds")
     _detach(real, op)
-    (insert_after if after else insert_before)(real, anchor, op)
+    (_insert_after if after else _insert_before)(real, anchor, op, entry)
 
 
 def move_before(
@@ -722,7 +797,8 @@ def move_before(
     placement rule is :func:`insert_before`'s: before a node the op is outside the
     loop, before a body op it is in that body. ``op`` may come from any list, and
     may be a :class:`LoopNode` (it moves with its body) as long as ``anchor`` is not
-    inside it.
+    inside it. An extern kernel goes before the anchor's outermost loop, or is
+    refused (:func:`insert_before`).
     """
     _move(operations, anchor, op, after=False)
 
@@ -733,13 +809,19 @@ def move_after(
     op: ir.Operation,
 ) -> None:
     """Move ``op``, already in the graph, to immediately after ``anchor``
-    (:func:`insert_after`'s placement rule)."""
+    (:func:`insert_after`'s placement rule: an extern kernel goes before the
+    anchor's outermost loop, or is refused). The redirect is sound because it
+    succeeds only when the extern reads nothing the loop writes, and the anchor's
+    output is among those, so before the loop is equivalent to after the anchor.
+    The refusal is ``Unsupported`` (the graph needs data from inside the loop, a
+    limit and not an API misuse)."""
     _move(operations, anchor, op, after=True)
 
 
 def insert_at_start(node: LoopNode, op: ir.Operation) -> None:
     """Insert ``op`` as the first entry of ``node``'s body: it runs every trip,
-    before the rest of the body."""
+    before the rest of the body. An extern kernel cannot run there: ``ValueError``."""
+    _refuse_extern_in_body(op)
     node.body.insert(0, op)
     _set_chain(op, _chain_of(node))
     _fill_tiling(op)
@@ -756,7 +838,10 @@ def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
     0.785). The position is the guarantee, so there is nothing to search for
     and nothing to check; a caller that wants an op NEAR an update, not at the
     end, wants :func:`insert_after` and owns that choice.
+
+    An extern kernel cannot run in a body: ``ValueError``.
     """
+    _refuse_extern_in_body(op)
     node.body.append(op)
     _set_chain(op, _chain_of(node))
     _fill_tiling(op)
@@ -775,9 +860,58 @@ def _chain_of(node: LoopNode) -> tuple[LoopNode, ...]:
 
 
 def _group_path(op: ir.Operation) -> tuple[int, ...]:
-    # An ExternKernel keeps its loop_member (e.g. a hoisted loop-body constant)
-    # but runs once, outside the loop, so it is not a member of any loop.
+    # A Spyre extern kernel runs once, outside every loop, so it is not a member of
+    # one (``counted_loop_path``); an extern on another device is.
     return counted_loop_path(op)
+
+
+def _refuse_before_loop(node: LoopNode, ops: list[ir.Operation]) -> None:
+    """Raise ``Unsupported`` if an op of ``ops`` cannot run once, before ``node``:
+    it reads a buffer a leaf of ``node`` writes (its output, or the storage it
+    mutates), which before the loop would read a value the loop has not produced
+    yet; or it writes a buffer the loop reads or writes (a mutation), which before
+    the loop would change what the body reads, or be overwritten by it. An op's
+    own output is not counted: no body op touches it before the op runs.
+
+    The refusal comes from the graph's content, an extern kernel that needs data
+    from inside the loop, which Spyre cannot run there. It is a limit of the
+    hardware, not a misuse of the API, so it is ``Unsupported``; naming a body
+    position for an extern kernel is a misuse and raises ``ValueError``."""
+    if not ops:
+        return
+    rw = node.get_read_writes()
+    written = {d.name for d in rw.writes}
+    written |= {buf.get_name() for buf in node.get_outputs()}
+    touched = written | {d.name for d in rw.reads}
+    for op in ops:
+        produced = {d.name for d in op.get_read_writes().reads} & written
+        if produced:
+            raise Unsupported(
+                f"{type(op).__name__} {op.get_name()} in counted loop "
+                f"{node.get_name()} reads {sorted(produced)}, which the loop "
+                "writes, so it cannot be placed before the loop"
+            )
+        mutated = {d.name for d in op.get_read_writes().writes}
+        get_mutation_names = getattr(op, "get_mutation_names", None)
+        if callable(get_mutation_names):
+            mutated |= set(get_mutation_names())
+        mutated.discard(op.get_name())
+        clobbered = mutated & touched
+        if clobbered:
+            raise Unsupported(
+                f"{type(op).__name__} {op.get_name()} in counted loop "
+                f"{node.get_name()} writes {sorted(clobbered)}, which the loop "
+                "reads or writes, so it cannot be placed before the loop"
+            )
+
+
+def _place_before_loop(
+    out: list[ir.Operation], node: LoopNode, ops: list[ir.Operation]
+) -> None:
+    """Append ``ops``, in order, to ``out`` ahead of ``node``: they run once, before
+    the loop. Raises ``Unsupported`` as :func:`_refuse_before_loop` does."""
+    _refuse_before_loop(node, ops)
+    out.extend(ops)
 
 
 def _carries_of(body: list[ir.Operation]) -> tuple[Any, ...]:
@@ -797,16 +931,30 @@ def _wrap(
     inductions: Mapping[int, sympy.Symbol],
     counter: list[int],
     only: frozenset[int] | None = None,
+    moved: list[ir.Operation] | None = None,
 ) -> list[ir.Operation]:
     """Wrap runs of ``ops`` sharing a ``loop_group_id`` prefix of length
     ``depth + 1`` (and extending ``prefix``) into ``LoopNode``s, recursively.
 
     A node's body is the span from its first member to its last member.  An
     op that sits between two members but is not one (no ``loop_member``, an
-    ``ExternKernel``, or an op of another loop) is kept in that span, where it
-    is: moving it would change the program order, and :func:`expand` must give
-    back exactly the list it was given.  Inside the node it is an ordinary
-    body entry; it is wrapped further only if its own path extends the node's.
+    op of another loop) is kept in that span, where it is.  Inside the node it
+    is an ordinary body entry; it is wrapped further only if its own path
+    extends the node's.
+
+    An op with a ``loop_member`` that sits just before the first member or after
+    the last is in no span (``_group_path`` gives ``()`` for it, or it is outside
+    the run), so it stays where it is.
+
+    The exception is an op that :func:`runs_once_outside_loops` (an extern
+    kernel that does work): it is taken out of the span and placed immediately
+    before the OUTERMOST node, the ops moved out of one loop in their program
+    order (:func:`_place_before_loop`, which refuses one that reads a buffer the
+    loop writes).  A depth-0 span holds its nested loops' ops too, so only the
+    depth-0 call filters; a deeper call never sees such an op.  The depth-0 call
+    appends what it moved to ``moved``, for :func:`_record_node_facts` to spend
+    the records.  :func:`expand` does not restore a moved op's original
+    position: the moved order is the program.
     """
     out: list[ir.Operation] = []
     i = 0
@@ -824,7 +972,14 @@ def _wrap(
         last = max(
             k for k in range(i, len(ops)) if _group_path(ops[k])[: depth + 1] == key
         )
-        run = ops[i : last + 1]
+        span = ops[i : last + 1]
+        if depth == 0:
+            # The depth-0 span holds the nested loops' ops too, so this takes out
+            # every runs-once op; a deeper call never sees one.
+            run = [op for op in span if not runs_once_outside_loops(op)]
+            hoisted = [op for op in span if runs_once_outside_loops(op)]
+        else:
+            run, hoisted = span, []
         group_idx = key[-1]
         node = LoopNode(
             f"loopnode{counter[0]}",
@@ -836,6 +991,10 @@ def _wrap(
         counter[0] += 1
         node.body = _wrap(run, depth + 1, key, inductions, counter, only)
         node.carries = _carries_of(node.body)
+        if depth == 0:
+            _place_before_loop(out, node, hoisted)
+            if moved is not None:
+                moved.extend(hoisted)
         out.append(node)
         i = last + 1
     return out
@@ -873,11 +1032,12 @@ def build_pending_loop_nodes(graph: Any) -> None:
     operations = graph.operations
     assert not isinstance(operations, OpsView), "needs the real list"
     existing = sum(1 for _ in _nodes_in(operations))
+    moved: list[ir.Operation] = []
     with building_loop():
         operations[:] = _wrap(
-            list(operations), 0, (), pending, [existing], frozenset(pending)
+            list(operations), 0, (), pending, [existing], frozenset(pending), moved
         )
-        _record_node_facts(operations)
+        _record_node_facts(operations, moved)
 
 
 def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
@@ -887,10 +1047,13 @@ def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
             yield from _nodes_in(op.body)
 
 
-def _record_node_facts(operations: list[ir.Operation]) -> None:
+def _record_node_facts(
+    operations: list[ir.Operation], moved: Iterable[ir.Operation] = ()
+) -> None:
     """Fill every node's per-member tiling and every leaf's node chain, after the
     nodes were built from the ops' ``loop_member``, then drop that record from the
-    ops the nodes hold."""
+    ops the nodes hold and from the ops ``_wrap`` moved before a node (``moved``):
+    those run once, outside every loop, so their record is spent too."""
     for entry in operations:
         _set_chain(entry, ())
         _fill_tiling(entry)
@@ -922,6 +1085,9 @@ def _record_node_facts(operations: list[ir.Operation]) -> None:
         for leaf in all_ops(node.body):
             if hasattr(leaf, "loop_member"):
                 del leaf.loop_member  # type: ignore[attr-defined]
+    for op in moved:
+        if hasattr(op, "loop_member"):
+            del op.loop_member  # type: ignore[attr-defined]
 
 
 def collapse(
@@ -937,14 +1103,18 @@ def collapse(
     assert not isinstance(operations, OpsView), "collapse needs the real list"
     if not any(_group_path(op) for op in operations):
         return
+    moved: list[ir.Operation] = []
     with building_loop():
-        operations[:] = _wrap(list(operations), 0, (), inductions or {}, [0])
-        _record_node_facts(operations)
+        operations[:] = _wrap(
+            list(operations), 0, (), inductions or {}, [0], None, moved
+        )
+        _record_node_facts(operations, moved)
 
 
 def expand(graph: Any) -> None:
     """Flatten every ``LoopNode`` in ``graph.operations`` back to its leaf ops,
-    in program order, in place.  The inverse of :func:`collapse`."""
+    in program order, in place.  The inverse of :func:`collapse`, except that an
+    extern kernel :func:`collapse` moved before its loop stays there."""
     operations = graph.operations
     assert not isinstance(operations, OpsView), "expand needs the real list"
     if not has_loop_nodes(operations):
