@@ -51,6 +51,8 @@ test_suite_config:
             - TestOps::test_floor_divide_eager.*
             # exact matches — no .* to avoid leaking into other shards
             - TestOps::test_log
+            - TestOps::test_log1p_fp32.*
+            - TestOps::test_log1p_fp16.*
             # test_mean has 3 params: 3d_dim0, 3d_dim1, 3d_dim0_keepdim.
             # The 3d_dim0_keepdim variant is in the keepdim shard (matched by
             # the old .*keepdim.* pattern on instantiated names). The other two
