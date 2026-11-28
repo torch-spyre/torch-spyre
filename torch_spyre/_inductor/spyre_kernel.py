@@ -791,7 +791,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         mapped: "int | None" = None
         if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
             for host_idx, r in enumerate(ir_node.data.ranges):
-                if int(r) != 1:
+                if r != 1:
                     if host_idx == dim:
                         mapped = it_idx
                     it_idx += 1
@@ -809,7 +809,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             if reduction_ranges is not None and reduction_pos >= 0:
                 red_it_idx = 0
                 for host_idx, r in enumerate(reduction_ranges):
-                    if int(r) != 1:
+                    if r != 1:
                         if host_idx == reduction_pos:
                             mapped = n_output_dims + red_it_idx
                             break
