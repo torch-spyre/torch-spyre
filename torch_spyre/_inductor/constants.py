@@ -191,6 +191,7 @@ SPYRE_FP32_OPS = [
     "keepbyindex",
     "maskbyindex",
     "log",
+    "log1p",
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when

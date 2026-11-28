@@ -61,6 +61,7 @@ host. `torch.fft.*` itself is not supported on the device (it is complex).
 | `torch.neg` | Y | Y | Spyre | |
 | `torch.exp` | Y | Y | Spyre | |
 | `torch.log` | Y | Y | Spyre | |
+| `torch.log1p` | Y | Y | Spyre | |
 | `torch.sqrt` | Y | Y | Spyre | |
 | `torch.rsqrt` | Y | Y | Spyre | |
 | `torch.reciprocal` | Y | Y | Spyre | |
