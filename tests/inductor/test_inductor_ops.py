@@ -4814,6 +4814,101 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 100), dtype=torch.float16),
                     cached_randn((2, 56), dtype=torch.float16),
                 ),
+                # 1-D targets with no alternative stick dim (issue #3916): the
+                # second piece starts mid-stick and the target's only dim
+                # already produces the offset stick, so the layout falls back
+                # to a synthetic size-1 stick (_make_sparse_output_stl).
+                "1d_dim0_unaligned_fp16": (
+                    0,
+                    cached_randn((33,), dtype=torch.float16),
+                    cached_randn((33,), dtype=torch.float16, differentiation="b"),
+                ),
+                "1d_dim0_unaligned_bfloat16": (
+                    0,
+                    cached_randn((33,), dtype=torch.bfloat16),
+                    cached_randn((33,), dtype=torch.bfloat16, differentiation="b"),
+                ),
+                "1d_dim0_unaligned_fp32": (
+                    0,
+                    cached_randn((33,), dtype=torch.float32),
+                    cached_randn((33,), dtype=torch.float32, differentiation="b"),
+                ),
+                # Both writes after the first land mid-stick (offsets 33 and
+                # 66), so the mutation writers must agree on one alt layout.
+                "1d_dim0_unaligned_three_tensors": (
+                    0,
+                    cached_randn((33,), dtype=torch.float16),
+                    cached_randn((33,), dtype=torch.float16, differentiation="b"),
+                    cached_randn((33,), dtype=torch.float16, differentiation="c"),
+                ),
+                # The original #3916 length as a cat: the second piece starts
+                # 384.5 sticks in.
+                "1d_dim0_unaligned_large_fp16": (
+                    0,
+                    cached_randn((24608,), dtype=torch.float16),
+                    cached_randn((32,), dtype=torch.float16),
+                ),
+            },
+        },
+        (
+            "test_cat_unaligned_1d_consumer",
+            "test_cat_unaligned_1d_consumer_cpu",
+        ): {
+            # The consumer half of issue #3916's 12-combination matrix: 3
+            # dtypes x 2 consumers x {eager, compiled} (compare_with_cpu runs
+            # both modes). The unconsumed cat is test_cat's
+            # 1d_dim0_unaligned_* params above.
+            "ops_dict": {
+                "pointwise": lambda t: t * 1.0,
+                # keepdim keeps the output [1]: the LX-planning reduction wrap
+                # sums dim 0 of the result, which a 0-d tensor rejects.
+                "sum": lambda t: t.sum(dim=-1, keepdim=True),
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((33,), dtype=torch.float16),
+                    cached_randn((33,), dtype=torch.float16, differentiation="b"),
+                ),
+                "bfloat16": (
+                    cached_randn((33,), dtype=torch.bfloat16),
+                    cached_randn((33,), dtype=torch.bfloat16, differentiation="b"),
+                ),
+                "fp32": (
+                    cached_randn((33,), dtype=torch.float32),
+                    cached_randn((33,), dtype=torch.float32, differentiation="b"),
+                ),
+            },
+        },
+        (
+            "test_stack_after_unaligned_split",
+            "test_stack_after_unaligned_split_cpu",
+        ): {
+            # Regression test for #3916: torch.stack lowers to a mutate_to
+            # writing the second piece at offset 8 into a flat [16] target,
+            # mid-stick at every dtype, with no alternative stick dim.
+            "param_sets": {
+                "fp16": (cached_randn((8, 130), dtype=torch.float16),),
+                "bfloat16": (cached_randn((8, 130), dtype=torch.bfloat16),),
+                "fp32": (cached_randn((8, 130), dtype=torch.float32),),
+                # Three chunks: the writes at offsets 8 and 16 both land
+                # mid-stick, so the mutation writers must agree on one alt
+                # layout.
+                "fp16_three_chunks": (cached_randn((8, 195), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_stack_after_gather_chunk_sum",
+            "test_stack_after_gather_chunk_sum_cpu",
+        ): {
+            # Regression test for #3916: the gathered row-block's chunks sum
+            # to [32] pieces stacked into a flat [128] target, where every
+            # write is an offset-free sub-stick write (write stick d0, extent
+            # 32 inside a 64-wide stick) sharing sticks with its neighbour.
+            "param_sets": {
+                "fp16": (
+                    cached_randn((64, 256), dtype=torch.float16),
+                    torch.randint(0, 64, (32,), dtype=torch.int64),
+                ),
             },
         },
         # A cat piece that needs a restickify is written straight into a slice of
@@ -5002,6 +5097,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_last_dim_unaligned_fp16": (
                     cached_randn((1, 24608), dtype=torch.float16),
                     (0, 32),
+                ),
+                # The original #3916 repro shape: a 1-D target has no
+                # alternative stick dim, so the mid-stick fill write at offset
+                # 24608 takes the synthetic size-1 stick.
+                "1d_last_dim_unaligned_fp16": (
+                    cached_randn((24608,), dtype=torch.float16),
+                    (0, 32),
+                ),
+                "1d_last_dim_unaligned_fp32": (
+                    cached_randn((993,), dtype=torch.float32),
+                    (0, 31),
+                ),
+                # Left pad: here it is the input copy, not the constant fill,
+                # that writes mid-stick (at offset 32) and picks the alt.
+                "1d_last_dim_unaligned_left_fp16": (
+                    cached_randn((24608,), dtype=torch.float16),
+                    (32, 0),
                 ),
                 "2d_last_dim_unaligned_fp16_small_pad": (
                     cached_randn((1, 24608), dtype=torch.float16),
@@ -12849,6 +12961,50 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.stack([x * (i + 1) for i in range(parts)], dim=-1).flatten(-2)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_cat_unaligned_1d_consumer_cpu(self, op, a, b):
+        """A 1-D cat whose second piece starts mid-stick, read by a consumer
+        (issue #3916).
+
+        The [66] target has no other dim to move the stick to, so the layout
+        falls back to a synthetic size-1 stick (one element per stick), where
+        the write at offset 33 lands on whole sticks. The consumer then reads
+        that sparse buffer pointwise or reduces it.
+        """
+
+        def fn(a, b):
+            return op(torch.cat([a, b]))
+
+        self.compare_with_cpu(fn, a, b)
+
+    def test_stack_after_unaligned_split_cpu(self, x):
+        """``torch.stack`` of per-chunk sums after an unaligned split (#3916).
+
+        The stack target is a flat buffer whose second piece is written at
+        offset 8 — mid-stick at every dtype — again with no alternative stick
+        dim.
+        """
+
+        def fn(t):
+            return torch.stack([c.sum(dim=-1) for c in t.split(65, dim=-1)])
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_stack_after_gather_chunk_sum_cpu(self, t, i):
+        """``torch.stack`` of per-chunk sums of a gathered row-block (#3916).
+
+        The stack target is a flat [128] buffer whose pieces are sub-stick
+        writes: the write stick is a bare ``d0`` (no offset), but each piece's
+        extent (32) sits inside a 64-wide stick that the neighbouring piece
+        also writes, so writing one natively would zero the other's lanes. The
+        1-D target has no alternative stick dim, so it takes the synthetic
+        size-1 stick, where no two pieces share a stick.
+        """
+
+        def fn(t, i):
+            return torch.stack([c.sum(dim=-1) for c in torch.chunk(t[i], 4, dim=-1)])
+
+        self.compare_with_cpu(fn, t, i, run_eager=False)
 
     def test_pad_cpu(self, x, pad):
         """Compiled torch.nn.functional.pad (constant zero) on Spyre matches CPU."""
