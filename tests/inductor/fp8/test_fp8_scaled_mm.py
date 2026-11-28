@@ -55,12 +55,15 @@ def _assert_close_scaled(out: torch.Tensor, ref: torch.Tensor) -> None:
     torch.testing.assert_close(out, ref, atol=atol, rtol=0.05)
 
 
-_XFAIL_4308 = pytest.mark.xfail(
+_XFAIL_5924 = pytest.mark.xfail(
     strict=True,
     raises=InductorError,
-    reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 fails to "
-    "compile: padding K leaves a STANDARD weight, so the FP8 matmul cost model finds no "
-    "QFP8WT input (StopIteration); past that, dbo-opt cannot zero-fill FP8 padding",
+    reason="https://github.com/torch-spyre/torch-spyre/issues/5924: the FP8 matmul is "
+    "wrong for N > 128 with N%128!=0, so lower_qfp8wt leaves such a weight's K "
+    "unpadded; it then fails as in "
+    "https://github.com/torch-spyre/torch-spyre/issues/4308: the compiler pads it in "
+    "FP8, the copy is STANDARD, and the FP8 matmul cost model finds no QFP8WT input "
+    "(StopIteration)",
 )
 
 _XFAIL_4310 = pytest.mark.xfail(
@@ -685,12 +688,41 @@ class TestFP8AlignedShapes:
 
 
 class TestFP8UnalignedShapes:
-    """K%128!=0: insert_bmm_padding pads weight K to next multiple of 128."""
+    """K%128!=0: lower_qfp8wt zero-pads the weight's K to a multiple of 128 (#2831)."""
 
     def setup_method(self):
         torch._dynamo.reset()
 
-    @_XFAIL_4308
+    @pytest.mark.parametrize("M, K, N", [(1, 130, 128), (2, 3, 5), (2, 3, 64)])
+    def test_unaligned_k_small_and_m1(self, M, K, N):
+        """#2831's own shape (2, 3, 5) and its N=64 variant (odd K inside one stick),
+        and M=1, which takes a different planner path than M>1."""
+        one = _st16(1.0, DEVICE)
+        a, w = _make_rand_inputs(M, K, N, device=DEVICE)
+        ref = _pipeline_ref(a, w, 1.0, 1.0, FP16)
+
+        def fn(a, w, sa, sw):
+            a_fp8 = torch.ops.spyre.quantize_fp8_with_scale(a, sa)
+            w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(w, sw)
+            return torch.ops.aten._scaled_mm(
+                a_fp8, w_fp8, scale_a=None, scale_b=None, bias=None, out_dtype=FP16
+            )
+
+        out = _compile(fn)(a, w, one, one).cpu()
+        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
+
+    def test_unaligned_k_returned_weight_reads_back(self):
+        """A weight the graph returns stays unpadded: a padded one reads back wrong,
+        since the DMA takes K from the host size (#2831)."""
+        _, w = _make_rand_inputs(1, 130, 128)
+        fn = _compile(lambda w, s: torch.ops.spyre.quantize_weight_fp8_with_scale(w, s))
+        out = fn(w.to(DEVICE), _st16(1.0, DEVICE)).cpu()
+        # The device rounds normals to within one E4M3 step (rtol 2**-3) and handles
+        # subnormals (below 2**-6) differently from the CPU cast, often as zero.
+        torch.testing.assert_close(
+            out.float(), w.to(E4M3).float(), atol=2**-6, rtol=2**-3
+        )
+
     def test_k64_hardcoded_scale(self):
         """K=64 (K%128=64), sa=sw=1.0: padding to K=128, value correctness vs oracle."""
         M, K, N = 16, 64, 128
@@ -708,7 +740,6 @@ class TestFP8UnalignedShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @_XFAIL_4308
     def test_k16_hardcoded_scale(self):
         """K=16 (K%128=16), sa=sw=1.0: padding to K=128, value correctness vs oracle."""
         M, K, N = 16, 16, 128
@@ -726,7 +757,7 @@ class TestFP8UnalignedShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @_XFAIL_4308
+    @_XFAIL_5924
     def test_k2880_medium_unaligned(self):
         """K=2880 (K%128=64), sa=sw=1.0: padded 2880→2944, value correctness vs oracle."""
         M, K, N = 16, 2880, 2880
@@ -745,7 +776,6 @@ class TestFP8UnalignedShapes:
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
     @pytest.mark.slow
-    @_XFAIL_4308
     def test_k4032_large_padding(self):
         """@slow — K=4032 (K%128=64), padded 4032→4096, value correctness at production K."""
         M, K, N = 16, 4032, 4096
@@ -764,7 +794,6 @@ class TestFP8UnalignedShapes:
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
     @pytest.mark.slow
-    @_XFAIL_4308
     def test_k3904_large_padding(self):
         """@slow — K=3904 (K%128=64), padded 3904→3968, value correctness at production K."""
         M, K, N = 16, 3904, 4096
