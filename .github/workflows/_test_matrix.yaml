@@ -630,7 +630,8 @@ jobs:
       needs.generate_matrix.outputs.resolved_test_type != 'perf' &&
       (needs.build_torch_spyre.result == 'success' ||
        needs.build_torch_spyre.result == 'skipped')
-    # Don't let one failed suite fail this job -- test_result (below) decides pass/fail after test_retry gets a shot on a fresh pod, so a merge-queue entry isn't evicted before the retry runs.
+    # Don't let one failed suite fail this job -- test_retry (below) gets a shot on a fresh pod first, so a merge-queue entry isn't evicted before the retry runs. The
+    # retry jobs are not continue-on-error, so a suite that fails again there fails the reusable workflow (needs.run-tests.result in the callers).
     continue-on-error: true
     runs-on:
       - x86_64
@@ -1327,7 +1328,7 @@ jobs:
        needs.generate_matrix.outputs.resolved_test_type == 'suite_distributed') &&
       (needs.build_torch_spyre.result == 'success' ||
        needs.build_torch_spyre.result == 'skipped')
-    # See the `test` job above: continue-on-error keeps a single failed suite from prematurely failing the reusable workflow -- test_result decides pass/fail after the retry.
+    # See the `test` job above: continue-on-error keeps a single failed suite from prematurely failing the reusable workflow -- the retry decides pass/fail.
     continue-on-error: true
     runs-on:
       - x86_64
@@ -1941,126 +1942,3 @@ jobs:
             fi
           done
           exit "$FAIL"
-
-  # ---------------------------------------------------------------------------
-  # Job 3: Report test suites that ran zero tests
-  #
-  # Runs after both matrix jobs (even if they fail) and checks every uploaded
-  # JUnit XML artifact for a zero-test result.  Issues ::warning:: annotations
-  # and writes a step summary table (does NOT fail the workflow).
-  # ---------------------------------------------------------------------------
-  report_empty_suites:
-    name: Report empty test suites
-    runs-on: ubuntu-latest
-    # Waits for both pod-level retry waves too, so a suite fixed by retry (overwrite: true replaces its report) is read post-correction.
-    needs: [generate_matrix, test, test_multi_spyre, test_retry, test_retry_final]
-    if: always()
-
-    steps:
-      - name: Download all XML artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p xml_artifacts
-          # --paginate: same page-cap trap as collect_retry_suites.py; an
-          # un-paginated query would miss XML reports past the first page and
-          # under-report the empty-suite check. Emit a per-object JSON stream
-          # (gh rejects --slurp with --jq) and slurp it into one array.
-          # created_at lets the python step below dedupe re-run duplicates by name, keeping the newest.
-          ARTIFACTS=$(gh api --paginate \
-            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name, created_at: .created_at}' \
-            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
-
-          ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
-          import json, os, subprocess
-          artifacts = json.loads(os.environ['ARTIFACTS'])
-          repo = "${{ github.repository }}"
-
-          # Keep only the newest artifact per name (see the created_at note above).
-          latest = {}
-          for a in artifacts:
-              existing = latest.get(a["name"])
-              if existing is None or a["created_at"] > existing["created_at"]:
-                  latest[a["name"]] = a
-
-          downloaded = 0
-          for a in latest.values():
-              zip_path = f"xml_artifacts/{a['name']}.zip"
-              try:
-                  result = subprocess.run(
-                      ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
-                      capture_output=True, check=True,
-                      env={**os.environ},
-                  )
-                  with open(zip_path, "wb") as f:
-                      f.write(result.stdout)
-                  subprocess.run(
-                      ["unzip", "-q", "-o", zip_path, "-d", "xml_artifacts/"],
-                      check=True,
-                  )
-                  downloaded += 1
-              except subprocess.CalledProcessError as e:
-                  # Skip a single bad artifact instead of aborting the whole job.
-                  stderr = e.stderr.decode(errors="replace") if e.stderr else str(e)
-                  print(f"::warning::Could not download artifact {a['name']} (id {a['id']}): {stderr.strip()}")
-          print(f"Downloaded {downloaded} of {len(latest)} artifact(s).")
-          PYEOF
-
-      - name: Check for empty suites
-        run: |
-          python3 <<'PYEOF'
-          import os
-          import sys
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-
-          xml_dir = Path("xml_artifacts")
-          xml_files = sorted(xml_dir.glob("**/*.xml"))
-
-          empty = []
-          for xml_file in xml_files:
-              try:
-                  tree = ET.parse(xml_file)
-                  root = tree.getroot()
-                  # Handle both <testsuite> and <testsuites><testsuite ...> forms
-                  # Count <testcase> elements directly — the tests= attribute
-                  # is unreliable when pytest-xdist produced the XML (it writes
-                  # tests="0" in the suite header even when cases are present).
-                  total_tests = len(root.findall(".//testcase"))
-                  if total_tests == 0:
-                      empty.append(xml_file.stem)
-              except ET.ParseError as e:
-                  print(f"::warning::Could not parse {xml_file.name}: {e}")
-
-          # Build step summary
-          lines = []
-          if empty:
-              lines.append("### Empty test suites detected\n")
-              lines.append(
-                  "The following suite(s) uploaded a JUnit XML report with **0 tests**:\n"
-              )
-              lines.append("| Artifact |")
-              lines.append("|---|")
-              for name in empty:
-                  lines.append(f"| `{name}` |")
-              lines.append("")
-              lines.append(
-                  "> **Note:** This is a warning only — the workflow is not failed."
-              )
-          else:
-              lines.append("### Empty suite check: all suites ran at least one test.")
-
-          summary = "\n".join(lines)
-          print(summary)
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
-          if summary_path:
-              with open(summary_path, "a") as f:
-                  f.write(summary + "\n")
-
-          # Emit ::warning:: annotations for each empty suite
-          for name in empty:
-              print(f"::warning title=Empty test suite::{name} reported 0 tests collected")
-
-          sys.exit(0)
-          PYEOF
