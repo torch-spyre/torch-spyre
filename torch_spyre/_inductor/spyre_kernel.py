@@ -1990,6 +1990,11 @@ def _sympy_literal(x: sympy.Expr) -> str:
     if isinstance(x, IndirectAccess):
         name_sym = x.args[0]
         return f"IndirectAccess('{name_sym}')"
+    if isinstance(x, sympy.Expr) and x.has(IndirectAccess):
+        # A compound coordinate (``IndirectAccess(idx) + 3`` from a sliced
+        # view, issue #6210) must re-parse to the real IndirectAccess class;
+        # plain sympify makes an unrelated undefined function of the same name.
+        return "sympify('" + str(x) + "', locals={'IndirectAccess': IndirectAccess})"
     return "sympify('" + str(x) + "')"
 
 

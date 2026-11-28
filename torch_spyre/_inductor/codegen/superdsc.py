@@ -1821,10 +1821,16 @@ def _create_sdsc_tensors(
                 )
                 else None
             )
+            # A sliced view adds a constant to the coordinate (``c0 + 3``, or
+            # ``IndirectAccess(idx) + 3`` when the sliced dim is also indexed,
+            # issue #6210). Fold it into the start offset. For an indirect
+            # coordinate the iteration extent is the index count, unrelated to
+            # the device extent, so take the offset even when the two match.
+            is_indirect_coord = dim_coord is not None and dim_coord.has(IndirectAccess)
             if (
                 dim_coord is not None
                 and not isinstance(dim_coord, IndirectAccess)
-                and dev_dim_size != it_dim_size
+                and (dev_dim_size != it_dim_size or is_indirect_coord)
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 coord_without_offset = dim_coord.as_coeff_Add()[1]
@@ -1832,6 +1838,14 @@ def _create_sdsc_tensors(
                 if is_qfp8wt_2d_stick and coord_idx % n_coords == n_coords - 2:
                     dim_offset //= _QFP8WT_ROWS_PER_STICK
                 offsets[dim] = dim_offset * dim_device_stride
+            # The backGap and stride rescale below describe a dim the loop walks
+            # directly. An indirect dim is addressed by the index value over the
+            # full device extent, so it keeps its physical stride and no gap.
+            if (
+                dim_coord is not None
+                and not is_indirect_coord
+                and dev_dim_size != it_dim_size
+            ):
                 # conv2d addresses the difference between device and iteration space sizes
                 # through the window/padding machinery in _conv2d_sdsc_fields, which already
                 # accounts for the gap between the device extent and the
