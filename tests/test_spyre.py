@@ -759,6 +759,35 @@ class TestSpyre(TestCase):
         dev = src.to("spyre", device_layout=layout, copy=True)
         torch.testing.assert_close(dev.cpu(), src, rtol=0, atol=0)
 
+    def test_d2d_to_with_device_layout_compares_valid_elements(self):
+        # .to(device_layout=) on a device tensor returns it unchanged only when
+        # the requested layout is its own, valid_elements included (#5905). A
+        # layout with the same geometry but other valid extents gets a copy
+        # that carries the requested layout.
+        from torch_spyre._C import SpyreTensorLayout
+
+        src = torch.arange(64 * 128, dtype=torch.float16).reshape(64, 128)
+        dev = src.to("spyre")
+        own = dev.device_tensor_layout()
+        self.assertIs(dev.to("spyre", device_layout=own), dev)
+
+        unknown = SpyreTensorLayout(
+            list(own.device_size),
+            list(own.stride_map),
+            own.device_dtype,
+            {},
+            own.element_arrangement,
+        )
+        self.assertNotEqual(own.valid_elements, {})
+        self.assertTrue(unknown.equals_ignoring_valid_elements(own))
+
+        moved = dev.to("spyre", device_layout=unknown)
+        self.assertIsNot(moved, dev)
+        self.assertEqual(moved.device_tensor_layout(), unknown)
+        # Against dev, not src: the device fp16 format rounds some of these
+        # integers on the way in.
+        torch.testing.assert_close(moved.cpu(), dev.cpu(), rtol=0, atol=0)
+
     @parametrize("form", ["keyword", "positional"])
     @parametrize("entry", ["to_layout", "to_dynamic"])
     def test_non_blocking_forwarded_by_spyre_to(self, form, entry):

@@ -329,7 +329,9 @@ def _materialize_unaligned_scatter_source(
             )
             continue
         dense_stl = _dense_scatter_source_stl(source_layout)
-        if dense_stl == source_layout.device_layout:
+        # Density is a question of geometry. dense_stl is rebuilt from host
+        # sizes, so its valid_elements need not match the source's.
+        if dense_stl.equals_ignoring_valid_elements(source_layout.device_layout):
             logger.debug(
                 "enforce_indirect_access_layout: scatter source candidate %s "
                 "is already dense",
