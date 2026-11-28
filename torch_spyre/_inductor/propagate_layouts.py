@@ -912,8 +912,13 @@ def _reduction_layout_from_stl(
             return [sparse_stl_from_host(output, out_dtype_for_layout)]
         return []
     x_stick_expr = x_dev_coords[-1]
+    # An indirect symbol (a gather fused into the reduction) is not a loop var.
+    _, indirect_subs, _ = indirect_info_from_op(op)
     reduction_var = next(
-        iter(dep.index.free_symbols - output_dep.index.free_symbols), None
+        iter(
+            dep.index.free_symbols - output_dep.index.free_symbols - set(indirect_subs)
+        ),
+        None,
     )
 
     out_coords = host_coordinates(output, output_dep, None)
@@ -2595,6 +2600,12 @@ def _reduction_layouts(
     no dim can carry the output stick, so the output takes a synthetic stick
     (one element per stick), as in ``_topk_layouts``.
     """
+    # An index tensor of a fused gather takes no part in the reduction's layout.
+    ind_names, _, _ = indirect_info_from_op(op)
+    if ind_names:
+        args = [a for a in args if a.dep.name not in ind_names]
+        if cost_args is not None:
+            cost_args = [a for a in cost_args if a.dep.name not in ind_names]
     arg = args[0]
     layouts = []
     for stl in arg.layouts:

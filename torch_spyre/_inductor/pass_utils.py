@@ -1226,6 +1226,18 @@ def patch_env(gl: GraphLowering):
     gl.env.update(env)
 
 
+def tensorbox_name_or_none(tb: TensorBox) -> "str | None":
+    """Buffer name of ``tb``, or None if it was never realized.
+
+    A gather fused into its consumer stays an unrealized Pointwise in the
+    lowering env; it has no buffer name.
+    """
+    try:
+        return tb.get_name()
+    except NotImplementedError:
+        return None
+
+
 def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node | None:
     """Return the FX node whose lowered TensorBox has the given buffer name.
 
@@ -1247,7 +1259,7 @@ def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node 
         for fx_node, tb in graph_lowering.env.items()
         if isinstance(fx_node, torch.fx.Node)
         and isinstance(tb, TensorBox)
-        and tb.get_name() == arg_name
+        and tensorbox_name_or_none(tb) == arg_name
     ]
     if candidates:
         return candidates[0]

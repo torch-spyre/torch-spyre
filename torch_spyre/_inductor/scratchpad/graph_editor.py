@@ -313,11 +313,16 @@ class GraphEditor:
             clone_users = []
             private_user_names = {user.get_name() for user in buffer_users}
             for node in self.lowering.name_to_users[buf_name]:
-                while not isinstance(node, Buffer):
-                    assert hasattr(node, "data"), (
+                while not isinstance(node, Buffer) and hasattr(node, "data"):
+                    node = node.data
+                if not isinstance(node, Buffer):
+                    # An inlined (never realized) Loops node, such as a gather
+                    # fused into its consumer. Its consumer's buffer is
+                    # registered as the real user of this buffer.
+                    assert isinstance(node, (Pointwise, Reduction)), (
                         f"unexpected node type {type(node)} ({node})"
                     )
-                    node = node.data
+                    continue
                 keep_source = node.name in [buf_name, new_buf_name] or (
                     private and node.name not in private_user_names
                 )

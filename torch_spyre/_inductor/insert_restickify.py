@@ -37,6 +37,7 @@ from .pass_utils import (
     loop_var_ranges_from_dim_hints,
     patch_env,
     undeclared_maximum_message,
+    tensorbox_name_or_none,
 )
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.ops_handler import WrapperHandler
@@ -379,7 +380,7 @@ def _create_restickify_node(
             for fx_node, tb in graph_lowering.env.items()
             if isinstance(fx_node, torch.fx.Node)
             and isinstance(tb, TensorBox)
-            and tb.get_name() == arg_name
+            and tensorbox_name_or_none(tb) == arg_name
         ),
         None,
     )
