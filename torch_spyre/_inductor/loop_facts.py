@@ -175,6 +175,12 @@ def loop_depth(op: Operation) -> int:
     return len(enclosing_loops(op))
 
 
+def in_built_node(op: Operation) -> bool:
+    """Whether ``op`` sits in loop nodes the pipeline built (it carries their
+    chain), as opposed to an op no node holds yet or a hand-built tree."""
+    return _in_built_node(op)
+
+
 def counted_loop_path(
     op: Operation, *, include_extern: bool = False
 ) -> tuple[int, ...]:
