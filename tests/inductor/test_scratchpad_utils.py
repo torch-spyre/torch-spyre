@@ -69,6 +69,7 @@ from torch_spyre._inductor.scratchpad.utils import (
 from utils_inductor import HAS_ORTOOLS, cached_randn, compare_with_cpu
 
 _COORDS = "torch_spyre._inductor.scratchpad.utils.device_coordinates"
+_PADDED_IT_SPACE = "torch_spyre._inductor.scratchpad.utils._padded_it_space"
 
 _BUF = "buf0"
 
@@ -299,6 +300,19 @@ class BackGapTest(TestCase):
         gap. This is why the check needs real range analysis and not ``subs``.
         """
         self.assertFalse(_back_gap(sympy.Mod(d0, 5), 4, {d0: 8}))
+
+    def test_iterating_the_padding_covers_a_padded_dim(self):
+        """``d0`` over ``[0,61)`` on a dim padded to 64 (#741).
+
+        With the host extent, rows 61..63 are never reached, which is a gap.
+        When the op iterates into the padding, as work division and codegen do
+        for a padded dim, ``d0`` runs to 64 and the dim is covered. The fake op
+        is not a ``ComputedBuffer``, so the first call also checks that
+        ``_padded_it_space`` falls back to the host ranges.
+        """
+        self.assertTrue(_back_gap(d0, 64, {d0: 61}))
+        with mock.patch(_PADDED_IT_SPACE, return_value={d0: sympy.Integer(64)}):
+            self.assertFalse(_back_gap(d0, 64, {d0: 61}))
 
 
 class ExternalOperandTest(TestCase):

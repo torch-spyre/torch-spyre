@@ -51,6 +51,10 @@ from torch._inductor.ir import (
 )
 from torch._inductor.utils import fresh_cache, sympy_index_symbol
 from torch._inductor.virtualized import V
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch.utils._ordered_set import OrderedSet
 from utils_inductor import mock_op_split_space
@@ -104,6 +108,7 @@ from torch_spyre._inductor.work_division import (
     _HBM_BW_GBS,
     TensorDep,
     WorkDivisionContext,
+    _cost_model_divide_op,
     _cost_model_matmul_planner,
     _decode_weight_delivery_us,
     _default_split,
@@ -112,6 +117,7 @@ from torch_spyre._inductor.work_division import (
     _matmul_multicast_penalty,
     _matmul_split_cost,
     _work_distribution_op,
+    adjust_it_space_for_padding,
     adjust_it_space_for_sticks,
     apply_splits,
     defer_work_division,
@@ -122,6 +128,8 @@ from torch_spyre._inductor.work_division import (
     work_division_context_for_op,
     work_division_splits_are_legal,
 )
+from torch_spyre._inductor.op_spec import IndirectAccess
+from torch_spyre._inductor.padding import _pad_iteration_space
 from torch_spyre._inductor.work_division_constraints import (
     JOINT_TILING_AND_DIVISION_ATTR,
     ConstraintResult,
@@ -1196,6 +1204,361 @@ class TestMultiDimIterationSpaceSplit(unittest.TestCase):
                 [r0, r1],
                 allowed_splits={r0: frozenset({2}), r1: frozenset({2})},
             )
+
+
+def _with_padded_dim(td, sym, extent, valid_elements=None):
+    """Return ``td`` with the device dim it reads ``sym`` through grown to ``extent``.
+
+    The padding is device-only, as on a padded graph input: host size, strides
+    and ``valid_elements`` are unchanged, unless ``valid_elements`` is specified.
+    """
+    k = td.device_coords.index(sym)
+    stl = td.layout.device_layout
+    device_size = list(stl.device_size)
+    device_size[k] = extent
+    padded = SpyreTensorLayout(
+        device_size,
+        stl.stride_map,
+        stl.device_dtype,
+        stl.valid_elements if valid_elements is None else valid_elements,
+    )
+    layout = FixedTiledLayout(
+        td.layout.device, td.layout.dtype, td.layout.size, td.layout.stride, padded
+    )
+    return TensorDep(dep=td.dep, layout=layout)
+
+
+class TestAdjustItSpaceForPadding(unittest.TestCase):
+    """``adjust_it_space_for_padding`` grows a non-stick output var to the padded
+    device extent only when every dep that reads it agrees on that extent."""
+
+    def setUp(self):
+        self.rows, self.cols = _isym("d0"), _isym("d1")
+        self.it_space = {self.rows: sympy.Integer(7), self.cols: sympy.Integer(64)}
+        self.op_no_loop = SimpleNamespace()
+
+    def _dep(self, name, padded_rows=None):
+        """A ``[7, 64]`` access over (rows, cols), its row dim padded if asked."""
+        td = _tensor_dep(name, (7, 64), (self.rows, self.cols))
+        if padded_rows is None:
+            return td
+        return _with_padded_dim(td, self.rows, padded_rows)
+
+    def test_padded_input_and_output_grow_rows(self):
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, self.it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(result, {self.rows: 8, self.cols: 64})
+        # A copy: the caller's iteration space is untouched.
+        self.assertEqual(self.it_space[self.rows], 7)
+
+    def test_op_in_counted_loop_keeps_extent(self):
+        # The same deps grow rows in test_padded_input_and_output_grow_rows;
+        # only the enclosing loop differs. Unreachable end to end today
+        # (_resize_device_layout refuses a padded buffer), so pin it here.
+        op_in_loop = SimpleNamespace(
+            loop_member=LoopMember(
+                loop_group_id=(0,),
+                loop_count=[2],
+                loop_tiled_dims=[[]],
+                loop_tiled_reduction_dims=[[]],
+            )
+        )
+        result = adjust_it_space_for_padding(
+            op_in_loop, self.it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(result[self.rows], 7)
+        self.assertEqual(result, self.it_space)
+
+    def test_other_vars_keep_extent_and_order(self):
+        # k stands in for a reduction var: in it_space, in no output coordinate.
+        k = _isym("d2")
+        it_space = {self.rows: sympy.Integer(7), k: sympy.Integer(32)}
+        it_space[self.cols] = sympy.Integer(64)
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(list(result), [self.rows, k, self.cols])
+        self.assertEqual(result[k], 32)
+        self.assertEqual(result[self.cols], 64)
+
+    def test_unpadded_output_keeps_rows(self):
+        # Iterating to 8 would write past the output's allocation.
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, self.it_space, [self._dep("x", 8)], self._dep("out")
+        )
+        self.assertEqual(result, self.it_space)
+
+    def test_disagreeing_padding_keeps_rows(self):
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, self.it_space, [self._dep("x", 8)], self._dep("out", 16)
+        )
+        self.assertEqual(result, self.it_space)
+
+    def test_broadcast_input_does_not_constrain(self):
+        bias = _tensor_dep("bias", (64,), (self.cols,))
+        result = adjust_it_space_for_padding(
+            self.op_no_loop,
+            self.it_space,
+            [self._dep("x", 8), bias],
+            self._dep("out", 8),
+        )
+        self.assertEqual(result[self.rows], 8)
+
+    def test_compound_access_after_padded_dep_keeps_rows(self):
+        # x[1:8] read from a [9, 64] buffer: rows appears as ``rows + 1``. It
+        # comes after a padded identity dep, which had already fixed p = 8.
+        shifted = TensorDep(
+            dep=MemoryDep(
+                "src",
+                64 * (self.rows + 1) + self.cols,
+                (self.rows, self.cols),
+                (7, 64),
+            ),
+            layout=_fixed_tiled_layout((9, 64)),
+        )
+        result = adjust_it_space_for_padding(
+            self.op_no_loop,
+            self.it_space,
+            [self._dep("x", 8), shifted],
+            self._dep("out", 8),
+        )
+        self.assertEqual(result, self.it_space)
+
+    def test_var_in_a_stick_coordinate_keeps_extent(self):
+        # out[c, r] = x[r, c]: c is a padded non-stick dim of the output (64 ->
+        # 72) but x's stick dim, so iterating past 64 would leave x's sticks.
+        c, r = self.cols, self.rows
+        out = _with_padded_dim(_tensor_dep("out", (64, 7), (c, r)), c, 72)
+        x = TensorDep(
+            dep=MemoryDep("x", 64 * r + c, (c, r), (64, 7)),
+            layout=_fixed_tiled_layout((7, 64)),
+        )
+        it_space = {c: sympy.Integer(64), r: sympy.Integer(7)}
+        self.assertEqual(
+            adjust_it_space_for_padding(self.op_no_loop, it_space, [x], out),
+            it_space,
+        )
+
+    def test_symbolic_extent_keeps_extent(self):
+        s0 = _isym("s0")
+        it_space = {self.rows: s0, self.cols: sympy.Integer(64)}
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(result, it_space)
+
+    def test_plain_int_extents(self):
+        # Some callers build iteration spaces with Python ints, not sympy.
+        it_space = {self.rows: 7, self.cols: 64}
+        grown = adjust_it_space_for_padding(
+            self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(grown, {self.rows: 8, self.cols: 64})
+        kept = adjust_it_space_for_padding(
+            self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out")
+        )
+        self.assertEqual(kept, it_space)
+
+    def test_live_slice_output_keeps_rows(self):
+        # An op outputting into a slice of a bigger, live, buffer should not
+        # grow padding: that would overwrite the rest of the buffer.
+        out_dep = _tensor_dep("out", (8, 64), (self.rows, self.cols))
+        in_dep = self._dep("x", 8)
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, self.it_space, [in_dep], out_dep
+        )
+        self.assertEqual(result[self.rows], 7)
+
+    def test_unknown_valid_elements_keeps_rows(self):
+        # If valid_elements is empty, we cannot distinguish the case of
+        # test_live_slice_output_keeps_rows from the case of
+        # test_padded_input_and_output_grow_rows, so we should not grow.
+        out_dep = _with_padded_dim(
+            _tensor_dep("out", (7, 64), (self.rows, self.cols)), self.rows, 8, {}
+        )
+        in_dep = self._dep("x", 8)
+        result = adjust_it_space_for_padding(
+            self.op_no_loop, self.it_space, [in_dep], out_dep
+        )
+        self.assertEqual(result[self.rows], 7)
+
+
+class TestPadIterationSpaceIndirect(unittest.TestCase):
+    """``_pad_iteration_space`` never pads an op with indirect access: iterating
+    into an index tensor's padding would use garbage as indices.
+
+    Both forms are covered: work division sees an ``IndirectAccess`` call in a
+    coordinate, while codegen, before that substitution, sees the raw indirect
+    symbol, which is not an iteration var. Accesses are given as
+    ``(device_coords, device_size)`` pairs, as codegen passes them.
+    """
+
+    def setUp(self):
+        self.rows, self.cols = _isym("d0"), _isym("d1")
+        self.it_space = {self.rows: sympy.Integer(7), self.cols: sympy.Integer(64)}
+        # The output reads rows as a whole coordinate, padded 7 -> 8, so rows
+        # would grow if nothing else blocked it.
+        self.output = ([sympy.Integer(0), self.rows, self.cols], [1, 8, 64])
+        self.output_valid_elements = {(0, 2): 64, (1,): 7}
+
+    def _pad(self, gather_row_coord):
+        """Pad for ``out[rows, cols] = x[gather_row_coord, cols]``, ``x`` being
+        a 100-row source table."""
+        source = ([sympy.Integer(0), gather_row_coord, self.cols], [1, 100, 64])
+        return _pad_iteration_space(
+            self.it_space,
+            self.output[0],
+            self.output_valid_elements,
+            [source, self.output],
+        )
+
+    def test_direct_source_lets_rows_grow(self):
+        # The control: with a direct read of x, rows grows to the padded 8.
+        self.assertEqual(self._pad(sympy.Integer(3))[self.rows], 8)
+
+    def test_indirect_access_keeps_rows(self):
+        gathered = IndirectAccess(sympy.Symbol("idx"))
+        self.assertEqual(self._pad(gathered), self.it_space)
+
+    def test_raw_indirect_symbol_keeps_rows(self):
+        self.assertEqual(self._pad(sympy.Symbol("tmp0")), self.it_space)
+
+
+class TestWorkDivisionContextPadding(unittest.TestCase):
+    """``work_division_context_for_op`` offers splits of the padded extent, but
+    a tiled frame keeps its per-tile extents.
+
+    Only the inputs the context is derived from are patched; padding, the stick
+    adjustment and the factor domains run for real.
+    """
+
+    def setUp(self):
+        self.rows, self.cols = _isym("d0"), _isym("d1")
+        self.op = _computed_buffer((7, 64), name="out")
+
+    def _context(self, output_padded_rows, tiling=None, frame_it_space=None):
+        """The context for ``out = f(x)`` over ``[7, 64]``, ``x`` padded to 8
+        rows and ``out`` padded to ``output_padded_rows`` (``None``: unpadded).
+        """
+        x = _with_padded_dim(
+            _tensor_dep("x", (7, 64), (self.rows, self.cols)), self.rows, 8
+        )
+        out = _tensor_dep("out", (7, 64), (self.rows, self.cols))
+        if output_padded_rows is not None:
+            out = _with_padded_dim(out, self.rows, output_padded_rows)
+        rw = MagicMock(writes=[out.dep], reads=[x.dep])
+        with ExitStack() as stack:
+            for target, value in [
+                ("iteration_space_from_op", {self.rows: 7, self.cols: 64}),
+                ("collect_tensor_deps", ([x], out)),
+                ("op_read_writes", rw),
+                ("get_mem_deps_from_rw", []),
+                ("collect_work_division_constraints", ConstraintResult()),
+            ]:
+                stack.enter_context(
+                    patch(
+                        f"torch_spyre._inductor.work_division.{target}",
+                        return_value=value,
+                    )
+                )
+            if frame_it_space is not None:
+                stack.enter_context(
+                    patch(
+                        "torch_spyre._inductor.wsr.tile_prediction.predict_frame",
+                        return_value=MagicMock(iter_space=frame_it_space),
+                    )
+                )
+            return work_division_context_for_op(self.op, 8, tiling)
+
+    def test_padded_rows_split_the_padded_extent(self):
+        ctx = self._context(output_padded_rows=8)
+        self.assertEqual(ctx.it_space[self.rows], 8)
+        self.assertEqual(ctx.factor_domain(self.rows), [1, 2, 4, 8])
+        self.assertTrue(ctx.is_legal({self.rows: 4}))
+
+    def test_unpadded_output_splits_the_host_extent(self):
+        ctx = self._context(output_padded_rows=None)
+        self.assertEqual(ctx.it_space[self.rows], 7)
+        self.assertEqual(ctx.factor_domain(self.rows), [1, 7])
+
+    def test_a_tiled_frame_is_not_padded(self):
+        # Four tiles over the rows: each tile has 2 rows, which is far below
+        # the padded device extent of 8 but must not grow to it.
+        tiling = TileSpec((TileAxis(host_dim=0, count=4),))
+        ctx = self._context(
+            output_padded_rows=8,
+            tiling=tiling,
+            frame_it_space={self.rows: 2, self.cols: 64},
+        )
+        self.assertEqual(ctx.it_space[self.rows], 2)
+        self.assertEqual(ctx.factor_domain(self.rows), [1, 2])
+
+
+@instantiate_parametrized_tests
+class TestMatMulCostModelUsesPadding(unittest.TestCase):
+    @parametrize(
+        "rows,padded_rows,cols",
+        [
+            (24, 32, 128),
+            (40, 64, 128),
+            (12, 16, 256),
+        ],
+    )
+    def test_m_split_divides_padded_extent(self, rows, padded_rows, cols) -> None:
+        """The matmul cost model splits M over its padded extent.
+
+        x and z are padded on M; iteration_space_from_op returns the host M on
+        purpose, as it does for a real padded input. The cost model must then
+        pick an M split that divides the padded M and use every core, instead of
+        a split of the host M that align_tensors_pure shrinks later.
+        """
+        K = 64
+        cores = 32
+        m, n, k = (_isym("m"), _isym("n"), _isym("k"))
+        op = _computed_buffer(
+            (rows, cols),
+            name="z",
+            reduction_type=BATCH_MATMUL_OP,
+            reduction_ranges=(K,),
+        )
+        x = _tensor_dep("x", (rows, K), (m, k))
+        w = _tensor_dep("w", (K, cols), (k, n))
+        z = _tensor_dep("z", (rows, cols), (m, n))
+
+        x = _with_padded_dim(x, m, padded_rows)
+        z = _with_padded_dim(z, m, padded_rows)
+
+        rw = MagicMock(writes=[z.dep], reads=[x.dep, w.dep])
+        with ExitStack() as stack:
+            for target, value in [
+                ("iteration_space_from_op", {m: rows, n: cols, k: K}),
+                ("collect_tensor_deps", ([x, w], z)),
+                ("op_read_writes", rw),
+                ("get_mem_deps_from_rw", []),
+                ("_apply_input_layout_overrides", []),
+                ("collect_work_division_constraints", ConstraintResult()),
+                ("work_division_transport_indexes", None),
+            ]:
+                stack.enter_context(
+                    patch(
+                        f"torch_spyre._inductor.work_division.{target}",
+                        return_value=value,
+                    )
+                )
+
+            committed = {}
+            stack.enter_context(
+                patch(
+                    "torch_spyre._inductor.work_division.apply_splits",
+                    side_effect=lambda o, s: committed.update(s),
+                )
+            )
+            took = _cost_model_divide_op(op, cores)
+
+        self.assertTrue(took, "the cost model should re-split this matmul")
+        self.assertEqual(padded_rows % committed[m], 0, f"split {committed}")
+        self.assertEqual(math.prod(committed.values()), cores, f"split {committed}")
 
 
 class TestWorkDivisionCandidates(unittest.TestCase):

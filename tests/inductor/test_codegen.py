@@ -16,7 +16,6 @@ import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import regex as re
 import sympy
 import torch
 from torch._inductor.exc import InductorError
@@ -52,7 +51,7 @@ from torch_spyre._inductor.codegen.superdsc import (
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
-from utils_inductor import mock_backend_compiler
+from utils_inductor import mock_backend_compiler, total_core_split
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
@@ -60,26 +59,6 @@ from torch_spyre._inductor.work_division import (
     _valid_divisor_basis,
     adjust_it_space_for_sticks,
 )
-
-
-def _total_core_split(source: str) -> int:
-    """Return the product of split factors in the emitted ``iteration_space``.
-
-    Co-optimization spreads the work division across several ``c`` dims rather
-    than loading all cores onto ``c0``, so the total core usage is the product
-    of the per-dim split factors (e.g. ``c0:(256, 2), c1:(128, 4), c2:(512, 4)``
-    uses ``2 * 4 * 4 == 32`` cores).
-    """
-    match = re.search(r"iteration_space=\{([^}]*)\}", source)
-    assert match, "no iteration_space found in emitted source"
-    factors = [
-        int(f) for f in re.findall(r"sympify\('\d+'\),\s*(\d+)\)", match.group(1))
-    ]
-    assert factors, f"no split factors found in {match.group(1)!r}"
-    product = 1
-    for f in factors:
-        product *= f
-    return product
 
 
 class TestSpyreConfig(InductorTestCase):
@@ -98,7 +77,7 @@ class TestSpyreConfig(InductorTestCase):
         FileCheck().check("sdsc_fused_abs").run(source_codes[0])
         # Co-optimization spreads the split across dims; the product of the
         # per-dim split factors must add up to the configured core count.
-        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
+        self.assertEqual(total_core_split(source_codes[0]), config.sencores)
 
     @config.patch({"sencores": 64})
     def test_config_too_many_sencores(self):
@@ -123,7 +102,7 @@ class TestSpyreConfig(InductorTestCase):
         FileCheck().check("sdsc_fused_abs").run(source_codes[0])
         # Co-optimization spreads the split across dims; the product of the
         # per-dim split factors must add up to the configured core count.
-        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
+        self.assertEqual(total_core_split(source_codes[0]), config.sencores)
 
     @config.patch({"sencores": 32})
     def test_symbolic_batch_dim_pointwise_split(self):
@@ -146,7 +125,7 @@ class TestSpyreConfig(InductorTestCase):
         FileCheck().check("sdsc_fused_add").run(source_codes[0])
         # Co-optimization spreads the split across dims; the product of the
         # per-dim split factors must add up to the configured core count.
-        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
+        self.assertEqual(total_core_split(source_codes[0]), config.sencores)
 
     # ------------------------------------------------------------------
     # Unit tests for the symbolic-shape sidecar in work_division.py

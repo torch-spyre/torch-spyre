@@ -1324,3 +1324,26 @@ def loop_member_view(op):
         ],
         strict_loop_vars=strict_loop_vars(op),
     )
+
+
+def total_core_split(source: str) -> int:
+    """Return the product of split factors in the emitted ``iteration_space``.
+
+    Co-optimization spreads the work division across several ``c`` dims rather
+    than loading all cores onto ``c0``, so the total core usage is the product
+    of the per-dim split factors (e.g. ``c0:(256, 2), c1:(128, 4), c2:(512, 4)``
+    uses ``2 * 4 * 4 == 32`` cores).
+
+    Reads the first ``iteration_space`` in ``source``, i.e. the first kernel;
+    pass a source with one kernel or slice it first.
+    """
+    match = re.search(r"iteration_space=\{([^}]*)\}", source)
+    assert match, "no iteration_space found in emitted source"
+    factors = [
+        int(f) for f in re.findall(r"sympify\('\d+'\),\s*(\d+)\)", match.group(1))
+    ]
+    assert factors, f"no split factors found in {match.group(1)!r}"
+    product = 1
+    for f in factors:
+        product *= f
+    return product

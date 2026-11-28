@@ -79,8 +79,8 @@ from . import config
 
 if typing.TYPE_CHECKING:
     # Deferred to avoid a circular import: work_division.py imports from this
-    # module, so TensorDep can only be used here as a string annotation.
-    from .work_division import TensorDep
+    # module, so its types can only be used here as string annotations.
+    from .work_division import OpIterationSpace, TensorDep
 
 logger = get_inductor_logger("work_division_constraints")
 
@@ -106,6 +106,26 @@ class WorkDivConstraintContext:
     stick_vars: dict[Symbol, int]
     reduction_vars: list[Symbol]
     committed_splits: dict[Symbol, int]
+
+    @classmethod
+    def from_op_iteration_space(
+        cls,
+        op: ComputedBuffer,
+        oi_space: "OpIterationSpace",
+        committed_splits: dict[Symbol, int],
+    ) -> "WorkDivConstraintContext":
+        """The context for ``op`` over ``oi_space``, whose extents (padded,
+        or a tiled frame's) the constraints then judge."""
+        return cls(
+            op=op,
+            it_space=oi_space.it_space,
+            it_space_adjusted=oi_space.it_space_adjusted,
+            output_td=oi_space.output_td,
+            input_tds=oi_space.input_tds,
+            stick_vars=oi_space.stick_vars,
+            reduction_vars=oi_space.reduction_vars,
+            committed_splits=committed_splits,
+        )
 
 
 @dataclasses.dataclass

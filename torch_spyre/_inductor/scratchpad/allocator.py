@@ -2941,6 +2941,8 @@ def _enum_split_options(
     if len(sliced) == 1:
         source = sliced[0]
         factor = seed[source]
+        # TODO(#741): host extents. An axis whose padded extent divides by
+        # ``factor`` but whose host extent does not is never offered.
         for sym, extent in iteration_space_from_op(op).items():
             if (
                 sym is not source

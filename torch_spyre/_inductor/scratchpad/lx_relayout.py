@@ -1017,6 +1017,9 @@ def solver_relayout_edge_context(
         read_dep,
         producer_coords,
         consumer_coords,
+        # TODO(#741): host extents. A view split over a padded dim cannot
+        # project onto them, so the solver offers no relayout for it. Pad these
+        # together with collect_lx_relayout_plans and materialize_lx_relayouts.
         iteration_space_from_op(producer),
         iteration_space_from_op(consumer),
     )
@@ -1657,6 +1660,9 @@ def collect_lx_relayout_plans(
                 source_name,
             )
             continue
+        # TODO(#741): host extents, as in solver_relayout_edge_context: a source
+        # split over a padded dim fails to project and the candidate is
+        # rejected.
         try:
             work_division_from_view(
                 source_view,
