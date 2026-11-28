@@ -940,9 +940,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         splits the output alone.
 
         Adds nothing when no buffer carries a non-empty spec, which is every
-        path except the joint solve with ``auto_coarse_tiling`` on; the tiling
-        variables then stay ``None`` and every method that reads them is a
-        no-op.
+        path except the joint solve with ``auto_coarse_tiling`` on, or with
+        span-overflow menus (``coarse_tiling.span_overflow_tilings``); the
+        tiling variables then stay ``None`` and every method that reads them is
+        a no-op.
         """
         UNTILED_ID = 0
         divided = {
@@ -1188,8 +1189,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         and cannot move the sum.
 
         Returns an empty list when nothing carries a choice of tiling, which is
-        every path except the joint solve with ``auto_coarse_tiling`` on, so the
-        tile-count stage below vanishes there.
+        every path except the joint solve with ``auto_coarse_tiling`` on, or a
+        span-overflow menu of several tilings, so the tile-count stage below
+        vanishes there.
         """
         terms = []
         for name, sb in tensors.items():

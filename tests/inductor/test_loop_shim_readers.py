@@ -25,7 +25,7 @@ import pytest
 import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 from torch._inductor.ir import ComputedBuffer
 
-from torch_spyre._inductor import passes
+from torch_spyre._inductor.scratchpad import coarse_tiling
 from torch_spyre._inductor.cost_features import extract_op_features
 from torch_spyre._inductor.loop_node import all_ops
 
@@ -38,7 +38,7 @@ def _features_of_the_looped_ops(case):
     every shim op of ``case``, in graph order, read straight after the lowering;
     ``advances`` is whether that operand moves with the loop variable."""
     rows = []
-    original = passes.tile_groups
+    original = coarse_tiling.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
@@ -60,7 +60,7 @@ def _features_of_the_looped_ops(case):
 
     fn, shapes, limit, *_ = CASES[case]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with mock.patch.object(passes, "tile_groups", spy):
+    with mock.patch.object(coarse_tiling, "tile_groups", spy):
         compile_span_overflow(fn, args, limit)
     return rows
 

@@ -26,6 +26,10 @@ for_each_tile group already stamped pre-stickification at pass 430. It reuses th
 existing ``coarse_tile`` machinery verbatim; the only new work is lowering a
 ``TileSpec`` to per-op ``DimHint``s and deriving groups as consecutive runs of
 ops that run the same loop nest.
+
+It also gives the joint solve its span-overflow menus
+(:func:`span_overflow_tilings`): the planner's tilings, less those the solve
+cannot take.
 """
 
 from __future__ import annotations
@@ -33,14 +37,15 @@ from __future__ import annotations
 import dataclasses
 import operator
 from collections.abc import Mapping, Sequence
-from typing import Optional
+from typing import Any, Optional
 
 import sympy
 
 from torch._inductor.dependencies import Dep, MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, Operation, Reduction
+from torch._inductor.ir import ComputedBuffer, Operation, Pointwise, Reduction
 
+from .. import config
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
@@ -62,9 +67,10 @@ from ..wsr.coarse_tile import (
     reject_nested_loops,
     validate_coarse_tile_groups,
 )
+from ..wsr.coarse_tile_span_overflow import span_overflow_groups
 from ..wsr.loop_tiling_lowering import tile_groups
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
-from .plan_solver import CoreDivisionBuffer, TileSpec
+from .plan_solver import CoreDivisionBuffer, TileAxis, TileSpec
 from .utils import buffer_not_read_in_full
 
 # The deepest nest the allocator's search may propose. The lowering builds one
@@ -921,3 +927,304 @@ def planned_splits(
             continue
         splits[name] = on_tile
     return splits, violations
+
+
+# --------------------------------------------------------------------------
+# Span-overflow tilings the joint solve picks (#5682)
+#
+# Under CP-SAT the span-overflow pass does nothing. The allocator runs the
+# planner instead, before it reads the graph (span_overflow_tilings, called by
+# CoOptimizingAllocator._plan_span_overflow). Each op of a planner group gets a
+# menu: the tilings of it the solve can take. The solve picks one tiling from
+# each menu, and apply_chosen_tilings applies it after the solve. A group the
+# solve cannot take is tiled before the solve with the planner's tilings
+# (apply_planner_tilings), as the pass would have tiled it.
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class SpanOverflowTilings:
+    """The span-overflow planner's groups, split by who tiles them.
+
+    ``menus`` maps the name of each op the joint solve tiles to the tilings the
+    solve picks from. ``left`` holds those ops' groups: if the solve fails, the
+    fallback tiles them with the planner's tilings. ``kept`` holds the groups the
+    solve cannot take, which are tiled before the solve with the planner's
+    tilings. ``dim_hint_assignments`` holds the planner's hints for every op;
+    tiling with the planner's tilings needs them.
+    """
+
+    menus: dict[str, tuple[TileSpec, ...]]
+    left: list[tuple]
+    kept: list[tuple]
+    dim_hint_assignments: list[tuple[Operation, list]]
+
+
+class _SolveTilingContext:
+    """What the span-overflow menu filter reads off the graph, gathered once per
+    graph, and each op's tiling space, built once per op."""
+
+    def __init__(self, graph: GraphLowering) -> None:
+        from .allocator import _DivisionPins
+
+        self.graph = graph
+        self.pins = _DivisionPins(graph, allow_deferred_read_candidates=True)
+        self.region_ops = frozenset(
+            name
+            for region in prescribed_regions(graph.operations)
+            for name in region.names
+        )
+        self.readers: dict[str, list[Operation]] = {}
+        for reader in graph.operations:
+            for name in {dep.name for dep in reader.get_read_writes().reads}:
+                self.readers.setdefault(name, []).append(reader)
+        self._spaces: dict[str, Any] = {}
+
+    def tiling_space(self, op: ComputedBuffer) -> Any:
+        """The solver's own tiling space for ``op`` (``build_tiling_space``)."""
+        from ..wsr.enumerate_tilings import build_tiling_space
+
+        name = op.get_name()
+        if name not in self._spaces:
+            self._spaces[name] = build_tiling_space(
+                op, max_dims=MAX_SEARCH_TILE_DEPTH, readers=self.readers.get(name, ())
+            )
+        return self._spaces[name]
+
+
+def _planner_tiling(
+    op: ComputedBuffer, hints: Sequence[Any]
+) -> tuple[Optional[TileSpec], Optional[str]]:
+    """The planner's tiling of ``op`` (its DimHints ``hints``) as a TileSpec, or
+    ``(None, reason)`` when a hint names no single axis.
+
+    An output hint becomes the output dim whose coordinate is a function of the
+    hint's loop variable alone, and a reduction (K) hint the position of its
+    loop variable among the reduction loop variables. Those are the two frames
+    :func:`try_resolve_tile_axis_loop_vars` indexes, so the spec resolves back
+    to the planner's loop variables.
+    """
+    out_coords = op_out_coords(op)
+    axes = []
+    for hint in hints:
+        if hint.is_reduction:
+            try:
+                red_vars = reduction_loop_vars(op)
+            except StopIteration:
+                red_vars = []
+            dims = [dim for dim, var in enumerate(red_vars) if var == hint.loop_var]
+            frame = "reduction loop variables"
+        else:
+            dims = [
+                dim
+                for dim, coord in enumerate(out_coords)
+                if coord.free_symbols == {hint.loop_var}
+            ]
+            frame = "output dims"
+        if len(dims) != 1:
+            return None, f"{hint.loop_var} names {len(dims)} {frame}"
+        axes.append(
+            TileAxis(
+                host_dim=dims[0],
+                count=int(hint.split_count),
+                is_reduction=hint.is_reduction,
+            )
+        )
+    return TileSpec(tuple(axes)), None
+
+
+def _span_overflow_candidates(
+    op: ComputedBuffer, planned: Optional[TileSpec]
+) -> list[TileSpec]:
+    """Every tiling of ``op`` that may stand in for the planner's (``planned``),
+    before :func:`_span_overflow_menu` drops those the solve cannot take. Never
+    untiled: the planner found that the untiled op overflows.
+
+    TODO(#5682): generate every tiling of ``op`` whose spans fit, not just the
+    planner's. Before this returns several, the objective has to tell them
+    apart: ``cost_expr`` has no term for tile size or cut count, which is why
+    ``CoOptimizingAllocator._solve`` drops it under ``auto_coarse_tiling``.
+
+    A menu of several already has a path through the solve, but no test runs a
+    span-overflow menu of several through it: add one with the generator.
+    ``_tiling_candidates`` offers such a menu
+    (``test_an_op_with_a_menu_is_offered_its_menu``). ``_extract_op_features``
+    prices it with the symbolic tile counts ``auto_coarse_tiling`` uses, which
+    ``test_solver_auto_coarse_tiling.py`` and ``test_cost_expr_dump.py`` cover.
+    """
+    return [] if planned is None else [planned]
+
+
+def _op_refusal(op: ComputedBuffer, ctx: _SolveTilingContext) -> Optional[str]:
+    """Why the solve can take no tiling of ``op`` at all, or ``None``: it never
+    tiles a restickify, cannot state a tiling on a division it pins, and leaves
+    ``for_each_tile`` regions to the user."""
+    from ..padding import is_restickify_op
+
+    if is_restickify_op(op, ctx.graph):
+        return "a restickify"
+    reason = ctx.pins.reason(op)
+    if reason is not None:
+        return f"the solve pins its division ({reason})"
+    if op.get_operation_name() in ctx.region_ops:
+        return "inside a for_each_tile region"
+    return None
+
+
+def _tiling_refusal(
+    op: ComputedBuffer, spec: TileSpec, ctx: _SolveTilingContext
+) -> Optional[str]:
+    """Why the solve cannot take ``spec`` on ``op``, or ``None``: a reduction
+    (K) axis, for which the solve builds no accumulator nest; an axis that
+    lowers to no loop; a tiling the solver's own tiling space does not admit
+    (the stick dim, a count it does not offer); or one that leaves no legal core
+    split per tile."""
+    from ..work_division import enumerate_work_division_candidates
+
+    if any(axis.is_reduction for axis in spec.axes):
+        return "a reduction-range (K) tile"
+    _, reason = try_resolve_tile_axis_loop_vars(op, spec)
+    if reason is not None:
+        return reason
+    if not ctx.tiling_space(op).admits(spec):
+        return "the solver's tiling space does not admit it"
+    try:
+        splits = enumerate_work_division_candidates(op, config.sencores, tiling=spec)
+    except Unsupported as exc:
+        return str(exc)
+    if not splits:
+        return "no legal core split per tile"
+    return None
+
+
+def _span_overflow_menu(
+    op: ComputedBuffer, hints: Sequence[Any], ctx: _SolveTilingContext
+) -> tuple[list[TileSpec], list[str]]:
+    """The tilings of ``op`` the solve picks from, and why each other candidate
+    was dropped.
+
+    Every candidate (:func:`_span_overflow_candidates`) has to meet the
+    constraints of the solve: first those on the op (:func:`_op_refusal`), which
+    drop every candidate, then those on the tiling (:func:`_tiling_refusal`). An
+    empty menu keeps the op's group out of the solve: it is tiled with the
+    planner's tilings.
+    """
+    planned, reason = _planner_tiling(op, hints)
+    refused = [] if reason is None else [f"the planner's tiling: {reason}"]
+    candidates = _span_overflow_candidates(op, planned)
+    op_reason = _op_refusal(op, ctx) if candidates else None
+    menu: list[TileSpec] = []
+    for spec in candidates:
+        reason = op_reason or _tiling_refusal(op, spec, ctx)
+        if reason is None:
+            menu.append(spec)
+        else:
+            refused.append(f"{spec.label}: {reason}")
+    return menu, refused
+
+
+def span_overflow_tilings(graph: GraphLowering) -> SpanOverflowTilings:
+    """Run the span-overflow planner, give each op its menu, and split the
+    planner's groups by who tiles them.
+
+    The allocator calls this before the joint solve, in place of the
+    span-overflow pass (``solve_decides_span_overflow_tiling``). A group whose
+    every op has a menu (:func:`_span_overflow_menu`) is left to the solve. A
+    group is left only whole, because it is one loop nest. The other groups are
+    kept: the caller tiles them before the solve, with the planner's tilings.
+    """
+    groups, dim_hint_assignments = span_overflow_groups(graph)
+    # The pass refuses a nested group whoever would tile it; so does this.
+    reject_nested_loops(groups, "span-overflow coarse tiling")
+    hints_of = {op.get_name(): hints for op, hints in dim_hint_assignments}
+    ctx = _SolveTilingContext(graph)
+    menus: dict[str, tuple[TileSpec, ...]] = {}
+    left: list[tuple] = []
+    kept: list[tuple] = []
+    for group in groups:
+        group_menus: dict[str, tuple[TileSpec, ...]] = {}
+        for op in group[0]:
+            name = op.get_name()
+            menu, refused = _span_overflow_menu(op, hints_of[name], ctx)
+            if not menu:
+                logger.debug(
+                    "span-overflow group of %s tiled with the planner's tilings: %s",
+                    name,
+                    "; ".join(refused),
+                )
+                kept.append(group)
+                break
+            group_menus[name] = tuple(menu)
+        else:
+            menus.update(group_menus)
+            left.append(group)
+    return SpanOverflowTilings(menus, left, kept, list(dim_hint_assignments))
+
+
+def _tile_planner_groups(
+    graph: GraphLowering,
+    groups: list[tuple],
+    dim_hint_assignments: Sequence[tuple[Operation, list]],
+) -> None:
+    """Tile ``groups`` with the planner's hints."""
+    # span_overflow_groups is a pure planning step: it decides each op's
+    # dim_hints but does not set them.  Apply them now, before
+    # validate_coarse_tile_groups/tile_groups run, since dim_hints is an input
+    # those consume (the plan's hint lookups), not something they produce.
+    # Only the members of ``groups``: an op the solve tiles carries no hints.
+    members = {id(op) for group_ops, _levels in groups for op in group_ops}
+    for op, dim_hints in dim_hint_assignments:
+        if id(op) in members:
+            op.dim_hints = dim_hints  # type: ignore[attr-defined]
+    # Compute offset to avoid loop_group_id collision with any groups already
+    # stamped by splice_while_loops (for_each_tile), or by an earlier call on
+    # the same graph (the groups the solve cannot take, before a failed solve's
+    # fallback tiles the others).
+    # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
+    used_ids = [
+        counted_loop_path(op, include_extern=True)[0]
+        for op in graph.operations
+        if counted_loop_path(op, include_extern=True)
+    ]
+    group_idx_offset = max(used_ids, default=-1) + 1
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    validate_coarse_tile_groups(groups)
+    reject_nested_loops(groups, "span-overflow coarse tiling")
+    request_loop_nodes(
+        graph,
+        tile_groups(
+            graph,
+            groups=groups,
+            group_idx_offset=group_idx_offset,
+        ),
+    )
+
+
+def apply_planner_tilings(
+    graph: GraphLowering,
+    groups: list[tuple],
+    dim_hint_assignments: Sequence[tuple[Operation, list]],
+) -> None:
+    """Tile ``groups`` with the planner's tilings.
+
+    The span-overflow pass calls this before work division. Under CP-SAT the
+    allocator calls it instead: for the groups the solve cannot take, before the
+    solve, and for the others if the solve fails. Work division has been
+    deferred by then (``defer_work_division``), so the ops the tiling adds join
+    the deferred set, as they would have if the pass had added them. Before
+    work division nothing is deferred, and nothing joins.
+    """
+    if not groups:
+        return
+    from ..work_division import deferred_work_division
+
+    before = {op.get_name() for op in graph.operations}
+    _tile_planner_groups(graph, groups, dim_hint_assignments)
+    deferred_work_division(graph).update(
+        op.get_name()
+        for op in graph.operations
+        if op.get_name() not in before
+        and isinstance(op, ComputedBuffer)
+        and isinstance(op.data, (Pointwise, Reduction))
+    )

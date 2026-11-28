@@ -197,6 +197,53 @@ Two ordering constraints fix this slot:
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
   for device-memory size computation.
 
+### Span-overflow tiling in the solve
+
+Under CP-SAT with ortools, the span-overflow pass does nothing. The
+co-optimizing allocator runs the planner instead, before it first reads the
+graph (`CoOptimizingAllocator._plan_span_overflow`, at the start of
+`_prepare_buffers`). The pass and the allocator ask one switch,
+`allocator_plans_span_overflow`, so they agree on who runs it. One function in
+`coarse_tiling.py`, `span_overflow_tilings(graph)`, does the work. It runs the planner, which
+decides which ops tile and groups them into loop nests. Each op of a group then
+gets a menu of the tilings the solve can take (`_span_overflow_menu`), in two
+steps:
+
+1. Generate the candidates (`_span_overflow_candidates`). For now that is the
+   planner's tiling alone; generating every tiling that fits is the next step.
+2. Drop each candidate the solve cannot take. On the op: a restickify, an op
+   the solve pins, an op in a `for_each_tile` region. On the tiling: a
+   reduction-range (K) axis, an axis that lowers to no loop, a tiling the
+   solver's tiling space does not admit (the stick dim), and one that leaves no
+   legal core split per tile.
+
+A group whose every op has a non-empty menu is left to the solve. The allocator
+keeps the menus as a dict from op name to tilings (`span_overflow_menus`), and
+`_tiling_candidates` offers an op its menu, as it offers auto tiling's options.
+Each op's candidates are the divisions of each menu tiling's per-tile frame, so
+the solve picks a tiling with the split, and `apply_chosen_tilings` applies it
+after the solve. The cost objective prices a one-tiling menu with its concrete
+tile counts, and a menu of several with the symbolic counts
+`auto_coarse_tiling` uses. Every other group is tiled with the planner's
+tilings right away (`apply_planner_tilings`), so the solve plans the graph the
+pass would have built for those groups. If the solve fails, the groups left to
+it get the planner's tilings before greedy placement
+(`tile_span_overflow_left`).
+
+The tiling of a group the solve cannot take now runs after `plan_sharded_hbm`,
+work division and `report_output_layouts`, not before them. Under CP-SAT work
+division only records the ops to divide later, and the ops tiling adds join
+that record. A graph with sharded placements keeps the pass, because the shard
+plan must see every op that reads a sharded buffer, and tiling adds such ops.
+
+Until the generator offers more than the planner's tiling, the solve applies
+the same tiling the pass would have. What changes is when it is applied: the
+solve plans the untiled op with that tiling, where before it planned the
+already-tiled op, so two adjacent groups with equal trip counts can share one
+nest. The planner tiles a 2-D op on its
+stick dim, which the solver's tiling space does not admit, so a 2-D op stays
+with the pass until the candidates include other tilings.
+
 ## Optimizations on softmax
 
 The softmax example (`max → sub → exp → sum → div` over a `(512, 1024)`

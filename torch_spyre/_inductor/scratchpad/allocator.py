@@ -133,8 +133,11 @@ from torch_spyre._inductor.scratchpad.graph_editor import (
 )
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     MAX_SEARCH_TILE_DEPTH,
+    SpanOverflowTilings,
     apply_chosen_tilings,
+    apply_planner_tilings,
     planned_splits,
+    span_overflow_tilings,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor.constants import (
@@ -2554,6 +2557,82 @@ def _fp8_matmul_consumer_seeds(graph: GraphLowering) -> dict[str, list[Operation
     return result
 
 
+class _DivisionPins:
+    """Which ops the joint solve must keep at their fixed core division, and why.
+
+    The joint solve normally picks each op's core split itself. For some ops any
+    split other than the one work division gives them is wrong code or a
+    scheduling hazard, so the solve keeps that one: the op is pinned.
+    ``reason(op)`` says why an op is pinned, or returns ``None`` when the solve
+    may pick its split. ``_division_map`` gives a pinned op its fixed division as
+    its only candidate, and the span-overflow menu filter
+    (``coarse_tiling._op_refusal``) gives a pinned op no tiling, since the solve
+    cannot tile an op it must keep at the fixed division of the untiled op.
+
+    Each guard detects a distinct wrong-code or scheduling hazard the joint
+    solver would hit by re-slicing the op, and all share the one remedy: keep
+    the fixed division. A resolved user work_div hint takes the same remedy,
+    last so a hazard guard's reason is the one logged: work division already
+    committed the hint, and the pin is whole-op, so unhinted dims keep their
+    committed split of 1. When work division was left to the solve, a pin
+    divides the op first (``_upstream_core_division``).
+    """
+
+    FP8_GROUP = "fp8 matmul layout group"
+
+    def __init__(
+        self, graph: GraphLowering, *, allow_deferred_read_candidates: bool
+    ) -> None:
+        self._graph = graph
+        self._allow_deferred_read_candidates = allow_deferred_read_candidates
+        self._offset_mutation_ops = ops_in_offset_mutation_component(graph)
+        self._layout_group_reason = _fused_layout_group_ops(
+            graph,
+            {
+                KEEP_BY_INDEX_OP: "keep_by_index layout group",
+                MASK_BY_INDEX_OP: "mask_by_index layout group",
+                BATCH_MATMUL_FP8_OP: self.FP8_GROUP,
+            },
+        )
+
+    def reason(self, op: Operation) -> Optional[str]:
+        if _is_cpu_host_buffer(op):
+            return "cpu/host buffer"
+        if op.name in self._offset_mutation_ops:
+            return "offset mutation forward closure"
+        if _is_windowed_pool(op):
+            return "windowed pool"
+        if op.name in self._layout_group_reason:
+            return self._layout_group_reason[op.name]
+        if _is_indirect_access_op(op):
+            return "indirect access entry split"
+        if _reads_offset_slice(op):
+            return "offset slice read"
+        if (
+            is_restickify_op(op, self._graph)
+            and hasattr(op, "_read_copy_elision_record")
+            and not (
+                self._allow_deferred_read_candidates
+                and config.read_copy_elision
+                and isinstance(op._read_copy_elision_record, ReadCopyElisionRecord)
+            )
+        ):
+            # The preparation path may provisionally enumerate ordinary
+            # legal candidates, but retains them only after proving and
+            # pricing the direct read in the actual allocation context.
+            # Other callers and unrecognized records keep the fixed pin.
+            return "deferred direct graph-input read"
+        if isinstance(op, ComputedBuffer) and getattr(op, "shard_pinned_splits", None):
+            return "shard plan"
+        if (
+            not config.ignore_work_division_hints
+            and isinstance(op, ComputedBuffer)
+            and has_resolved_work_div_hint(op)
+        ):
+            return "user work_div hint"
+        return None
+
+
 def _fixed_core_division(op: Operation) -> CoreDivision:
     """The op's committed symbol-keyed division, or a one-core division."""
     ownership = getattr(op, "iteration_space_ownership", None)
@@ -3331,6 +3410,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         self._decides_lx_relayouts = layout_planning.decides_lx_relayouts()
         self._tilings_from_menu = layout_planning.tilings_from_menu()
+        # The span-overflow menus (``coarse_tiling.span_overflow_tilings``): op
+        # name -> the tilings the solve picks from. ``_plan_span_overflow`` sets
+        # them, and keeps the planner's groups for a failed solve.
+        self.span_overflow_menus: Mapping[str, tuple[TileSpec, ...]] = {}
+        self._span_overflow: Optional[SpanOverflowTilings] = None
         if config.lx_planner_relayout and not self._decides_lx_relayouts:
             logger.debug(
                 "%s does not decide LX relayouts; continuing without relayout",
@@ -3344,6 +3428,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         lx_relayout_plans: list[LXRelayoutPlan] | None = None,
     ) -> Sequence[Any]:
         # Joint selection derives its own divisions; fixed-division plans do not apply.
+        self._plan_span_overflow(graph)
         # Validate the post-loop drain plans exactly once, here, before the
         # solver runs: the residency gate, the lifetime extension and the push
         # must all consume this same object.  Re-deriving it after the solve
@@ -3393,6 +3478,49 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # allocation context and recheck the remaining expanded reads.
             # Rejection is monotonic, so this terminates after at most one pin
             # per deferred read, without changing the graph or the late proof.
+
+    @property
+    def takes_span_overflow_tilings(self) -> bool:
+        """Takes span-overflow menus (``span_overflow_menus``): it takes tilings
+        off its menus, which are not pruned around the committed split."""
+        return self._tilings_from_menu and not self.prune
+
+    def _plan_span_overflow(self, graph: GraphLowering) -> None:
+        """Run the span-overflow planner here, in place of its pass, when this
+        solve picks the tilings.
+
+        :func:`allocator_plans_span_overflow` decides whether it does; this
+        calls it with ``self``. The pass calls the same function with the
+        configured allocator, so exactly one of the two runs the planner.
+
+        A group the solve cannot take is tiled at once, with the planner's
+        tilings, before anything here reads the graph. For every other group,
+        each op's menu is kept for :meth:`_tiling_candidates`, and the group
+        for :meth:`tile_span_overflow_left`, which tiles it if the solve fails.
+        """
+        self.span_overflow_menus = {}
+        self._span_overflow = None
+        if not allocator_plans_span_overflow(self, graph):
+            return
+        with timing_recorder.stage(
+            "stage:CoOptimizingAllocator:span_overflow_tilings"
+        ) as event:
+            tilings = span_overflow_tilings(graph)
+        event.meta["menu_ops"] = len(tilings.menus)
+        event.meta["left_groups"] = len(tilings.left)
+        event.meta["kept_groups"] = len(tilings.kept)
+        apply_planner_tilings(graph, tilings.kept, tilings.dim_hint_assignments)
+        self.span_overflow_menus = tilings.menus
+        self._span_overflow = tilings
+
+    def tile_span_overflow_left(self, graph: GraphLowering) -> None:
+        """After a failed solve, tile the span-overflow groups left to it with
+        the planner's tilings, so greedy placement plans the graph the pass
+        would have built. Does nothing the second time."""
+        tilings, self._span_overflow = self._span_overflow, None
+        self.span_overflow_menus = {}
+        if tilings is not None:
+            apply_planner_tilings(graph, tilings.left, tilings.dim_hint_assignments)
 
     @staticmethod
     def _direct_read_candidates_priced(op, divisions, buffers) -> bool:
@@ -3523,6 +3651,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     bufmap,
                     default_is_lx,
                     op=pricing_by_name[output_name],
+                    menu=self.span_overflow_menus.get(output_name),
                 )
                 for output_name in feature_names
             }
@@ -3617,7 +3746,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         return result
 
-    def _extract_op_features(self, graph, output_name, buffers, is_lx, *, op=None):
+    def _extract_op_features(
+        self, graph, output_name, buffers, is_lx, *, op=None, menu=None
+    ):
         """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
 
         Same extraction as dump_cost_model.extract_op_features, but keyed off
@@ -3632,6 +3763,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         symbolic count (``sym_tile_counts``) is keyed on the op's own loop
         variable for that axis. With no tiled candidate there are none, and the
         extractor reads the op's committed tiling (its enclosing loops) as before.
+        An op with a span-overflow ``menu`` is priced tiled whatever
+        ``auto_coarse_tiling`` says: with its concrete tile counts when the menu
+        holds one tiling, so the expression keeps no tile-count symbol, and by
+        the same symbolic counts when it holds several.
         """
         from torch_spyre._inductor.cost_features import extract_op_features
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -3647,7 +3782,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         ws = _work_slices(op, division)
         sym_tiling: dict = {}
-        if config.auto_coarse_tiling:
+        if menu is not None and len(menu) == 1:
+            (only,) = menu
+            loop_vars, reason = try_resolve_tile_axis_loop_vars(op, only)
+            if loop_vars is None:
+                raise Unsupported(reason)
+            for var, axis in zip(loop_vars, only.axes):
+                sym_tiling[var] = sym_tiling.get(var, 1) * axis.count
+        elif menu is not None or config.auto_coarse_tiling:
             for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
                 spec = TileSpec((TileAxis(host_dim, 1, is_reduction),))
                 loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
@@ -3963,71 +4105,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 for name in {dep.name for dep in reader.get_read_writes().reads}:
                     self._readers_by_name.setdefault(name, []).append(reader)
 
-        # Ops pinned to their committed (work-division) division: each guard
-        # detects a distinct wrong-code or scheduling hazard the joint solver
-        # would hit by re-slicing the op, and all share the one remedy -- keep the
-        # fixed division. A resolved user work_div hint takes the same remedy,
-        # last so a hazard guard's reason is the one logged: work division
-        # already committed the hint, and the pin is whole-op -- unhinted dims
-        # keep their committed split of 1. When work division was left to this
-        # solve, a pin divides the op first (``_upstream_core_division``). The
-        # graph-level group sets are loop-invariant, so build them once here
-        # rather than rescanning graph.operations for every op.
-        offset_mutation_ops = ops_in_offset_mutation_component(graph)
-        fp8_group_reason = "fp8 matmul layout group"
-        layout_group_reason = _fused_layout_group_ops(
-            graph,
-            {
-                KEEP_BY_INDEX_OP: "keep_by_index layout group",
-                MASK_BY_INDEX_OP: "mask_by_index layout group",
-                BATCH_MATMUL_FP8_OP: fp8_group_reason,
-            },
+        pins = _DivisionPins(
+            graph, allow_deferred_read_candidates=allow_deferred_read_candidates
         )
         fp8_consumer_seeds = _fp8_matmul_consumer_seeds(graph)
         prep_cache: dict = {}
         result = {}
         enumerated = set()
         for op in graph.operations:
-            reason: Optional[str] = None
-            if _is_cpu_host_buffer(op):
-                reason = "cpu/host buffer"
-            elif op.name in offset_mutation_ops:
-                reason = "offset mutation forward closure"
-            elif _is_windowed_pool(op):
-                reason = "windowed pool"
-            elif op.name in layout_group_reason:
-                reason = layout_group_reason[op.name]
-            elif _is_indirect_access_op(op):
-                reason = "indirect access entry split"
-            elif _reads_offset_slice(op):
-                reason = "offset slice read"
-            elif (
-                is_restickify_op(op, graph)
-                and hasattr(op, "_read_copy_elision_record")
-                and not (
-                    allow_deferred_read_candidates
-                    and config.read_copy_elision
-                    and isinstance(op._read_copy_elision_record, ReadCopyElisionRecord)
-                )
-            ):
-                # The preparation path may provisionally enumerate ordinary
-                # legal candidates, but retains them only after proving and
-                # pricing the direct read in the actual allocation context.
-                # Other callers and unrecognized records keep the fixed pin.
-                reason = "deferred direct graph-input read"
-            elif isinstance(op, ComputedBuffer) and getattr(
-                op, "shard_pinned_splits", None
-            ):
-                reason = "shard plan"
-            elif (
-                not config.ignore_work_division_hints
-                and isinstance(op, ComputedBuffer)
-                and has_resolved_work_div_hint(op)
-            ):
-                reason = "user work_div hint"
+            reason = pins.reason(op)
 
             aligned: Optional[CoreDivision] = None
-            if reason == fp8_group_reason and op.name in fp8_consumer_seeds:
+            if reason == _DivisionPins.FP8_GROUP and op.name in fp8_consumer_seeds:
                 aligned = self._seed_aligned_division(
                     op,
                     fp8_consumer_seeds[op.name],
@@ -4062,6 +4151,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     enumerated.add(op.name)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
+            menu = self.span_overflow_menus.get(op.name)
+            if menu is not None and any(d.tiling not in menu for d in divs):
+                # The menu filter gives a pinned op no menu, so only a
+                # disagreement gets here: the graph changed after the filter ran
+                # (the groups the solve cannot take were tiled in between). Left
+                # untiled, the op would keep a span the hardware cannot address,
+                # so fail the solve. Its fallback tiles every group left to the
+                # solve with the planner's tilings.
+                logger.warning(
+                    "%s: core-division candidates off its span-overflow menu; "
+                    "falling back to the planner's tilings and greedy placement",
+                    op.name,
+                )
+                raise SolveError(f"{op.name}: candidates off its span-overflow menu")
             # The core budget is an invariant of the MENU, not of its consumers: both
             # engines pin an op's split symbols to one enumerated candidate, so nothing
             # downstream re-checks the product -- and `_matmul_split_cost`'s own budget
@@ -4170,10 +4273,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op.data, (Pointwise, Reduction)
         ):
             return fixed(), False
-        try:
-            candidates = enumerate_work_division_candidates(op, max_cores)
-        except Unsupported as exc:
-            return _legal_fixed_division(op, fixed(), str(exc)), False
+        if op.get_name() in self.span_overflow_menus:
+            # A span-overflow menu holds no untiled option, so the op's untiled
+            # frame (whose span floors may be illegal) is never enumerated.
+            candidates = []
+        else:
+            try:
+                candidates = enumerate_work_division_candidates(op, max_cores)
+            except Unsupported as exc:
+                return _legal_fixed_division(op, fixed(), str(exc)), False
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
         # Each tiling option gets its own division enumeration: the legal split
@@ -4271,7 +4379,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         other op inside a ``for_each_tile`` region (``_prescribed_ops``): the
         user's loop covers it even where no level stamped it. The solve reads no
         hints of its own.
+
+        An op with a span-overflow menu (``span_overflow_menus``) is offered
+        that menu, whatever ``auto_coarse_tiling`` says.
         """
+        menu = self.span_overflow_menus.get(op.get_name())
+        if menu is not None:
+            return list(menu)
         untiled = [TileSpec()]
         if not (config.auto_coarse_tiling and self._tilings_from_menu):
             return untiled
@@ -5866,6 +5980,54 @@ def solve_decides_work_division() -> bool:
     return solver_cls is not None and solver_cls.chooses_core_divisions()
 
 
+def allocator_plans_span_overflow(
+    allocator: ScratchpadAllocator, graph: GraphLowering
+) -> bool:
+    """Whether ``allocator`` runs the span-overflow planner on ``graph`` itself,
+    in place of the span-overflow pass, so that the solve picks the tilings
+    (:meth:`CoOptimizingAllocator._plan_span_overflow`).
+
+    This is the one switch for who runs the planner. The allocator asks it about
+    itself, and the pass about the configured allocator
+    (:func:`solve_decides_span_overflow_tiling`), so a patch here switches both.
+
+    Span-overflow tiling must be on, and the allocator must take span-overflow
+    menus. That is CP-SAT with ortools. The annealer, the pruned exhaustive
+    search and the placement-only allocators keep the pass. Work division must
+    be left to the solve as well (:func:`solve_decides_work_division`), because
+    the planner's tilings are then applied after work division. A graph with
+    sharded placements keeps the pass: the shard plan, which runs after the
+    pass, must see every op that reads a sharded buffer, and tiling adds such
+    ops.
+    """
+    from torch_spyre._inductor.sharded_hbm import graph_placements
+
+    if config.ignore_span_overflow_hints or not solve_decides_work_division():
+        return False
+    if not (
+        isinstance(allocator, CoOptimizingAllocator)
+        and allocator.takes_span_overflow_tilings
+    ):
+        return False
+    return not graph_placements(graph)
+
+
+def solve_decides_span_overflow_tiling(graph: GraphLowering) -> bool:
+    """Whether the allocator :func:`select_allocator` builds runs the
+    span-overflow planner on ``graph``, in place of the pass
+    (:func:`allocator_plans_span_overflow`). The span-overflow pass asks this.
+    """
+    # The cheap checks first, so no allocator is built when the answer is no.
+    if config.ignore_span_overflow_hints or not solve_decides_work_division():
+        return False
+    try:
+        allocator = select_allocator()
+    except ValueError:
+        # A solver config select_allocator refuses; scratchpad_planning raises it.
+        return False
+    return allocator_plans_span_overflow(allocator, graph)
+
+
 def scratchpad_planning(
     graph: GraphLowering,
     allocator: Optional[ScratchpadAllocator] = None,
@@ -5890,11 +6052,14 @@ def scratchpad_planning(
     try:
         allocator.plan_allocation(graph, lx_relayout_plans=lx_relayout_plans)
     except SolveError as error:
-        # Strong exception guarantee: SolveError comes from the solve, before the
+        # Strong exception guarantee: SolveError comes from the solve, or from the
+        # span-overflow menu check before it (``_division_map``), before the
         # allocator commits divisions, relayouts or addresses, and select_allocator
-        # configures no pre-passes. The graph is unchanged, so greedy placement
-        # replans it with the work divisions already committed and recollects
-        # relayout plans itself.
+        # configures no pre-passes. The one change to the graph before it is the
+        # span-overflow groups the solve cannot take, tiled with the planner's
+        # tilings, which the fallback keeps. So greedy placement replans the graph
+        # with the work divisions already committed and recollects relayout plans
+        # itself.
         # Keep the failed allocator's post-allocation passes: select_allocator
         # adds LxContextSwitchingPass under the same flag that lets residency skip
         # the extern-kernel liveness guard, so dropping it would leave LX buffers
@@ -5905,9 +6070,10 @@ def scratchpad_planning(
             config.layout_solver,
             error,
         )
-        # Work division may have been left to the failed solve
-        # (``defer_work_division``): divide what it left, so greedy placement
-        # plans with the splits the pass would have committed up front.
+        # Tile and divide what was left to the failed solve, in that order, so
+        # greedy placement plans the graph the passes would have built.
+        if isinstance(allocator, CoOptimizingAllocator):
+            allocator.tile_span_overflow_left(graph)
         divide_deferred_ops(graph)
         ScratchpadAllocator(
             GreedyLayoutSolver,

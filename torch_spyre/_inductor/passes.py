@@ -55,7 +55,7 @@ from .temp_passes import (
     mm_to_bmm_pass,
     strided_stick_slice_to_index_select,
 )
-from .wsr.coarse_tile import reject_nested_loops, validate_coarse_tile_groups
+from .wsr.coarse_tile import validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
 from .wsr.for_each_tile_lowering import clear_marker_maps, splice_while_loops
 from . import config
@@ -90,8 +90,10 @@ from .work_division import (
 from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
+    solve_decides_span_overflow_tiling,
     solve_decides_work_division,
 )
+from .scratchpad.coarse_tiling import apply_planner_tilings
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import sink_collective_waits, spyre_fuse_nodes
 from .scheduler import (
@@ -101,14 +103,12 @@ from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .loop_carries import apply_loop_carries
 from .loop_checker import check_loops
-from .loop_facts import counted_loop_path
 from .loop_node import (
     OpsView,
     all_ops,
     build_pending_loop_nodes,
     expand,
     has_loop_nodes,
-    request_loop_nodes,
 )
 from . import loop_scheduler
 from .dedup_constants import dedup_and_promote_constants
@@ -390,6 +390,7 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
     span_overflow_groups,
     validate_coarse_tile_groups,
     tile_groups,
+    apply_planner_tilings,
 )
 def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """Span-overflow coarse tiling only.  Runs POST-stickification.
@@ -402,39 +403,16 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     committed every op's device layout by this point, so a read-copy here
     would only produce an HBM-to-HBM copy with no layout-reconciliation
     benefit.
+
+    Under CP-SAT (``solve_decides_span_overflow_tiling``) the pass does nothing:
+    the LX planning allocator runs the planner instead, before the solve
+    (``CoOptimizingAllocator._plan_span_overflow``), so that the solve picks the
+    tilings.
     """
-    if config.ignore_span_overflow_hints:
+    if config.ignore_span_overflow_hints or solve_decides_span_overflow_tiling(graph):
         return
     groups, dim_hint_assignments = span_overflow_groups(graph)
-    if not groups:
-        return
-    # span_overflow_groups is a pure planning step: it decides each op's
-    # dim_hints but does not set them.  Apply them now, before
-    # validate_coarse_tile_groups/tile_groups run, since dim_hints is an input
-    # those consume (the plan's hint lookups), not something they produce.
-    for op, dim_hints in dim_hint_assignments:
-        op.dim_hints = dim_hints  # type: ignore[attr-defined]
-    # Compute offset to avoid loop_group_id collision with any groups already
-    # stamped by splice_while_loops (for_each_tile).
-    # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
-    used_ids = [
-        counted_loop_path(op, include_extern=True)[0]
-        for op in graph.operations
-        if counted_loop_path(op, include_extern=True)
-    ]
-    group_idx_offset = max(used_ids, default=-1) + 1
-    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
-    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
-    validate_coarse_tile_groups(groups)
-    reject_nested_loops(groups, "span-overflow coarse tiling")
-    request_loop_nodes(
-        graph,
-        tile_groups(
-            graph,
-            groups=groups,
-            group_idx_offset=group_idx_offset,
-        ),
-    )
+    apply_planner_tilings(graph, groups, dim_hint_assignments)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
@@ -642,7 +620,8 @@ class CustomPreSchedulingPasses:
             #
             # Working Set Reduction (device-layout-aware, post-stickification)
             # These passes require FixedTiledLayout.device_layout (device_size,
-            # stride_map, elems_per_stick) for physical span arithmetic.
+            # stride_map, elems_per_stick) for physical span arithmetic. Under
+            # CP-SAT the planner runs in LX planning instead (see the pass).
             _maybe_coarse_tile_span_overflow,
             #
             # Core Division

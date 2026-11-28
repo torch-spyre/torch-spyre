@@ -46,7 +46,9 @@ it is rejected instead.
 """
 
 import contextlib
+from types import SimpleNamespace
 from unittest import mock
+from unittest.mock import MagicMock
 
 import pytest
 import regex as re
@@ -56,9 +58,12 @@ from torch._inductor.utils import run_and_get_code
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._inductor import config
-from torch_spyre._inductor import nonstick_dim_order, passes, work_division
+from torch_spyre._inductor import nonstick_dim_order, work_division
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import coarse_tiling, ilp_solver_ortools
 from torch_spyre._inductor.scratchpad.coarse_tiling import MAX_SEARCH_TILE_DEPTH
+from torch_spyre._inductor.scratchpad.plan_solver import SolveError, TileAxis, TileSpec
 from torch_spyre._inductor.wsr import span_overflow_hint_analysis
 from torch_spyre._inductor.wsr.coarse_tile import reject_nested_loops
 from torch_spyre.constants import DEVICE_NAME
@@ -85,11 +90,18 @@ def _shaped(shape, seed):
 
 
 class _Compiled:
-    def __init__(self, outputs, groups, added, code):
+    def __init__(self, outputs, groups, added, code, paths, kept):
         self.outputs = outputs
         self.groups = groups  # [(ops in group, [data type of each], [trip counts])]
         self.added = added  # names of ops the transform added, in order
         self.code = code  # normalised generated code
+        # Who applied each group: "pass" (passes.py, before the solve or in a
+        # failed solve's fallback) or "solve" (apply_tilings, after the solve).
+        self.paths = paths
+        # [(op name, why each candidate tiling was dropped)] for each op whose
+        # menu came out empty, for the failure messages of the tests that check
+        # who tiles a group.
+        self.kept = kept
 
 
 _RUN_SPECIFIC = (
@@ -108,12 +120,36 @@ def normalise(text):
     return text
 
 
-def compile_span_overflow(fn, args, limit_bytes):
-    """Compile ``fn`` with span-overflow on and the span limit lowered."""
-    formed, added = [], []
-    original = passes.tile_groups
+def compile_span_overflow(fn, args, limit_bytes, *, in_solve=True):
+    """Compile ``fn`` with span-overflow on and the span limit lowered.
+
+    The lowering is watched at ``coarse_tiling.tile_groups``, which both the
+    planner's tilings and the solve's reach. A call inside ``apply_tilings`` is
+    the solve's ("solve"); any other call applies the planner's tilings
+    ("pass"): in the pass, or under CP-SAT for the groups the solve cannot take.
+    Each op whose menu came out empty is recorded with why each candidate was
+    dropped. ``in_solve=False`` keeps every group with the pass."""
+    formed, added, paths, kept = [], [], [], []
+    original = coarse_tiling.tile_groups
+    solve_apply = coarse_tiling.apply_tilings
+    in_solve_apply = [False]
+    menu_of = coarse_tiling._span_overflow_menu
+
+    def solve_applies(choices, graph):
+        in_solve_apply[0] = True
+        try:
+            return solve_apply(choices, graph)
+        finally:
+            in_solve_apply[0] = False
+
+    def record_kept(op, hints, ctx):
+        menu, refused = menu_of(op, hints, ctx)
+        if not menu:
+            kept.append((op.get_name(), refused))
+        return menu, refused
 
     def spy(graph, groups, group_idx_offset=0):
+        path = "solve" if in_solve_apply[0] else "pass"
         before = {op.get_operation_name() for op in graph.operations}
         formed.extend(
             (
@@ -123,6 +159,7 @@ def compile_span_overflow(fn, args, limit_bytes):
             )
             for ops, levels in groups
         )
+        paths.extend(path for _ in groups)
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
         added.extend(
             op.get_operation_name()
@@ -131,9 +168,16 @@ def compile_span_overflow(fn, args, limit_bytes):
         )
         return result
 
+    # The one switch for who runs the planner: the pass and the allocator ask it.
+    in_pass = mock.patch.object(
+        allocator_module, "allocator_plans_span_overflow", lambda allocator, g: False
+    )
     torch._dynamo.reset()
     with (
-        mock.patch.object(passes, "tile_groups", spy),
+        mock.patch.object(coarse_tiling, "tile_groups", spy),
+        mock.patch.object(coarse_tiling, "apply_tilings", solve_applies),
+        mock.patch.object(coarse_tiling, "_span_overflow_menu", record_kept),
+        contextlib.nullcontext() if in_solve else in_pass,
         span_limit(limit_bytes),
         config.patch({"ignore_span_overflow_hints": False}),
         torch._inductor.config.patch(force_disable_caches=True),
@@ -146,6 +190,8 @@ def compile_span_overflow(fn, args, limit_bytes):
         formed,
         added,
         normalise("\n".join(code)),
+        paths,
+        kept,
     )
 
 
@@ -184,6 +230,16 @@ CASES = {
         4 * MB,
         [(2, ["Pointwise", "Pointwise"], [2])],
         ["op", "op", r"coarse_tile_copy_", r"coarse_tile_copy_"],
+    ),
+    # In 2-D the planner tiles the stick dim, the outermost device dim of
+    # (M, N). In 3-D it tiles M, so this chain is the one group of several ops
+    # the CP-SAT solve can take (SOLVE_CASES).
+    "pointwise_chain_3d": (
+        lambda a, b, c: (a + b) * c,
+        [(8, 2048, 256)] * 3,
+        4 * MB,
+        [(2, ["Pointwise", "Pointwise"], [2])],
+        ["op", r"coarse_tile_copy_"],
     ),
     # A matmul tiled on an OUTPUT dim has no accumulator: like a pointwise op it
     # computes a tile into a scratch buffer and a coarse_tile_copy_* op writes it out.
@@ -276,6 +332,362 @@ def test_the_current_lowering_on_a_compiled_span_overflow_graph(case):
     # the K-tiled accumulation, about 4e-3. 2e-2 leaves headroom without hiding a
     # wrong tile or a NaN.
     assert _relative_error(compiled.outputs, reference) < 2e-2
+
+
+# The cases whose groups the CP-SAT solve takes; the pass applies the others'.
+# The pass keeps a K tile and a tiling of the stick dim, which the solve cannot
+# take. The planner tiles every 2-D case on its stick dim (dim 1, the outermost
+# device dim of (M, N); see the steps in test_span_overflow_loop_terms.py), so
+# only the 3-D cases, tiled on M, go to the solve. A case missing here that the
+# solve takes fails the test below, which checks every case.
+SOLVE_CASES = {"pointwise_chain_3d", "bmm_output_tiled"}
+
+_CPSAT = {
+    "lx_planning": True,
+    "co_optimizing_lx_planning": True,
+    "layout_solver": "cpsat",
+}
+
+needs_ortools = pytest.mark.skipif(
+    ilp_solver_ortools.cp_model is None,
+    reason="the CP-SAT solve, which takes span-overflow tilings, needs ortools",
+)
+
+
+@needs_ortools
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_the_solve_takes_the_groups_it_can_and_builds_the_same_loops(case):
+    """The same planner groups, the same ops added and the same result, whether
+    the pass applies a group before the solve or the solve applies it after."""
+    fn, shapes, limit, groups, patterns = CASES[case]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with config.patch(_CPSAT):
+        solved = compile_span_overflow(fn, args, limit)
+        passed = compile_span_overflow(fn, args, limit, in_solve=False)
+
+    tiled_by = "solve" if case in SOLVE_CASES else "pass"
+    assert passed.paths == ["pass"] * len(groups), passed.paths
+    assert solved.paths == [tiled_by] * len(groups), (solved.paths, solved.kept)
+    assert solved.groups == passed.groups == groups, (solved.groups, passed.groups)
+    assert _matches(solved.added, patterns), (solved.added, patterns)
+    reference = fn(*[a.float() for a in args])
+    # As in test_the_current_lowering_on_a_compiled_span_overflow_graph.
+    assert _relative_error(solved.outputs, reference) < 2e-2
+
+
+@needs_ortools
+def test_a_failed_solve_applies_the_groups_left_to_it():
+    """When the solve fails, the groups left to it are applied before greedy
+    placement, by the pass's own apply, so the compile still tiles them."""
+    fn, shapes, limit, groups, patterns = CASES["pointwise_chain_3d"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    offered = []
+
+    def fail(solver, cost_expr):
+        offered.append(
+            sorted(
+                buf.name
+                for buf in solver.buffers
+                if any(
+                    not cd.tiling.is_untiled
+                    for cd in getattr(buf, "core_divisions", None) or ()
+                )
+            )
+        )
+        raise SolveError("failed by the test")
+
+    with (
+        config.patch(_CPSAT),
+        mock.patch.object(
+            ilp_solver_ortools.CpSatLayoutSolver,
+            "plan_layout_and_core_divisions",
+            fail,
+        ),
+    ):
+        compiled = compile_span_overflow(fn, args, limit)
+
+    # The solve was offered the chain's two tiled ops, and failed.
+    assert len(offered) == 1 and len(offered[0]) == 2, (offered, compiled.kept)
+    assert compiled.paths == ["pass"], compiled.paths
+    assert compiled.groups == groups, compiled.groups
+    assert _matches(compiled.added, patterns), (compiled.added, patterns)
+    reference = fn(*[a.float() for a in args])
+    assert _relative_error(compiled.outputs, reference) < 2e-2
+
+
+@needs_ortools
+def test_only_cpsat_with_ortools_takes_span_overflow_tilings():
+    """The predicate asks ``select_allocator``, so this states the outcome
+    independently: only CP-SAT with ortools takes the menus, only with
+    span-overflow tiling and LX planning on, and only on a graph without sharded
+    placements, which the shard plan must see tiled."""
+    on = {"ignore_span_overflow_hints": False, "lx_planning": True}
+    cases = [  # (config changes, ortools present, expected)
+        ({"layout_solver": "cpsat"}, True, True),
+        # Without ortools this builds the exhaustive search, which takes no menus.
+        ({"layout_solver": "cpsat", "allow_exhaustive_search": True}, False, False),
+        ({"layout_solver": "simulated_annealing"}, True, False),
+        ({"layout_solver": "cpsat", "ignore_span_overflow_hints": True}, True, False),
+        ({"layout_solver": "cpsat", "lx_planning": False}, True, False),
+    ]
+    decides = allocator_module.solve_decides_span_overflow_tiling
+    for changes, with_ortools, expected in cases:
+        cp_model = ilp_solver_ortools.cp_model if with_ortools else None
+        with (
+            config.patch({**on, **changes}),
+            mock.patch.object(ilp_solver_ortools, "cp_model", cp_model),
+        ):
+            assert decides(SimpleNamespace()) == expected, changes
+    sharded = SimpleNamespace(_spyre_sharded_placements={"x": object()})
+    with config.patch({**on, "layout_solver": "cpsat"}):
+        assert not decides(sharded)
+
+
+def _stand_in(name):
+    reads = SimpleNamespace(reads=[])
+    return SimpleNamespace(
+        get_name=lambda: name,
+        get_operation_name=lambda: name,
+        get_read_writes=lambda: reads,
+    )
+
+
+def test_a_group_is_left_to_the_solve_only_whole():
+    """A member with an empty menu keeps its whole group out of the solve: it is
+    tiled with the planner's tilings. The other groups' ops get their menus."""
+    spec = TileSpec((TileAxis(host_dim=0, count=2),))
+    ops = [_stand_in(name) for name in ("buf0", "buf1", "buf2")]
+    groups = [(ops[:2], [(10000, 2)]), (ops[2:], [(10001, 2)])]
+    hints = [(op, [object()]) for op in ops]
+
+    def menu(op, hints, ctx):
+        refused = ([], ["d0:2: a restickify"])
+        return refused if op.get_name() == "buf1" else ([spec], [])
+
+    with (
+        mock.patch.object(
+            coarse_tiling, "span_overflow_groups", lambda graph: (groups, hints)
+        ),
+        mock.patch.object(coarse_tiling, "_SolveTilingContext", lambda graph: None),
+        mock.patch.object(coarse_tiling, "_span_overflow_menu", menu),
+    ):
+        tilings = coarse_tiling.span_overflow_tilings(SimpleNamespace(operations=ops))
+
+    assert tilings.kept == groups[:1]
+    assert tilings.left == groups[1:]
+    assert tilings.menus == {"buf2": (spec,)}
+    assert tilings.dim_hint_assignments == hints
+
+
+_D0, _D1 = (TileSpec((TileAxis(host_dim=dim, count=2),)) for dim in (0, 1))
+
+
+def _menu_of(candidates, *, op_refusal=None, tiling_refusals=None):
+    """``_span_overflow_menu`` on a stand-in op, with the planner's tiling ``_D0``,
+    the given candidates and the given refusals."""
+    tiling_refusals = tiling_refusals or {}
+    with (
+        mock.patch.object(
+            coarse_tiling, "_planner_tiling", lambda op, hints: (_D0, None)
+        ),
+        mock.patch.object(
+            coarse_tiling,
+            "_span_overflow_candidates",
+            lambda op, planned: candidates,
+        ),
+        mock.patch.object(coarse_tiling, "_op_refusal", lambda op, ctx: op_refusal),
+        mock.patch.object(
+            coarse_tiling,
+            "_tiling_refusal",
+            lambda op, spec, ctx: tiling_refusals.get(spec),
+        ),
+    ):
+        return coarse_tiling._span_overflow_menu(_stand_in("buf0"), [], None)
+
+
+def test_the_menu_keeps_each_candidate_the_solve_can_take():
+    """Each candidate is checked on its own and the menu keeps their order. A
+    refusal on the op drops every candidate, whatever the tiling checks say."""
+    stick = {_D0: "the stick dim"}
+    assert _menu_of([_D0, _D1], tiling_refusals=stick) == (
+        [_D1],
+        ["d0:2: the stick dim"],
+    )
+    assert _menu_of([_D1, _D0]) == ([_D1, _D0], [])
+    assert _menu_of([_D0, _D1], op_refusal="a restickify") == (
+        [],
+        ["d0:2: a restickify", "d1:2: a restickify"],
+    )
+
+
+def test_the_candidates_are_the_planners_tiling_alone():
+    """The generator is a TODO: it offers the planner's tiling, or nothing when
+    the planner's hints name no single axis."""
+    op = _stand_in("buf0")
+    assert coarse_tiling._span_overflow_candidates(op, _D0) == [_D0]
+    assert coarse_tiling._span_overflow_candidates(op, None) == []
+
+
+def test_a_k_tile_is_refused_before_anything_reads_the_op():
+    """The solve builds no accumulator nest for a reduction-range tile."""
+    k_tile = TileSpec((TileAxis(host_dim=0, count=8, is_reduction=True),))
+    reason = coarse_tiling._tiling_refusal(None, k_tile, None)
+    assert reason == "a reduction-range (K) tile"
+
+
+def test_tiling_with_the_planner_defers_the_ops_it_adds():
+    """``apply_planner_tilings`` tiles the groups with the planner's hints. When
+    it runs after work division was deferred, the ops the tiling adds join the
+    deferred set, as they would have when the pass tiled before work division.
+    With no groups it does nothing."""
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    added = MagicMock(spec=ComputedBuffer, data=MagicMock(spec=Pointwise))
+    added.get_name.return_value = "coarse_tile_copy_buf2"
+    a, b = _stand_in("buf1"), _stand_in("buf2")
+    graph = SimpleNamespace(operations=[a, b])
+    setattr(graph, work_division._DEFERRED_WORK_DIVISION, {"buf1", "buf2"})
+    group = ([a, b], [(10001, 2)])
+    hints = [(a, ["buf1"]), (b, ["buf2"])]
+    tiled = []
+
+    def tile(graph, groups, hints):
+        tiled.append((groups, hints))
+        graph.operations.append(added)
+
+    with mock.patch.object(coarse_tiling, "_tile_planner_groups", tile):
+        coarse_tiling.apply_planner_tilings(graph, [group], hints)
+        coarse_tiling.apply_planner_tilings(graph, [], hints)
+
+    assert tiled == [([group], hints)]
+    deferred = work_division.deferred_work_division(graph)
+    assert deferred == {"buf1", "buf2", "coarse_tile_copy_buf2"}
+
+
+@needs_ortools
+def test_the_allocator_runs_the_planner_and_tiles_what_the_solve_cannot_take():
+    """Under CP-SAT the allocator runs the span-overflow step itself. It tiles
+    the kept groups with the planner's tilings and keeps the menus of the
+    others. After a failed solve it tiles the groups left to the solve, once."""
+    with config.patch(_CPSAT):
+        allocator = allocator_module.select_allocator()
+    tilings = coarse_tiling.SpanOverflowTilings(
+        menus={"buf0": (_D0,)},
+        left=[("left",)],
+        kept=[("kept",)],
+        dim_hint_assignments=[("op", [])],
+    )
+    graph = object()
+    tiled = []
+    with (
+        mock.patch.object(
+            allocator_module, "allocator_plans_span_overflow", lambda a, g: True
+        ),
+        mock.patch.object(allocator_module, "span_overflow_tilings", lambda g: tilings),
+        mock.patch.object(
+            allocator_module,
+            "apply_planner_tilings",
+            lambda g, groups, hints: tiled.append((g, groups, hints)),
+        ),
+    ):
+        allocator._plan_span_overflow(graph)
+        assert allocator.span_overflow_menus == {"buf0": (_D0,)}
+        assert tiled == [(graph, tilings.kept, tilings.dim_hint_assignments)]
+        allocator.tile_span_overflow_left(graph)
+        allocator.tile_span_overflow_left(graph)
+    assert tiled[1:] == [(graph, tilings.left, tilings.dim_hint_assignments)]
+    assert allocator.span_overflow_menus == {}
+
+    # When the pass runs the planner, the allocator does not.
+    with mock.patch.object(
+        allocator_module, "allocator_plans_span_overflow", lambda a, g: False
+    ):
+        allocator._plan_span_overflow(graph)
+    assert allocator.span_overflow_menus == {} and len(tiled) == 2
+
+
+@needs_ortools
+def test_a_failed_solve_tiles_what_was_left_to_it_then_divides():
+    """If the solve fails, the groups left to it are tiled with the planner's
+    tilings, then the work division the solve left is done, then greedy
+    placement runs."""
+    with config.patch(_CPSAT):
+        allocator = allocator_module.select_allocator()
+    graph = object()
+    order = []
+    with (
+        mock.patch.object(
+            allocator, "plan_allocation", side_effect=SolveError("failed by the test")
+        ),
+        mock.patch.object(
+            allocator,
+            "tile_span_overflow_left",
+            side_effect=lambda graph: order.append(("tile", graph)),
+        ),
+        mock.patch.object(
+            allocator_module,
+            "divide_deferred_ops",
+            side_effect=lambda graph: order.append(("divide", graph)),
+        ),
+        mock.patch.object(
+            allocator_module.ScratchpadAllocator,
+            "plan_allocation",
+            autospec=True,
+            side_effect=lambda *args, **kwargs: order.append(("greedy",)),
+        ),
+    ):
+        allocator_module.scratchpad_planning(graph, allocator, lx_relayout_plans=[])
+
+    assert order == [("tile", graph), ("divide", graph), ("greedy",)]
+
+
+@needs_ortools
+def test_a_candidate_off_the_menu_fails_the_solve_instead_of_the_compile():
+    """If ``_division_map`` gives an op with a menu a candidate off that menu
+    (here the op became pinned after the filter ran), it raises ``SolveError``.
+    The fallback then tiles with the planner's tilings, so the compile goes on."""
+    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
+
+    with config.patch(_CPSAT):
+        allocator = allocator_module.select_allocator()
+    allocator.span_overflow_menus = {"buf0": (_D0,)}
+    op = SimpleNamespace(name="buf0", get_name=lambda: "buf0")
+    pins = allocator_module._DivisionPins
+    with (
+        config.patch({"auto_coarse_tiling": False}),
+        mock.patch.object(
+            allocator_module, "_find_distinct_matmul_splits", return_value=((), ())
+        ),
+        mock.patch.object(
+            allocator_module, "_fp8_matmul_consumer_seeds", lambda graph: {}
+        ),
+        mock.patch.object(pins, "__init__", lambda self, graph, **kwargs: None),
+        mock.patch.object(pins, "reason", lambda self, op: "user work_div hint"),
+        mock.patch.object(
+            allocator_module, "_upstream_core_division", return_value=CoreDivision({})
+        ),
+        mock.patch.object(
+            allocator_module, "_legal_fixed_division", lambda op, divs, reason: divs
+        ),
+        pytest.raises(SolveError, match="buf0: candidates off its span-overflow menu"),
+    ):
+        allocator._division_map(
+            SimpleNamespace(operations=[op]), allow_deferred_read_candidates=True
+        )
+
+
+def test_an_op_with_a_menu_is_offered_its_menu():
+    """Whatever ``auto_coarse_tiling`` says, and with no untiled option."""
+    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+    op = SimpleNamespace(
+        loop_member=None, get_operation_name=lambda: "op0", get_name=lambda: "buf0"
+    )
+    owner = SimpleNamespace(span_overflow_menus={"buf0": (_D0, _D1)})
+    for auto in (False, True):
+        with config.patch({"auto_coarse_tiling": auto}):
+            candidates = CoOptimizingAllocator._tiling_candidates(owner, op, 4)
+            assert candidates == [_D0, _D1]
 
 
 @expects_raise
@@ -386,6 +798,7 @@ def test_the_allocator_asks_the_enumerator_for_one_level_only():
         _readers_by_name={},
         _get_op_name=lambda o: "pointwise",
         _solver_chooses_tilings=True,
+        span_overflow_menus={},
     )
     with (
         config.patch({"auto_coarse_tiling": True}),
@@ -405,23 +818,29 @@ def test_the_allocator_asks_the_enumerator_for_one_level_only():
 def test_no_third_enumerator_call_in_the_allocator_escapes_the_bound():
     """The test above covers the two known call sites. This is the structural
     backstop for a new one: every call to the enumerator in ``allocator.py`` must
-    pass ``max_dims=MAX_SEARCH_TILE_DEPTH``. (``enumerate_tilings.py`` calls itself
-    with the bound it was given, and the allocator is its only other caller.)"""
+    pass ``max_dims=MAX_SEARCH_TILE_DEPTH``, and so must the one in
+    ``coarse_tiling.py``, which builds the tiling space the span-overflow menus
+    are checked against. (``enumerate_tilings.py`` calls itself with the bound it
+    was given, and these two modules are its only other callers.)"""
     import ast
     import inspect
 
     from torch_spyre._inductor.scratchpad import allocator
 
-    tree = ast.parse(inspect.getsource(allocator))
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and getattr(node.func, "id", getattr(node.func, "attr", None))
-        in ("enumerate_tile_options", "build_tiling_space")
-    ]
+    def enumerator_calls(module):
+        return [
+            node
+            for node in ast.walk(ast.parse(inspect.getsource(module)))
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None))
+            in ("enumerate_tile_options", "build_tiling_space")
+        ]
+
+    calls = enumerator_calls(allocator)
     assert len(calls) == 2, [ast.unparse(c)[:60] for c in calls]
-    for call in calls:
+    menu_calls = enumerator_calls(coarse_tiling)
+    assert len(menu_calls) == 1, [ast.unparse(c)[:60] for c in menu_calls]
+    for call in calls + menu_calls:
         bound = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}.get("max_dims")
         assert bound == "MAX_SEARCH_TILE_DEPTH", ast.unparse(call)
 
