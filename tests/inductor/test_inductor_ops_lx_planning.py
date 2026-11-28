@@ -186,6 +186,9 @@ INHERITED_TEST_ATTRIBUTES = [
     # tests are self-contained, but test_conv3d_via_conv2d_base delegates here.
     "_run_conv3d_via_conv2d",
     "_assert_conversion_on_device",
+    # Shared bodies of the var/std tests and the deterministic-mode tests.
+    "_check_var_std",
+    "_deterministic_algorithms",
 ]
 
 POINTWISE_TEST_FAILURES = []

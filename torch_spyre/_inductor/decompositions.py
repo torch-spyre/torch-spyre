@@ -3283,6 +3283,53 @@ def spyre_cumsum(
     return result.squeeze(-1) if rank1 else result.transpose(dim, -2)
 
 
+# Inductor lowers var/std to a welford reduction, which Spyre has no kernel
+# for; compute them from mean and sum instead.
+def _spyre_var_mean(x, dim, correction, keepdim):
+    dims = [dim] if isinstance(dim, int) else list(dim or range(x.dim()))
+    n = math.prod(x.shape[d] for d in dims)
+    mean = torch.mean(x, dims, keepdim=True)
+    c = x - mean
+    # A mean of squares rather than their sum: a 16-bit sum over a large
+    # reduction exceeds the format's range. torch divides by
+    # max(0, N - correction), and a zero divisor gives nan / inf.
+    divisor = max(0, n - (1 if correction is None else correction))
+    scale = n / divisor if divisor else float("inf")
+    var = torch.mean(c * c, dims, keepdim=keepdim) * scale
+    return var, mean if keepdim else mean.squeeze(dims)
+
+
+@register_spyre_decompositions([torch.ops.aten.var.correction])
+def spyre_var(x, dim=None, *, correction=None, keepdim=False):
+    return _spyre_var_mean(x, dim, correction, keepdim)[0]
+
+
+@register_spyre_decompositions([torch.ops.aten.var_mean.correction])
+def spyre_var_mean(x, dim=None, *, correction=None, keepdim=False):
+    return _spyre_var_mean(x, dim, correction, keepdim)
+
+
+@register_spyre_decompositions([torch.ops.aten.std.correction])
+def spyre_std(x, dim=None, *, correction=None, keepdim=False):
+    return torch.sqrt(_spyre_var_mean(x, dim, correction, keepdim)[0])
+
+
+@register_spyre_decompositions([torch.ops.aten.std_mean.correction])
+def spyre_std_mean(x, dim=None, *, correction=None, keepdim=False):
+    var, mean = _spyre_var_mean(x, dim, correction, keepdim)
+    return torch.sqrt(var), mean
+
+
+@register_spyre_decompositions([torch.ops.aten.logsumexp.default])
+def spyre_logsumexp(x, dim, keepdim=False):
+    # The composite logsumexp masks an infinite max with masked_fill_ and
+    # reduces through sum.out, neither of which runs eagerly on Spyre.
+    m = torch.amax(x, dim, keepdim=True)
+    m = torch.where(torch.abs(m) == float("inf"), torch.zeros_like(m), m)
+    out = torch.log(torch.sum(torch.exp(x - m), dim, keepdim=True)) + m
+    return out if keepdim else out.squeeze(dim)
+
+
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
 #: dense (groups==1) conv contracts over C_in*kH*kW; that per-output-channel
 #: weight working set grows with k**2 and, at k>3 with a stick-aligned C_in>=64,

@@ -29,6 +29,7 @@ test_suite_config:
             - TestOps::test_embedding.*
             # isin family — test_isin.* covers all test_isin_* variants
             - TestOps::test_isin.*
+            - TestOps::test_interpolate_nearest_1d.*
             # inplace / copy — test_inplace_copy.* covers noncontiguous variant too
             - TestOps::test_inplace_copy.*
             - TestOps::test_inplace_op.*
