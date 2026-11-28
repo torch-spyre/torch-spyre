@@ -38,7 +38,7 @@ import sympy
 from sympy.core.function import AppliedUndef
 from sympy.printing.printer import Printer
 
-from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval, operands
 
 if TYPE_CHECKING:
     from ortools.sat.python import cp_model, cp_model_helper
@@ -270,12 +270,7 @@ class _SympyExprToCpSat(Printer):
             return None  # Preserve the ordinary printer's required default.
         if isinstance(expr, AppliedUndef):
             return None  # An implemented function is _print_AppliedUndef's lookup.
-        args = (
-            [part for pair in expr.args for part in pair]
-            if expr.is_Piecewise
-            else expr.args
-        )
-        evaluated = [self._candidate_values(arg) for arg in args]
+        evaluated = [self._candidate_values(arg) for arg in operands(expr)]
         if any(value is None for value in evaluated):
             return None
         owners = [value[0] for value in evaluated if value[0] is not None]

@@ -27,7 +27,11 @@ from sympy.logic.boolalg import Boolean
 from sympy.utilities.lambdify import implemented_function
 
 from torch_spyre._inductor.scratchpad import cpsat_expr_printer
-from torch_spyre._inductor.scratchpad.cost_expr_numpy import NUMPY_FUNC_MAP, numpy_eval
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import (
+    NUMPY_FUNC_MAP,
+    numpy_eval,
+    operands,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 x, y = sympy.symbols("split_x split_y", integer=True, positive=True)
@@ -36,20 +40,16 @@ MENU = {x: [1, 2, 4, 8], y: [8, 2, 4, 1]}
 
 
 def _value(expr: sympy.Basic, env: dict[sympy.Symbol, Any]) -> Any:
-    """expr's value where each symbol has its value in env: the core applied to each
-    node's operands' values, from the leaves up, as a caller of the core does."""
+    """expr's value where each symbol has its value in env: the core applied to the
+    values of each node's operands (operands), from the leaves up, as a caller of the
+    core does."""
     if expr in env:
         return env[expr]
     if expr is sympy.true or expr is sympy.false:
         return bool(expr)
     if expr.is_Number:
         return int(expr) if expr.is_Integer else float(expr)
-    operands = (
-        [part for pair in expr.args for part in pair.args]
-        if expr.is_Piecewise
-        else expr.args
-    )
-    return numpy_eval(expr, [_value(operand, env) for operand in operands])
+    return numpy_eval(expr, [_value(operand, env) for operand in operands(expr)])
 
 
 def _sympy_value(expr: sympy.Basic, point: dict[sympy.Symbol, int]) -> Any:
@@ -162,6 +162,63 @@ def test_a_plain_int_stays_exact_at_any_size():
     floats = [0.1, 0.2, 0.3]
     assert numpy_eval(x + y + 1, floats) == sum(floats)
     assert numpy_eval(x * y * 2, floats) == math.prod(floats)
+
+
+# Forms lambdify prints by their node: a Mul with a negative power as one division and
+# a rational coefficient as a factor, (1/49)*x; a power of a half as sqrt(x) and of
+# minus a half as 1/sqrt(x).
+PRINTED_FORMS = [
+    98 / x,
+    x / 49,
+    98 * x / y**2,
+    x / (3 * y),
+    x / sympy.sqrt(y),
+    sympy.floor(98 / x),
+    98 / x >= 2,
+    sympy.sqrt(x),
+    x ** sympy.Rational(-1, 2),
+    x ** sympy.Rational(3, 2),
+    x**-2,
+]
+
+
+def test_a_mul_or_a_pow_is_computed_as_lambdify_prints_it():
+    """98/x is Mul(98, Pow(x, -1)): from the value of 1/x it would be 98 * (1/x), one
+    ulp under 2 at x = 49. A Mul reads a power with a negative exponent as its base
+    (operands) and divides once by it, and multiplies by a rational, as lambdify
+    prints x/49; a lone x**(-1/2) is 1/sqrt(x). Each value is lambdify's to the bit,
+    over floats and over the printer's exact ints."""
+    assert math.floor(98 * (1 / 49)) == 1
+    assert operands(98 / x) == [98, x]
+    assert operands(x / 49) == [sympy.Rational(1, 49), x]
+    assert set(operands(x * y**-2)) == {x, y}
+    assert set(operands(x**2 * y)) == {x**2, y}
+    floats = {x: np.asarray([49.0, 7.0, 98.0]), y: 4.0}
+    ints = {x: np.asarray([49, 7, 98], dtype=object), y: 4}
+    for expr in PRINTED_FORMS:
+        over_floats = sympy.lambdify([x, y], expr, modules="numpy")
+        at_ints = sympy.lambdify([x, y], expr, modules="math")
+        expected = list(over_floats(floats[x], floats[y]))
+        assert list(_value(expr, floats)) == expected, expr
+        expected = [at_ints(value, ints[y]) for value in ints[x]]
+        assert list(_value(expr, ints)) == expected, expr
+
+
+def test_a_mul_multiplies_in_the_order_lambdify_prints_it():
+    """lambdify multiplies a Mul's factors in as_ordered_factors() order, which need
+    not be the order of its args: here the args put the Piecewise before the sum, and
+    multiplying in that order is one ulp off lambdify at x = 0, y = 1."""
+    pick = sympy.Piecewise((1.09235648634148, sympy.Eq(y, 1)), (1.7, True))
+    c = sympy.Float("0.00666666666666667")
+    expr = sympy.Mul(c, pick, 128000 - 128000 * x, evaluate=False)
+    assert list(expr.args) != expr.as_ordered_factors() == operands(expr)
+    by_args = math.prod([0.00666666666666667, 1.09235648634148, 128000])
+    printed = math.prod([0.00666666666666667, 128000, 1.09235648634148])
+    assert by_args != printed
+    env = {x: np.asarray([0.0, 0.0, 1.0]), y: np.asarray([1.0, 2.0, 1.0])}
+    lambdified = sympy.lambdify([x, y], expr, modules="numpy")
+    assert list(_value(expr, env)) == list(lambdified(env[x], env[y]))
+    assert _value(expr, {x: 0.0, y: 1.0}) == printed
 
 
 def test_a_number_stands_at_every_entry():
