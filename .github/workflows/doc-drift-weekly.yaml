@@ -1,0 +1,306 @@
+name: weekly-doc-maintenance
+
+# Runs the weekly-doc-maintenance skill in two jobs.
+#
+# edit: Claude audits docs/source and edits the checkout. The job holds only the
+# API key and a read-only token. Claude can edit files under docs/source only and
+# has no shell. The changed doc files and the PR text are uploaded as an artifact.
+#
+# publish: a fresh checkout of main. It accepts from the artifact only regular
+# files under docs/source ending in .md, .rst or .svg (no symlinks), builds the
+# docs with the docs.yaml command, and only then creates the spyre-bot app token
+# to commit through the API (signed, and the PR runs the normal checks).
+#
+# The workflow does nothing until the ANTHROPIC_API_KEY secret is set, and it
+# skips while an earlier weekly PR is open, so it never overwrites review edits.
+on:
+  schedule:
+    - cron: 17 7 * * 1   # Mondays 07:17 UTC
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Which part of the docs to audit.
+        type: choice
+        options:
+          - ops-table
+          - full
+        default: ops-table
+
+concurrency:
+  group: weekly-doc-maintenance
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BRANCH: bot/weekly-doc-maintenance
+  # A scheduled run reads the scope from a repository variable, so it can be
+  # widened to "full" without a code change.
+  SCOPE: ${{ inputs.scope || vars.DOC_MAINTENANCE_SCOPE || 'ops-table' }}
+
+jobs:
+  edit:
+    if: github.repository == 'torch-spyre/torch-spyre' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      changed: ${{ steps.collect.outputs.changed }}
+    env:
+      HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - name: Check that the API key is set and no weekly PR is open
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${HAS_API_KEY}" != "true" ]; then
+            echo "::notice::ANTHROPIC_API_KEY is not set; skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          OPEN="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" \
+            --state open --json url --jq '.[0].url // ""')"
+          if [ -n "${OPEN}" ]; then
+            echo "::notice::Weekly doc PR still open (${OPEN}); skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: steps.gate.outputs.run == 'true'
+        with:
+          persist-credentials: false
+
+      # Edit and Write are allowed under docs/source only; with no matching
+      # allow rule a headless run denies the call. The deny rules are a second
+      # layer. There is no Bash tool: the publish job builds the docs. Reads of
+      # the process environment (/proc), the runner temp directory and dot
+      # directories in the home directory are denied, so the agent cannot read
+      # ANTHROPIC_API_KEY. The secret scan in publish is the check that does
+      # not depend on these rules.
+      - name: Run the weekly-doc-maintenance skill
+        if: steps.gate.outputs.run == 'true'
+        id: claude
+        uses: anthropics/claude-code-action@c84e279f859e2591391e95bd309286eb111c345f # v1.0.284
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Invoke the weekly-doc-maintenance skill and follow it exactly.
+            The audit scope for this run is: ${{ env.SCOPE }}.
+            Edit .md, .rst and .svg files under docs/source only. Return the pull
+            request title and body in the structured output.
+          claude_args: |
+            --max-turns 80
+            --allowedTools "Read,Glob,Grep,Edit(docs/source/**)"
+            --disallowedTools "Bash,WebFetch,WebSearch,Edit(.git/**),Edit(.github/**),Edit(.claude/**),Edit(**/*.py),Read(//proc/**),Read(//sys/**),Read(//home/runner/work/_temp/**),Read(~/.*/**)"
+            --json-schema '{"type":"object","properties":{"changed":{"type":"boolean"},"title":{"type":"string"},"body":{"type":"string"}},"required":["changed","title","body"]}'
+
+      - name: Collect the changed doc files
+        if: steps.gate.outputs.run == 'true'
+        id: collect
+        env:
+          RESULT: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/doc-changes"
+          mkdir -p "${OUT}/files"
+          git status --porcelain=v1 -z --untracked-files=all > "${RUNNER_TEMP}/status"
+          python3 - "${RUNNER_TEMP}/status" "${OUT}" <<'PYEOF'
+          import json, os, shutil, sys
+          status_file, out = sys.argv[1:]
+          entries = [e for e in open(status_file, "rb").read().decode().split("\0") if e]
+          changed, ignored = [], []
+          for e in entries:
+              code, path = e[:2], e[3:]
+              # Files the action leaves outside docs/source are never published.
+              if not path.startswith("docs/source/"):
+                  ignored.append(path)
+                  continue
+              # The agent has no tool that deletes or renames a file.
+              if "D" in code or "R" in code:
+                  sys.exit(f"::error::Unexpected deletion or rename: {path!r}")
+              changed.append(path)
+              dest = os.path.join(out, "files", path)
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              shutil.copyfile(path, dest, follow_symlinks=False)
+          for path in ignored:
+              print(f"::warning::Ignoring a change outside docs/source: {path}")
+          result = json.loads(os.environ.get("RESULT") or "{}")
+          json.dump(
+              {"changed": changed,
+               "title": result.get("title", ""), "body": result.get("body", "")},
+              open(os.path.join(out, "manifest.json"), "w"),
+          )
+          print("\n".join(changed) or "No changes under docs/source.")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"changed={'true' if changed else 'false'}\n")
+          PYEOF
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.collect.outputs.changed == 'true'
+        with:
+          name: doc-changes
+          path: ${{ runner.temp }}/doc-changes
+          retention-days: 7
+
+  publish:
+    needs: edit
+    if: needs.edit.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: doc-changes
+          path: ${{ runner.temp }}/doc-changes
+
+      # The artifact is untrusted. Accept only regular files under docs/source
+      # ending in .md, .rst or .svg; anything else fails the run.
+      - name: Apply the allowed doc files
+        run: |
+          set -euo pipefail
+          python3 - "${RUNNER_TEMP}/doc-changes" <<'PYEOF'
+          import json, os, posixpath, shutil, stat, sys
+          src = sys.argv[1]
+          allowed = (".md", ".rst", ".svg")
+          manifest = json.load(open(os.path.join(src, "manifest.json")))
+
+          def check(path):
+              norm = posixpath.normpath(path)
+              if (norm != path or not norm.startswith("docs/source/")
+                      or ".." in norm.split("/") or not norm.endswith(allowed)):
+                  sys.exit(f"::error::Rejected path: {path!r}")
+
+          for path in manifest["changed"]:
+              check(path)
+              f = os.path.join(src, "files", path)
+              if not stat.S_ISREG(os.lstat(f).st_mode):
+                  sys.exit(f"::error::Not a regular file: {path!r}")
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              if os.path.islink(path):
+                  sys.exit(f"::error::Target is a symlink: {path!r}")
+              shutil.copyfile(f, path)
+
+          # Every file in the artifact must be listed in the manifest.
+          listed = set(manifest["changed"])
+          for root, _, files in os.walk(os.path.join(src, "files")):
+              for name in files:
+                  rel = os.path.relpath(os.path.join(root, name), os.path.join(src, "files"))
+                  if rel not in listed:
+                      sys.exit(f"::error::Unlisted file in artifact: {rel!r}")
+          PYEOF
+          git status --short
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install docs dependencies
+        run: pip install -r docs/requirements.txt regex==2026.7.19
+
+      # Same command as the Build docs check in docs.yaml. No token exists yet.
+      - name: Build docs
+        run: python -m sphinx docs/source docs/build/html -W --keep-going
+
+      # The artifact text is published under the app's name, so fail the run if
+      # it contains anything that looks like a credential. The match is never
+      # printed. Mentions in the PR title and body are neutralized with a
+      # zero-width space after the @, so a bad run cannot notify anyone.
+      - name: Scan for secrets and prepare the PR text
+        run: |
+          set -euo pipefail
+          python3 - "${RUNNER_TEMP}/doc-changes" "${RUNNER_TEMP}" <<'PYEOF'
+          import json, os, sys
+          import regex
+          src, tmp = sys.argv[1:]
+          manifest = json.load(open(os.path.join(src, "manifest.json")))
+          secret = regex.compile(
+              r"sk-ant-[A-Za-z0-9_-]{8,}|gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+              r"|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}"
+          )
+          texts = {"PR title": manifest["title"], "PR body": manifest["body"]}
+          for path in manifest["changed"]:
+              texts[path] = open(path, encoding="utf-8", errors="replace").read()
+          found = [name for name, text in texts.items() if secret.search(text)]
+          if found:
+              sys.exit(f"::error::Possible credential in: {', '.join(found)}")
+
+          def no_mentions(text):
+              return regex.sub(r"(?<![\w`])@(?=[A-Za-z0-9])", "@\u200b", text)
+
+          scope = os.environ["SCOPE"]
+          title = no_mentions(manifest["title"].strip().splitlines()[0] if manifest["title"].strip() else "")
+          if not title:
+              title = f"docs: weekly drift and consistency maintenance ({scope})"
+          open(os.path.join(tmp, "title.txt"), "w").write(title)
+          open(os.path.join(tmp, "body.md"), "w").write(no_mentions(manifest["body"]))
+          PYEOF
+
+      # The token is limited to this repository and to what the next step uses,
+      # below the app's full permission set.
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
+          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          repositories: torch-spyre
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open the PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          MANIFEST="${RUNNER_TEMP}/doc-changes/manifest.json"
+          # The commit is made through the API, as in refresh-test-timings.yaml:
+          # GitHub signs it for the app token, which main's required_signatures
+          # expects. The branch is reset to main's head each run.
+          BASE_SHA="$(git rev-parse HEAD)"
+          python3 - "${BASE_SHA}" "${MANIFEST}" > "${RUNNER_TEMP}/tree.json" <<'PYEOF'
+          import base64, json, os, subprocess, sys
+          base, manifest = sys.argv[1], json.load(open(sys.argv[2]))
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tree = []
+          for path in manifest["changed"]:
+              with open(path, "rb") as f:
+                  blob = {"content": base64.b64encode(f.read()).decode(), "encoding": "base64"}
+              sha = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/git/blobs", "--input", "-", "--jq", ".sha"],
+                  input=json.dumps(blob), check=True, capture_output=True, text=True,
+              ).stdout.strip()
+              tree.append({"path": path, "mode": "100644", "type": "blob", "sha": sha})
+          json.dump({"base_tree": base, "tree": tree}, sys.stdout)
+          PYEOF
+          TITLE="$(cat "${RUNNER_TEMP}/title.txt")"
+          TREE_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/trees" \
+            --input "${RUNNER_TEMP}/tree.json" --jq .sha)"
+          COMMIT_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits" -f tree="${TREE_SHA}" \
+            -f 'parents[]='"${BASE_SHA}" \
+            -f message="$(printf '%s\n\nSigned-off-by: spyre-bot[bot] <spyre-bot[bot]@users.noreply.github.com>' "${TITLE}")" \
+            --jq .sha)"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -f sha="${COMMIT_SHA}" -F force=true >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/heads/${BRANCH}" \
+              -f sha="${COMMIT_SHA}" >/dev/null
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf '\n---\nGenerated by Claude Code in the weekly-doc-maintenance workflow (scope: %s, run %s). Review every change against the code before merging.\n' \
+            "${SCOPE}" "${RUN_URL}" >> "${RUNNER_TEMP}/body.md"
+          gh pr create --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --base main \
+            --title "${TITLE}" --body-file "${RUNNER_TEMP}/body.md"
