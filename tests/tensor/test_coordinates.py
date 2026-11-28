@@ -42,14 +42,17 @@ from torch_spyre._inductor.pass_utils import (
     _check_stick_expr_supported,
     _former_stick_dim_outermost,
     compute_restickify_needed,
+    compute_size1_restickify_target,
     dense_relocation_serves_read,
     device_coordinates,
+    is_sparse_stl,
     is_stick_expr_offset_free,
     non_stick_reduction_vars,
     output_is_indirectly_mutated,
     restickify_dense_stl_to_sparse,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
+    stick_compatible,
     try_device_coordinates,
 )
 from torch_spyre._inductor.nonstick_dim_order import _flat_dense_projection_x_layout
@@ -2057,6 +2060,66 @@ class TestFormerStickDimOutermost(TestCase):
         self.assertIsNone(_former_stick_dim_outermost(self._relocated(), 4, 100))
         # Nor does a size and stride belonging to no dim at all.
         self.assertIsNone(_former_stick_dim_outermost(self._inner_stick(), 7, 999))
+
+
+class TestSize1RestickifyForBroadcastStick(TestCase):
+    """compute_restickify_needed falls back to a size-1-stick (sparse) target when the
+    input is broadcast along the output's stick and no dense target exists.  The
+    target is used only if it is stick-compatible with the output."""
+
+    def test_accepts_input_broadcast_along_output_stick(self):
+        # out[d0, d1] = in[d1] with the output stick on d0: the input never varies
+        # along d0, so no dense layout of it can carry that stick.
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        host = _contiguous_host([128])
+        in_stl = SpyreTensorLayout([128], torch.float16)
+        out_stl = SpyreTensorLayout([128, 128], [128, 1], torch.float16, [1, 0])
+        in_dep = MemoryDep("arg0_1", d1, (d0, d1), (128, 128))
+        out_dep = MemoryDep("buf0", 128 * d0 + d1, (d0, d1), (128, 128))
+        needed, target = compute_restickify_needed(
+            in_stl, host, in_dep, out_stl, out_dep
+        )
+        self.assertTrue(needed)
+        self.assertIsNotNone(target)
+        self.assertTrue(is_sparse_stl(target))
+        # The target is what makes the pair compatible.
+        self.assertTrue(
+            stick_compatible(
+                [
+                    try_device_coordinates(target, in_dep, None),
+                    try_device_coordinates(out_stl, out_dep, None),
+                ]
+            )
+        )
+
+    def test_rejects_when_output_stick_var_is_in_the_input_index(self):
+        # in[128*d0 + 64*d1 + d2] with the output stick on d1: d1 is part of the
+        # input's own index, so a size-1 stick on the input would carry d1 on a
+        # non-stick dim and stay incompatible.  The size-1 target can be built; it is
+        # stick_compatible that rejects it.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
+        host = FixedLayout(
+            torch.device("spyre:0"), torch.float16, [4, 2, 64], [128, 64, 1]
+        )
+        in_stl = SpyreTensorLayout(
+            [1, 32, 64], [64, 64, 1], DataFormats.SEN169_FP16, {(0, 2): 64, (1,): 8}
+        )
+        out_stl = SpyreTensorLayout(
+            [64, 1, 4, 64],
+            [1, 128, 128, 64],
+            DataFormats.SEN169_FP16,
+            {(0,): 64, (1, 3): 2, (2,): 4},
+        )
+        index = 128 * d0 + 64 * d1 + d2
+        in_dep = MemoryDep("arg0_1", index, (d0, d1, d2), (4, 2, 64))
+        out_dep = MemoryDep("buf0", index, (d0, d1, d2), (4, 2, 64))
+        self.assertIsNotNone(
+            compute_size1_restickify_target(in_stl, host, in_dep, None)
+        )
+        self.assertEqual(
+            compute_restickify_needed(in_stl, host, in_dep, out_stl, out_dep),
+            (True, None),
+        )
 
 
 class TestStickExprOffsetFree(TestCase):

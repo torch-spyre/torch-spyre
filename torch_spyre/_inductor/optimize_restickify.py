@@ -42,6 +42,7 @@ from .pass_utils import (
     compute_size1_restickify_target,
     device_coordinates,
     host_coordinates,
+    is_sparse_stl,
 )
 
 INF = math.inf
@@ -91,9 +92,10 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible, the input device size in bytes weighted by the
-        device dtype (RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT; 32-bit formats cost 2x fp16
-        per byte) if restickifiable, or INF if infeasible.
+        Cost is 0 if stick-compatible, the input device size in bytes (the target's
+        for a sparse target) weighted by the device dtype
+        (RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT; 32-bit formats cost 2x fp16 per byte)
+        if restickifiable, or INF if infeasible.
         _layout stores:
           None               — compatible, no restickify needed
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
@@ -130,8 +132,11 @@ class EdgeCostMap:
             cost = INF  # infeasible restickify
             self._layout[in_stl][target_stl] = EdgeCostMap.INFEASIBLE
         else:
+            # A sparse target (one element per stick) is far larger than the
+            # input, so price it by its own size. Dense targets keep the
+            # input-size price.
             cost = float(
-                get_device_size_in_bytes(in_stl)
+                get_device_size_in_bytes(tgt if is_sparse_stl(tgt) else in_stl)
                 * RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT[in_stl.device_dtype]
             )
             self._layout[in_stl][target_stl] = tgt
