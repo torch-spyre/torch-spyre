@@ -88,6 +88,30 @@ When each arg appears:
 - A numeric `coll_bytes` of `0` is a real zero-byte transfer, not an
   unknown size.
 
+#### Protocol event class and peer
+
+spyre-comms also tags individual collective events with their role in the
+protocol (RFC 2973 §3.4) and, where one is involved, the peer rank:
+
+| Arg | Type | Meaning |
+|---|---|---|
+| `coll_event` | string | `SEND_DATA`, `RECV_DATA`, `SIGNAL_DATA`, `SIGNAL_ACK`, `WAIT_DATA`, `WAIT_ACK`, `MONITOR_NOTICE` or `COMPUTE`; or `RESET_SEND` / `RESET_WAIT` for the HDMA thread reset that ends each schedule, which is not part of the protocol. |
+| `coll_peer` | number | Peer rank of a `SEND_DATA`, `RECV_DATA`, `SIGNAL_DATA` or `SIGNAL_ACK` event, such as the rank an HDMA signal is sent to. |
+
+```json
+{"ph": "X", "cat": "gpu_memcpy", "name": "Memcpy (DtoH)",
+ "args": {"coll_group": "Allreduce", "coll_event": "SIGNAL_ACK", "coll_peer": 1, "bytes": 128}}
+```
+
+- `SIGNAL_DATA` / `SIGNAL_ACK` are the one-flit host-DMA signals that unblock
+  a peer's recv or buffer reuse; they are otherwise indistinguishable from
+  data copies by name or `dmi_type`/`dmo_type`.
+- `MONITOR_NOTICE` (Host DMA, PF only) is the card's wait, after posting a
+  signal, for the host's HDMA thread to confirm it took the instruction.
+- Either arg is absent when the producer did not tag that event. As in
+  RFC 2973 §3.4, waits and `COMPUTE` carry no `coll_peer`, and neither does a
+  transfer with several peers (an RDMA wait's peers are in `peer_mask`).
+
 ## `aiu-trace-analyzer`
 
 [`aiu-trace-analyzer`][ata] is an open-source post-processing tool for

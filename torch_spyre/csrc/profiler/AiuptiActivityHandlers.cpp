@@ -16,7 +16,9 @@
  * Portions derived from libkineto AIU plugin.
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
+#include <util/sendefs/sendefs.h>
 
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -200,6 +202,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsCollBroadcast";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
       return "aiuCommsCollBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER:
+      return "aiuCommsCollReduceScatter";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_START:
       return "aiuCommsWorkSchedStart";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_WAIT:
@@ -216,6 +220,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsCollReduceSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST_SETUP:
       return "aiuCommsCollBroadcastSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER_SETUP:
+      return "aiuCommsCollReduceScatterSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_RECORDING:
       return "aiuCommsWorkSchedPhaseRecord";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_WIREUP:
@@ -291,8 +297,10 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_ITERATION_DURATION:
       return "aiuIterationDuration";
 
-    // CBIDS 83 to 84 are reserved
-    // P2P RDMA CBIDS (85 - 91)
+    // CBID 83 is reserved
+    // P2P RDMA CBIDS (84 - 91)
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_SEND:
+      return "aiuP2PRdmaSend";
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
       return "aiuP2PRdmaMulticast";
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
@@ -368,6 +376,165 @@ inline void addCollMetadata(trace_activity_type& trace_activity,
   }
 }
 
+// Runtime-record detail: transfer direction and conversion data formats. Newer
+// than the other runtime fields, so detected rather than assumed.
+template <class T, class = void>
+struct HasRuntimeDetailFields : std::false_type {};
+template <class T>
+struct HasRuntimeDetailFields<
+    T, std::void_t<decltype(std::declval<T&>().direction),
+                   decltype(std::declval<T&>().dtype_src),
+                   decltype(std::declval<T&>().dtype_dst)>> : std::true_type {};
+
+// dtype_src / dtype_dst carry the deeptools DataFormats value + 1; 0 = none.
+inline std::string runtimeDtypeName(uint8_t dtype) {
+  const int format = static_cast<int>(dtype) - 1;
+  if (format >= 0 && format < static_cast<int>(DataFormats::NUM_DATA_FORMATS)) {
+    return EnumsConversion::dataFormatsToString(
+        static_cast<DataFormats>(format));
+  }
+  return std::to_string(format);
+}
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addRuntimeDetailMetadata(trace_activity_type& trace_activity,
+                                     const aiupti_activity_type* activity) {
+  if constexpr (HasRuntimeDetailFields<aiupti_activity_type>::value) {
+    switch (activity->direction) {
+      case (uint8_t)AIUPTI_ACTIVITY_MEMCPY_KIND_HTOD:
+        trace_activity->addMetadataQuoted("direction", "HtoD");
+        break;
+      case (uint8_t)AIUPTI_ACTIVITY_MEMCPY_KIND_DTOH:
+        trace_activity->addMetadataQuoted("direction", "DtoH");
+        break;
+      default:
+        break;
+    }
+    if (activity->dtype_src != 0 || activity->dtype_dst != 0) {
+      trace_activity->addMetadataQuoted(
+          "dtype", runtimeDtypeName(activity->dtype_src) + "->" +
+                       runtimeDtypeName(activity->dtype_dst));
+    }
+  }
+}
+
+// DMA section types (raw hal DmaTypeEnum values) and, on compute records, the
+// peer set the CB names. Detected for the same reason as above.
+template <class T, class = void>
+struct HasDmaSectionFields : std::false_type {};
+template <class T>
+struct HasDmaSectionFields<T,
+                           std::void_t<decltype(std::declval<T&>().dmi_type),
+                                       decltype(std::declval<T&>().dmo_type)>>
+    : std::true_type {};
+
+template <class T, class = void>
+struct HasPeerFields : std::false_type {};
+template <class T>
+struct HasPeerFields<T, std::void_t<decltype(std::declval<T&>().peer_mask),
+                                    decltype(std::declval<T&>().peer_rank)>>
+    : std::true_type {};
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addDmaSectionMetadata(trace_activity_type& trace_activity,
+                                  const aiupti_activity_type* activity) {
+  if constexpr (HasDmaSectionFields<aiupti_activity_type>::value) {
+    trace_activity->addMetadata("dmi_type",
+                                static_cast<unsigned>(activity->dmi_type));
+    trace_activity->addMetadata("dmo_type",
+                                static_cast<unsigned>(activity->dmo_type));
+  }
+  if constexpr (HasPeerFields<aiupti_activity_type>::value) {
+    if (activity->peer_mask != 0) {
+      trace_activity->addMetadataQuoted(
+          "peer_mask", fmt::format("0x{:x}", activity->peer_mask));
+    }
+    if (activity->peer_rank != UINT32_MAX) {
+      trace_activity->addMetadata("peer_rank", activity->peer_rank);
+    }
+  }
+}
+
+// Protocol event class (RFC 2973 Section 3.4) the producer tagged a
+// collective's CB or copy with, as coll_event (e.g. "SIGNAL_ACK"), and on
+// copies the peer it named, as coll_peer. Omitted when unset. Newer than the
+// coll_* fields, so detected rather than assumed.
+template <class T, class = void>
+struct HasCollEventField : std::false_type {};
+template <class T>
+struct HasCollEventField<T,
+                         std::void_t<decltype(std::declval<T&>().coll_event)>>
+    : std::true_type {};
+template <class T, class = void>
+struct HasCollPeerField : std::false_type {};
+template <class T>
+struct HasCollPeerField<T, std::void_t<decltype(std::declval<T&>().coll_peer)>>
+    : std::true_type {};
+
+inline const char* collEventName(uint8_t cls) {
+  switch (cls) {
+    case AIUPTI_COLL_EVENT_SEND_DATA:
+      return "SEND_DATA";
+    case AIUPTI_COLL_EVENT_RECV_DATA:
+      return "RECV_DATA";
+    case AIUPTI_COLL_EVENT_SIGNAL_DATA:
+      return "SIGNAL_DATA";
+    case AIUPTI_COLL_EVENT_SIGNAL_ACK:
+      return "SIGNAL_ACK";
+    case AIUPTI_COLL_EVENT_WAIT_DATA:
+      return "WAIT_DATA";
+    case AIUPTI_COLL_EVENT_WAIT_ACK:
+      return "WAIT_ACK";
+    case AIUPTI_COLL_EVENT_MONITOR_NOTICE:
+      return "MONITOR_NOTICE";
+    case AIUPTI_COLL_EVENT_COMPUTE:
+      return "COMPUTE";
+    case AIUPTI_COLL_EVENT_RESET_SEND:
+      return "RESET_SEND";
+    case AIUPTI_COLL_EVENT_RESET_WAIT:
+      return "RESET_WAIT";
+    default:
+      return nullptr;  // NONE, or a class newer than this build
+  }
+}
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addCollEventMetadata(trace_activity_type& trace_activity,
+                                 const aiupti_activity_type* activity) {
+  if constexpr (HasCollEventField<aiupti_activity_type>::value) {
+    if (const char* name = collEventName(activity->coll_event)) {
+      trace_activity->addMetadataQuoted("coll_event", name);
+    }
+  }
+  if constexpr (HasCollPeerField<aiupti_activity_type>::value) {
+    // Collective records only: a zero-initialized record would read as peer 0.
+    if (activity->coll_group[0] != '\0' && activity->coll_peer != UINT32_MAX) {
+      trace_activity->addMetadata("coll_peer", activity->coll_peer);
+    }
+  }
+}
+
+// Collective a host span did work for (e.g. the artifact load an allreduce
+// triggered). Not a correlation ID, so it never links host and device records.
+// Newer than the other runtime fields, so detected rather than assumed.
+template <class T, class = void>
+struct HasRuntimeCollIdField : std::false_type {};
+template <class T>
+struct HasRuntimeCollIdField<
+    T, std::void_t<decltype(std::declval<T&>().coll_id),
+                   decltype(std::declval<T&>().has_coll_id)>> : std::true_type {
+};
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addRuntimeCollIdMetadata(trace_activity_type& trace_activity,
+                                     const aiupti_activity_type* activity) {
+  if constexpr (HasRuntimeCollIdField<aiupti_activity_type>::value) {
+    if (activity->has_coll_id != 0) {
+      trace_activity->addMetadata("coll_id", activity->coll_id);
+    }
+  }
+}
+
 void AiuptiActivityProfilerSession::handleRuntimeActivity(
     const AIUpti_ActivityAPI* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
@@ -430,6 +597,8 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   runtime_activity->flow.start = flowStart;
   runtime_activity->linked = linked;
   runtime_activity->addMetadata("correlation", activity->correlation_id);
+  addRuntimeDetailMetadata(runtime_activity, activity);
+  addRuntimeCollIdMetadata(runtime_activity, activity);
 
   if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE &&
       !calibration && linked && linked->deviceId() == activity->process_id &&
@@ -481,8 +650,16 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
       runtime_activity->addMetadata("fence_size", activity->data);
       break;
 
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_SEND:
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
+    case AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE:
       runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    // (correlation, cb_idx) identifies the CB's device record.
+    case AIUPTI_RUNTIME_TRACE_CBID_FLEX_ROUNDTRIP:
+      runtime_activity->addMetadata("cb_idx", activity->data);
       break;
 
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
@@ -498,6 +675,26 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
 
     case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
       runtime_activity->addMetadata("world_size", activity->data);
+      break;
+
+    // spyre-comms WorkScheduleInfo: joins a collective's setup and
+    // bundle-generation spans to each of its _applyTensor spans.
+    case AIUPTI_RUNTIME_TRACE_CBID_BUNDLE_GENERATE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER:
+      runtime_activity->addMetadata("wsi_id", activity->data);
       break;
 
     default:
@@ -555,6 +752,8 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   // Compute records always carry counters, so emit unconditionally: an
   // all-zero array here signals a counter failure rather than absence.
   kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
+  addDmaSectionMetadata(kernel_activity, activity);
+  addCollEventMetadata(kernel_activity, activity);
 
   recordStream(kernel_activity->device, kernel_activity->resource);
   kernel_activity->log(*logger);
@@ -676,6 +875,8 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
     memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
   }
   addCollMetadata(memcpy_activity, activity);
+  addDmaSectionMetadata(memcpy_activity, activity);
+  addCollEventMetadata(memcpy_activity, activity);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,

@@ -236,6 +236,25 @@ void emitMemcpy(uint32_t batch, bool launch, bool calibration = false) {
   }
 }
 
+// A collective copy tagged with a protocol role and peer, as flex fills them:
+// coll_peer is UINT32_MAX when the producer named no peer.
+void emitCollCopy(uint32_t correlation, const char* group, uint8_t event,
+                  uint32_t peer) {
+  const auto now = libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  AIUpti_ActivityMemcpy copy{};
+  copy.activity_kind = AIUPTI_ACTIVITY_KIND_MEMCPY;
+  copy.copy_kind = AIUPTI_ACTIVITY_MEMCPY_KIND_DTOH;
+  copy.correlation_id = correlation;
+  copy.stream_id = 5;
+  copy.start = now + 1000;
+  copy.end = now + 2000;
+  copy.bytes = 128;
+  std::strncpy(copy.coll_group, group, sizeof(copy.coll_group) - 1);
+  copy.coll_event = event;
+  copy.coll_peer = peer;
+  syntheticApi.copies.push_back(copy);
+}
+
 // A host-side runtime span whose `data` payload carries CBID-specific metadata.
 void emitRuntime(uint32_t cbid, uint32_t correlation, uint64_t data) {
   const auto now = libkineto::timeSinceEpoch(std::chrono::system_clock::now());
@@ -301,6 +320,39 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     // Distinct nonzero payloads catch both CBID and metadata-key drift.
     emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER, 40, 3);
     emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND, 41, 5);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA, 42, 4096);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_FLEX_ROUNDTRIP, 43, 2);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_SEND, 44, 1024);
+    // spyre-comms WorkScheduleInfo ID, shown as wsi_id.
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_BUNDLE_GENERATE, 45, 7);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE_SETUP, 46, 7);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE, 47, 7);
+    // An artifact load tagged with the collective that triggered it (0 is a
+    // valid ID), and one that is not.
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE, 48, 4096);
+    syntheticApi.runtime.back().has_coll_id = 1;
+    syntheticApi.runtime.back().coll_id = 0;
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE, 49, 4096);
+  });
+  module.def("emit_coll_events", [] {
+    emitCollCopy(60, "Allreduce", AIUPTI_COLL_EVENT_SIGNAL_ACK, 1);
+    emitCollCopy(61, "Allreduce", AIUPTI_COLL_EVENT_SEND_DATA, UINT32_MAX);
+    emitCollCopy(62, "Allreduce", AIUPTI_COLL_EVENT_NONE, UINT32_MAX);
+    // Not a collective: a stray peer value must not be reported.
+    emitCollCopy(63, "", AIUPTI_COLL_EVENT_NONE, 0);
+    const auto now =
+        libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+    AIUpti_ActivityCompute kernel{};
+    kernel.activity_kind = AIUPTI_ACTIVITY_KIND_CMPT;
+    kernel.operation_kind = AIUPTI_ACTIVITY_CMPT_KIND_EXEC;
+    kernel.correlation_id = 65;
+    kernel.stream_id = 3;
+    kernel.start = now + 2000;
+    kernel.end = now + 4000;
+    std::memcpy(kernel.name, "coll_wait", sizeof("coll_wait"));
+    std::strncpy(kernel.coll_group, "Allreduce", sizeof(kernel.coll_group) - 1);
+    kernel.coll_event = AIUPTI_COLL_EVENT_WAIT_DATA;
+    syntheticApi.kernels.push_back(kernel);
   });
   module.def("emit_capture_window", [](int window) {
     at::RecordFunction origin(at::RecordScope::FUNCTION);
