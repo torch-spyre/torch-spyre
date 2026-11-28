@@ -45,8 +45,6 @@ import torch_spyre  # noqa: F401 — registers Spyre as the inductor backend
 from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
 
-DEVICE_TYPE = DEVICE.type  # 'spyre' — used for device.type comparisons
-
 
 # ---------------------------------------------------------------------------
 # Unit tests — no model checkpoint required
@@ -63,9 +61,7 @@ class TestDmaToSpyreFp8Kernel:
         weight = torch.randn(128, 256, dtype=torch.float16).to(torch.float8_e4m3fn)
         dev = _dma_to_spyre_fp8_kernel(weight)
 
-        assert dev.device.type == DEVICE_TYPE, (
-            f"Expected device {DEVICE}, got {dev.device}"
-        )
+        assert dev.device.type == DEVICE, f"Expected device {DEVICE}, got {dev.device}"
         assert dev.dtype == torch.float8_e4m3fn, f"Expected fp8, got {dev.dtype}"
         assert list(dev.shape) == [128, 256], f"Shape mismatch: {list(dev.shape)}"
 
@@ -85,7 +81,7 @@ class TestDmaToSpyreFp8Kernel:
         )
         dev = _dma_to_spyre_fp8_kernel(weight)
 
-        assert dev.device.type == DEVICE_TYPE
+        assert dev.device.type == DEVICE
         assert dev.dtype == torch.float8_e4m3fn
 
     def test_rejects_non_fp8(self):
@@ -119,7 +115,7 @@ class TestDmaToSpyreFp8Kernel:
                 torch.float8_e4m3fn
             )
             dev = _dma_to_spyre_fp8_kernel(weight)
-            assert dev.device.type == DEVICE_TYPE
+            assert dev.device.type == DEVICE
             assert dev.dtype == torch.float8_e4m3fn
             assert list(dev.shape) == [out_f, in_f]
 
@@ -156,7 +152,7 @@ class TestLoadModelToSpyreUseFp8Weights:
 
         for module in model.modules():
             if isinstance(module, nn.Linear):
-                assert module.weight.device.type == DEVICE_TYPE, (
+                assert module.weight.device.type == DEVICE, (
                     f"Expected weight on {DEVICE}, got {module.weight.device}"
                 )
                 assert module.weight.dtype == torch.float8_e4m3fn, (
@@ -190,7 +186,7 @@ class TestLoadModelToSpyreUseFp8Weights:
         )
         load_model_to_spyre(model, use_fp8_weights=True)
 
-        assert model[0].weight.device.type == DEVICE_TYPE
+        assert model[0].weight.device.type == DEVICE
         # dtype should be preserved (bfloat16 on device)
         assert model[0].weight.dtype == torch.bfloat16
 
@@ -239,8 +235,8 @@ class TestScaledMmWithPrequantizedWeight:
         assert q_weight.dtype == torch.float8_e4m3fn, (
             f"Expected float8_e4m3fn, got {q_weight.dtype}"
         )
-        assert q_weight.device.type == DEVICE_TYPE, (
-            f"Expected on {DEVICE_TYPE}, got {q_weight.device.type}"
+        assert q_weight.device.type == DEVICE, (
+            f"Expected on {DEVICE}, got {q_weight.device.type}"
         )
         assert q_weight.shape == torch.Size([n, k]), (
             f"Expected shape [{n}, {k}], got {q_weight.shape}"
@@ -670,7 +666,7 @@ class TestPrequantizedFp8ModelShapes:
 
         w = _fp8_weight_exact(shape, ("SBDMA", shape))
         dev = _dma_to_spyre_fp8_kernel(w)
-        assert dev.device.type == DEVICE_TYPE
+        assert dev.device.type == DEVICE
         assert dev.dtype == torch.float8_e4m3fn
         assert list(dev.shape) == list(shape)
         with config.patch({"sencores": sencores}):

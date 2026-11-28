@@ -31,6 +31,7 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     reinterpret_tensor_with_layout,
 )
+from torch_spyre.constants import DEVICE_NAME
 
 import unittest
 from typing import Any, TYPE_CHECKING
@@ -39,7 +40,10 @@ if TYPE_CHECKING:
     from torch_spyre._inductor.work_division import OpSplitSpace
     from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 
-DEVICE = torch.device("spyre")
+# A string, not ``torch.device("spyre")``: that call fails until the backend has
+# registered the device, and conftests import this module in the xdist
+# controller, which runs with autoload off (#6672).
+DEVICE = DEVICE_NAME
 
 try:
     from ortools.sat.python import cp_model as _cp_model  # noqa: F401
