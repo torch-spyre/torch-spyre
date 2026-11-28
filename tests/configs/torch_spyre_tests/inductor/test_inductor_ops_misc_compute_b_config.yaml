@@ -23,6 +23,7 @@ test_suite_config:
             - TestOps::test_rmsnorm_manual.*
             - TestOps::test_batch_norm_functional.*
             - TestOps::test_group_norm_functional.*
+            - TestOps::test_normalize_eager.*
             - TestOps::test_softmax.*
             - TestOps::test_softplus.*
             # embedding

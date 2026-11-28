@@ -4202,6 +4202,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # -----------------------------------------------------------------------
+        # clamp_min / clamp_max eager dispatch (#6340): the ``.out`` variants and
+        # the functional ones go through the standalone-compiled kernel.
+        # -----------------------------------------------------------------------
+        ("test_clamp_eager", "test_clamp_eager"): {
+            "ops_dict": {
+                "clamp_min": torch.clamp_min,
+                "clamp_max": torch.clamp_max,
+            },
+            "param_sets": {
+                "fp16": (torch.tensor([0.0, 1.0, -1.0], dtype=torch.float16), 0.5),
+                "fp32": (torch.tensor([0.0, 1.0, -1.0], dtype=torch.float32), 0.5),
+                "int32": (torch.tensor([0, 1, -1], dtype=torch.int32), 0),
+                # Unaligned inner dims: fp16 sticks hold 64 elements, fp32 32.
+                "fp16_1d_100": (cached_randn((100,), dtype=torch.float16), 0.1),
+                "fp16_2d_7x44": (cached_randn((7, 44), dtype=torch.float16), 0.1),
+                "fp16_3d_2x3x70": (cached_randn((2, 3, 70), dtype=torch.float16), 0.1),
+                "fp32_1d_44": (cached_randn((44,), dtype=torch.float32), 0.1),
+                "fp32_2d_7x44": (cached_randn((7, 44), dtype=torch.float32), 0.1),
+                "fp32_3d_2x3x70": (cached_randn((2, 3, 70), dtype=torch.float32), 0.1),
+                "int32_2d_7x44": (torch.randint(-5, 5, (7, 44), dtype=torch.int32), 0),
+            },
+        },
+        # F.normalize calls clamp_min on the norm (#6340 case 4).
+        ("test_normalize_eager", "test_normalize_eager"): {
+            "param_sets": {
+                "fp32": (cached_randn((32, 128), dtype=torch.float32),),
+            },
+        },
+        # -----------------------------------------------------------------------
         # clamp bigint: large integers where int -> fp32 promotion may lose precision.
         # Below 2**24 (16.7M) every integer is exact in fp32.
         # Above 2**24, gaps between consecutive integers occur.
@@ -12429,17 +12458,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self.compare_with_cpu(
                 lambda a: op(a, min=min_val, max=max_val),
                 x,
-                run_eager=False,
                 **kwargs,
             )
         elif op is torch.clamp_min:
-            self.compare_with_cpu(
-                lambda a: op(a, min=min_val), x, run_eager=False, **kwargs
-            )
+            self.compare_with_cpu(lambda a: op(a, min=min_val), x, **kwargs)
         elif op is torch.clamp_max:
-            self.compare_with_cpu(
-                lambda a: op(a, max=max_val), x, run_eager=False, **kwargs
-            )
+            self.compare_with_cpu(lambda a: op(a, max=max_val), x, **kwargs)
 
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
@@ -12480,6 +12504,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         the device really does collapse 2e9+1 → 2e9 after the cast.
         """
         self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
+
+    def test_clamp_eager(self, op, x, bound):
+        """Eager clamp_min/clamp_max, functional and ``out=`` (#6340)."""
+        atol, rtol = _clamp_tol(x.dtype)
+        self.compare_with_cpu(
+            lambda a: op(a, bound), x, run_compile=False, atol=atol, rtol=rtol
+        )
+        self.compare_with_cpu(
+            lambda a: op(a, bound, out=torch.empty_like(a)),
+            x,
+            run_compile=False,
+            atol=atol,
+            rtol=rtol,
+        )
+
+    def test_normalize_eager(self, x):
+        """Eager F.normalize, which calls clamp_min on the norm (#6340)."""
+        self.compare_with_cpu(
+            lambda a: torch.nn.functional.normalize(a, dim=-1),
+            x,
+            run_compile=False,
+            atol=1e-3,
+            rtol=1e-3,
+        )
 
     def test_clamp_inplace_cpu(self, op, x, min_val, max_val):
         """in-place clamp_ variants mutating a graph input (fixes #4069).
