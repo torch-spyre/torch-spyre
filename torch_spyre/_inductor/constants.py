@@ -243,9 +243,14 @@ FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 TOPK_OPS = {"topkvalue", "topkindex"}
 _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
-# topkindex counts in the input dtype, and fp16 holds integers exactly only up to
-# this many elements along the search dim (#5847).
+# topkindex counts in the input dtype, so the search dim must stay within the
+# range where that dtype holds every integer along it (#5847). Measured on device
+# with a one-hot row at every position: fp16 is exact up to 1025 elements (1024
+# is kept as the safe bound, matching deeptools 75b28ae481), bf16 is exact only
+# up to 257 (256 is kept), because its index is rounded to a bf16 value.
+# #5780 uses 512 for the fp16 limit; reconcile the two when it lands.
 FP16_TOPK_MAX_DIM = 1024
+BF16_TOPK_MAX_DIM = 256
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
