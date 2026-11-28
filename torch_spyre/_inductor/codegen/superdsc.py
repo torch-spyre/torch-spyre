@@ -113,8 +113,13 @@ class SDSCArgs:
     non_unified_shard_dim: Symbol | None = None
 
     @property
+    def bundle_local(self) -> bool:
+        """Kept in the bundle's HBM pool or in LX, not a kernel argument."""
+        return "hbm_pool" in self.allocation or "lx" in self.allocation
+
+    @property
     def non_unified(self) -> bool:
-        return self.non_unified_shard_bytes > 0
+        return self.non_unified_shard_bytes > 0 and not self.bundle_local
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())

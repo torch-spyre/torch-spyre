@@ -48,6 +48,7 @@ from device_env import num_shards
 from device_suite import make_device_suite_test, requires_emulation
 from torch.distributed.tensor import Shard
 
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre.execution import kernel_runner
 
 
@@ -380,6 +381,34 @@ def test_cross_shard_result_feeds_an_unsharded_op():
     z = torch.compile(lambda u, v: u + v, dynamic=False)(y, other.to("spyre"))
 
     assert torch.equal(z.cpu(), src.sum(1) + other)
+
+
+@requires_emulation
+@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm_pool", "lx"])
+@pytest.mark.parametrize(
+    "fn",
+    [lambda x: (x + x).sum(0), lambda x: x.sum(0) * 2],
+    ids=["sharded_intermediate_in", "result_used_in_graph"],
+)
+def test_cross_shard_reduction_with_an_intermediate_in_one_graph(
+    launched, fn, lx_planning
+):
+    """A cross-shard reduction and its neighbours compile as one kernel.
+
+    The intermediate stays in the bundle (HBM pool or LX) as unified storage:
+    a sharded input to the ring reduction, or its ordinary result read by the
+    next op.
+    """
+    n = num_shards()
+    src = _small_ints((4 * n, 64), seed=10)
+    x = _sharded(src, 0, n)
+
+    with spyre_config.patch(lx_planning=lx_planning):
+        y = torch.compile(fn, dynamic=False)(x)
+
+    assert len(launched) == 1, launched
+    assert not torch.spyre.is_sharded(y)
+    assert torch.equal(y.cpu(), fn(src))
 
 
 @requires_emulation

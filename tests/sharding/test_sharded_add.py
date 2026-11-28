@@ -467,6 +467,69 @@ def test_chained_compiled_adds(launched):
 
 
 @requires_emulation
+@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm_pool", "lx"])
+def test_sharded_intermediate_compiles_as_one_graph(launched, lx_planning):
+    """(x + y) * y on Shard(0) tensors is one graph and one kernel.
+
+    The intermediate x + y stays in the bundle (HBM pool or LX), so only the
+    graph inputs and output are chunk-addressed (nonUnifiedAllocInHBM_): the
+    launch resolves shard addresses for x, y and the output, and nothing else.
+    """
+    from torch_spyre._C import SymbolicArgKind
+
+    n = num_shards()
+    torch.manual_seed(0)
+    a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    a, b = _sharded(a_cpu, 0, n), _sharded(b_cpu, 0, n)
+
+    def fn(x, y):
+        return (x + y) * y
+
+    with spyre_config.patch(lx_planning=lx_planning):
+        c = torch.compile(fn, dynamic=False)(a, b)
+
+    # One launch: the whole chain ran as one compiled kernel.
+    assert len(launched) == 1, [d for d, _ in launched]
+    _, symbolic_args = launched[0]
+    # Only x, y and the output are shards (tensor args 0-2, one per core).
+    assert [(arg.kind, arg.tensor_id, arg.dim_index) for arg in symbolic_args] == [
+        (SymbolicArgKind.kShardAddress, t, core) for t in range(3) for core in range(n)
+    ]
+    assert torch.spyre.is_sharded(c)
+    expected = fn(a_cpu.to("spyre"), b_cpu.to("spyre")).cpu()
+    assert torch.equal(c.cpu(), expected)
+
+
+@requires_emulation
+@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm_pool", "lx"])
+def test_sharded_intermediate_with_an_unsharded_operand(launched, lx_planning):
+    """(x + bias) * 2 with x sharded and bias an ordinary device tensor.
+
+    The bias is an unsharded read-only replica that every core reads whole
+    (a row bias on a Shard(0) activation). The intermediate x + bias is
+    sharded and stays in the bundle, and the second op scales it by a scalar
+    constant: one kernel, sharded result.
+    """
+    n = num_shards()
+    torch.manual_seed(0)
+    x_cpu = torch.randn(8 * n, 64, dtype=torch.float16)
+    bias_cpu = torch.randn(64, dtype=torch.float16)
+    x = _sharded(x_cpu, 0, n)
+
+    def fn(x, bias):
+        return (x + bias) * 2
+
+    with spyre_config.patch(lx_planning=lx_planning):
+        c = torch.compile(fn, dynamic=False)(x, bias_cpu.to("spyre"))
+
+    assert len(launched) == 1, [d for d, _ in launched]
+    assert torch.spyre.is_sharded(c)
+    expected = fn(x_cpu.to("spyre"), bias_cpu.to("spyre")).cpu()
+    assert torch.equal(c.cpu(), expected)
+
+
+@requires_emulation
 @pytest.mark.parametrize("dim", [0, 1])
 def test_each_core_writes_only_its_own_shard(launched, dim):
     n = num_shards()
@@ -755,12 +818,6 @@ def test_non_unified_shard_dim_rejects_an_ambiguous_shard_dim(monkeypatch):
         ),
         # TODO: in-place writes into sharded storage.
         (lambda x, y: x.add_(y), "shard0", "in-place writes into sharded"),
-        # TODO: sharded intermediates.
-        (
-            lambda x, y: (x + y) * y,
-            "shard0",
-            "every sharded result to be a graph output",
-        ),
     ],
 )
 @expects_raise
@@ -778,6 +835,50 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
 
     with pytest.raises(RuntimeError, match=match):
         torch.compile(fn, dynamic=False)(a, b)
+
+
+def _write_back(b, c):
+    b.copy_(c)
+    return c
+
+
+# Ways to write a sharded value into an unsharded tensor in place. Each one
+# functionalizes to the sharded result (an intermediate) plus a MutationLayout
+# op that writes it back into b's storage.
+_SHARDED_WRITE_INTO_REPLICA = {
+    "add_then_use": lambda b, a: (b.add_(a), b * 2)[1],
+    "add_return_b": lambda b, a: (b.add_(a), b)[1],
+    "add_no_return": lambda b, a: b.add_(a),
+    "explicit_copy": lambda b, a: _write_back(b, b + a),
+}
+
+
+@requires_emulation
+@expects_raise
+@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm_pool", "lx"])
+@pytest.mark.parametrize("variant", sorted(_SHARDED_WRITE_INTO_REPLICA))
+def test_in_place_write_of_sharded_data_into_unsharded_fails(variant, lx_planning):
+    """b.add_(x_sharded) with b an ordinary device tensor fails at compile.
+
+    An unsharded operand is a read-only replica. Writing sharded data into
+    one has no defined semantics yet, so the planner rejects the write-back,
+    and b is left untouched.
+    TODO: positive once writes into replicas are designed (#5820).
+    """
+    n = num_shards()
+    torch.manual_seed(0)
+    a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
+    b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    b = b_cpu.to("spyre")
+    b_before = b.cpu()
+
+    with spyre_config.patch(lx_planning=lx_planning):
+        with pytest.raises(
+            RuntimeError,
+            match=r"in-place writes of sharded data into an unsharded tensor",
+        ):
+            torch.compile(_SHARDED_WRITE_INTO_REPLICA[variant], dynamic=False)(b, a)
+    assert torch.equal(b.cpu(), b_before)
 
 
 @requires_emulation
