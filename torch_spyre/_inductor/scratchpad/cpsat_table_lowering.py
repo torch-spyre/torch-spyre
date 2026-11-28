@@ -47,7 +47,12 @@ from ortools.sat.python import cp_model
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
-from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import (
+    divides,
+    factors,
+    numpy_eval,
+    operands,
+)
 
 # One cost unit is COST_SCALE objective units: a table entry is
 # rint(COST_SCALE * value).
@@ -321,16 +326,6 @@ def _on(
 # ---------------------------------------------------------------------- the printer
 
 
-def _divides(factor: sympy.Basic) -> bool:
-    """Whether factor, a factor of a Mul, has a negative rational exponent, which
-    lambdify prints as a division."""
-    return (
-        isinstance(factor, sympy.Pow)
-        and bool(factor.exp.is_Rational)
-        and bool(factor.exp.is_negative)
-    )
-
-
 def _is_condition(expr: sympy.Basic) -> bool:
     """Whether expr is a condition: a relational, a logical operation, true or false,
     and not a symbol."""
@@ -376,7 +371,7 @@ class TableLowering(Printer):
             try:
                 realization = super()._print(expr, **kwargs)
                 if realization is None:
-                    realization = self._operation(expr, expr.args)
+                    realization = self._operation(expr, operands(expr))
             except TableLoweringError as exc:
                 if exc.node is not None:
                     raise
@@ -443,43 +438,18 @@ class TableLowering(Printer):
         return SumRealization(constant, terms, tuple(self._inputs(expr)))
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
-        """A quotient is one table (_quotient). A constant times one operand is the
-        operand scaled in float. Any other product is declined."""
-        if any(_divides(factor) for factor in expr.args):
-            return self._quotient(expr)
-        constants = [factor for factor in expr.args if not factor.free_symbols]
-        operands = [factor for factor in expr.args if factor.free_symbols]
-        if len(operands) != 1:
+        """A constant times one operand is the operand scaled in float, as lambdify
+        prints a/49: (1/49)*a. A product that divides (divides), 98/a, is declined:
+        its table divides once in the numpy core, as lambdify prints it, so 98/a is 2
+        at a = 49, where 98 times the table of 1/a is under 2. Any other product is
+        declined."""
+        printed = factors(expr)
+        constants = [factor for factor in printed if not factor.free_symbols]
+        symbolic = [factor for factor in printed if factor.free_symbols]
+        if len(symbolic) != 1 or any(divides(factor) for factor in expr.args):
             return None
         coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
-        return self._print(operands[0]).scaled(coefficient)
-
-    def _quotient(self, expr: sympy.Mul) -> TableRealization:
-        """expr as one table: the product of its other factors divided by the product
-        of the bases of its factors with a negative rational exponent, each raised to
-        minus that exponent, as lambdify prints a quotient: 98/a, where 98*(1/a)
-        floors one low at a = 49. A factor it divides by is still printed, refusing
-        its own value that is not finite."""
-        index, grid = self._position(expr)
-        numerator: list[np.ndarray] = []
-        denominator: list[tuple[np.ndarray, float]] = []
-        for factor in expr.args:
-            if _divides(factor):
-                self._table(factor)
-                base, exp = factor.args
-                denominator.append((_on(self._table(base), index, grid), float(-exp)))
-            else:
-                numerator.append(_on(self._table(factor), index, grid))
-        values = _values(
-            expr,
-            index.size,
-            lambda: math.prod(numerator) / math.prod(b**e for b, e in denominator),
-        )
-        return TableRealization(values=values, index=index)
-
-    def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
-        """Over its arms' values and conditions: an ExprCondPair is not printed."""
-        return self._operation(expr, [part for pair in expr.args for part in pair.args])
+        return self._print(symbolic[0]).scaled(coefficient)
 
     def emptyPrinter(self, expr: sympy.Basic) -> None:
         """Any other node is declined. sympy's own returns str(expr)."""
